@@ -1,4 +1,4 @@
-# QEMU Voodoo 3 Device — Patch Archive
+# QEMU Voodoo 3 ported from 86Box
 
 ## Anwenden
 
@@ -20,7 +20,7 @@ qemu-system-x86_64 -device voodoo3,model=3 [...]
 
 # PPC — AmigaOS 4.1 FE auf Pegasos2 oder AmigaOne
 qemu-system-ppc -M pegasos2 -vga none \
-    -device voodoo3,model=3,big-endian-framebuffer=on [...]
+    -device voodoo3,model=3 [...]
 
 # Banshee
 qemu-system-x86_64 -device voodoo3,model=0 [...]
@@ -31,7 +31,6 @@ qemu-system-x86_64 -device voodoo3,model=0 [...]
 | Property | Werte | Default | Beschreibung |
 |---|---|---|---|
 | `model` | 0–4 | 3 | 0=Banshee, 1=V3-1000, 2=V3-2000, 3=V3-3000, 4=V3-3500 |
-| `big-endian-framebuffer` | on/off | off | **on** für alle PPC-Gäste |
 | `render-threads` | 1–4 | 2 | Rasterizer-Threads |
 | `bilinear` | on/off | on | Bilinear-Filter |
 | `agp` | on/off | off | AGP-Modus (experimentell) |

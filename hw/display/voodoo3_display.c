@@ -341,7 +341,7 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                         uint32_t r  = ((px >> 11) & 0x1f); r = (r << 3) | (r >> 2);
                         uint32_t g  = ((px >>  5) & 0x3f); g = (g << 2) | (g >> 4);
                         uint32_t b  =  (px        & 0x1f); b = (b << 3) | (b >> 2);
-                        dst[x] = 0xff000000u | (r << 16) | (g << 8) | b;
+                        dst[x] = rgb_to_pixel32bgr(r, g, b);
                     }
                 } else if (dst_bpp == 2) {
                     memcpy(dst_row, src, (size_t)w * 2);

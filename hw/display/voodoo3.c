@@ -601,7 +601,10 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         break;
     case DAC_dacData:
         if (s->dacAddr < VOODOO3_CLUT_SIZE)
-            s->pallook[s->dacAddr] = val & 0x00ffffff;
+            s->pallook[s->dacAddr] =
+				(((val >> 16) & 0xff) << 16) |  /* R */
+				(((val >>  8) & 0xff) <<  8) |  /* G */
+				( (val        & 0xff)      );   /* B */
         break;
 
     case Video_vidInFormat:
@@ -705,7 +708,7 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
          * authoritative source-of-truth for the display scanout.
          */
         s->params.front_offset = s->desktop_start;
-        s->params.draw_offset  = s->desktop_start;
+        // s->params.draw_offset  = s->desktop_start;
         memset(s->dirty_line, 1, sizeof(s->dirty_line));
         break;
     case Video_vidDesktopOverlayStride:
@@ -1118,10 +1121,10 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         s->params.draw_offset  = val & 0xfffff0;
         break;
     case SST_colBufferStride:
-        s->params.col_tiled  = (int)(val & (1u << 15));
-        s->params.row_width  = s->params.col_tiled
-                               ? (val & 0x7fu) * 128u * 32u
-                               : (val & 0x3fffu);
+		s->params.col_tiled = !!(val & (1u << 15));
+		s->params.row_width = s->params.col_tiled
+							  ? (val & 0x3fffu) * 128u * 32u
+							  : (val & 0x3fffu);
         break;
     case SST_auxBufferAddr:
         s->params.aux_offset = val & 0xfffff0;
@@ -1855,7 +1858,7 @@ static void voodoo3_lfb_write(void *opaque, hwaddr addr,
         uint32_t base = s->cur_pat_addr;
         if (phys >= base && phys + size <= base + 1024u) {
             uint32_t off = (uint32_t)(phys - base);
-            /* Copy bytes in little-endian order (LSB first in data) */
+
             for (unsigned i = 0; i < size && off + i < 1024u; i++)
                 s->cursor_buf[off + i] = (uint8_t)(data >> (i * 8));
         }
@@ -1868,7 +1871,11 @@ static const MemoryRegionOps voodoo3_lfb_ops = {
     .read  = voodoo3_lfb_read,
     .write = voodoo3_lfb_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    /* Accept 8-byte guest writes (e.g. 64-bit STQ on PPC/x86-64);
+     * the impl limit tells QEMU to split them into two 4-byte calls
+     * before they reach voodoo3_lfb_write(), which only handles <= 4. */
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl  = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 /* =========================================================================
@@ -2091,17 +2098,87 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
     voodoo3_init_dither_tables();
 
     pci_config_set_class(cfg, PCI_CLASS_DISPLAY_VGA);
+
+    /* PCI IDs */
+    pci_set_word(cfg + PCI_VENDOR_ID, PCI_VENDOR_ID_3DFX);
+    qemu_log_mask(LOG_UNIMP,
+        "voodoo3: selected model=%d (is_agp=%d)\n",
+        s->model, s->is_agp);
+
+    /* -----------------------------------------------------------------------
+     * Device ID
+     * Banshee uses 0x0003; all Voodoo3 variants (V3-1000..3500) use 0x0005.
+     * Source: 86Box vid_voodoo_banshee.c + 3dfx PCI IDs.
+     * ----------------------------------------------------------------------- */
+    switch (s->model) {
+    case VOODOO3_MODEL_BANSHEE:
+        pci_set_word(cfg + PCI_DEVICE_ID, PCI_DEVICE_ID_3DFX_BANSHEE);
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: DEVICE_ID = BANSHEE (0x%04x)\n",
+            PCI_DEVICE_ID_3DFX_BANSHEE);
+        break;
+    case VOODOO3_MODEL_V3_1000:
+    case VOODOO3_MODEL_V3_2000:
+    case VOODOO3_MODEL_V3_3000:
+    case VOODOO3_MODEL_V3_3500TV:
+    default:
+        pci_set_word(cfg + PCI_DEVICE_ID, PCI_DEVICE_ID_3DFX_VOODOO3);
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: DEVICE_ID = VOODOO3 (0x%04x)\n",
+            PCI_DEVICE_ID_3DFX_VOODOO3);
+        break;
+    }
+
+    /* -----------------------------------------------------------------------
+     * Subsystem Vendor + Device ID
+     * Subsystem Vendor is always 0x121A (3dfx Interactive).
+     * Subsystem Device IDs from 86Box vid_voodoo_banshee.c pci_regs[0x2e]:
+     *   Banshee          0x0003
+     *   V3-1000          0x0052  (PCI only — no AGP variant sold)
+     *   V3-2000 PCI      0x0030  /  AGP  0x0038
+     *   V3-3000 PCI      0x003A  /  AGP  0x003C
+     *   V3-3500          0x0060  (AGP only)
+     * ----------------------------------------------------------------------- */
     pci_set_word(cfg + PCI_SUBSYSTEM_VENDOR_ID, PCI_VENDOR_ID_3DFX);
     switch (s->model) {
     case VOODOO3_MODEL_BANSHEE:
-        pci_set_word(cfg + PCI_SUBSYSTEM_ID, 0x0003); break;
+        pci_set_word(cfg + PCI_SUBSYSTEM_ID, 0x0003);
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: SUBSYSTEM_ID = BANSHEE (0x0003)\n");
+        break;
+    case VOODOO3_MODEL_V3_1000:
+        /* V3-1000 was PCI-only; no AGP variant exists */
+        pci_set_word(cfg + PCI_SUBSYSTEM_ID, 0x0052);
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: SUBSYSTEM_ID = V3_1000 PCI (0x0052)\n");
+        break;
     case VOODOO3_MODEL_V3_2000:
-        pci_set_word(cfg + PCI_SUBSYSTEM_ID,
-            s->is_agp ? PCI_SUBDEV_V3_2000_AGP : PCI_SUBDEV_V3_2000_PCI); break;
-    default:
-        pci_set_word(cfg + PCI_SUBSYSTEM_ID,
-            s->is_agp ? PCI_SUBDEV_V3_3000_AGP : PCI_SUBDEV_V3_3000_PCI); break;
+    {
+        uint16_t subid = s->is_agp ? 0x0038u : 0x0030u;
+        pci_set_word(cfg + PCI_SUBSYSTEM_ID, subid);
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: SUBSYSTEM_ID = V3_2000 (%s) = 0x%04x\n",
+            s->is_agp ? "AGP" : "PCI", subid);
+        break;
     }
+    case VOODOO3_MODEL_V3_3500TV:
+        /* V3-3500TV was AGP-only; always use AGP subsystem ID */
+        pci_set_word(cfg + PCI_SUBSYSTEM_ID, 0x0060);
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: SUBSYSTEM_ID = V3_3500 AGP (0x0060)\n");
+        break;
+    case VOODOO3_MODEL_V3_3000:
+    default:
+    {
+        uint16_t subid = s->is_agp ? 0x003Cu : 0x003Au;
+        pci_set_word(cfg + PCI_SUBSYSTEM_ID, subid);
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: SUBSYSTEM_ID = V3_3000 (%s) = 0x%04x\n",
+            s->is_agp ? "AGP" : "PCI", subid);
+        break;
+    }
+    }
+
     cfg[PCI_LATENCY_TIMER] = 0x40;
 
     s->fb_size = VOODOO3_FB_SIZE;
@@ -2169,6 +2246,51 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
     }
 
     voodoo3_reset_state(s);
+
+    /* -----------------------------------------------------------------------
+     * Model-specific hardware defaults after reset.
+     * pllCtrl0 encodes the pixel clock: freq = 14.318 MHz * (N+2) / ((M+2) * (1<<K))
+     * where bits[1:0]=K, bits[7:2]=M, bits[15:8]=N.
+     * The BIOS ROM overwrites this during POST; these are power-on defaults.
+     *   Banshee   ~125 MHz  0x2907  (N=0x29, M=1, K=3)
+     *   V3-1000   ~143 MHz  0x2d07  (N=0x2d, M=1, K=3)
+     *   V3-2000   ~143 MHz  0x2d07
+     *   V3-3000   ~166 MHz  0x3207  (N=0x32, M=1, K=3)
+     *   V3-3500   ~183 MHz  0x3507  (N=0x35, M=1, K=3)
+     * ----------------------------------------------------------------------- */
+    switch (s->model) {
+    case VOODOO3_MODEL_BANSHEE:
+        s->pllCtrl0 = 0x2907;   /* ~125 MHz */
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: model BANSHEE -> pllCtrl0=0x%04x (~125 MHz)\n",
+            s->pllCtrl0);
+        break;
+    case VOODOO3_MODEL_V3_1000:
+        s->pllCtrl0 = 0x2d07;   /* ~143 MHz */
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: model V3_1000 -> pllCtrl0=0x%04x (~143 MHz)\n",
+            s->pllCtrl0);
+        break;
+    case VOODOO3_MODEL_V3_2000:
+        s->pllCtrl0 = 0x2d07;   /* ~143 MHz */
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: model V3_2000 -> pllCtrl0=0x%04x (~143 MHz)\n",
+            s->pllCtrl0);
+        break;
+    case VOODOO3_MODEL_V3_3500TV:
+        s->pllCtrl0 = 0x3507;   /* ~183 MHz */
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: model V3_3500 -> pllCtrl0=0x%04x (~183 MHz)\n",
+            s->pllCtrl0);
+        break;
+    case VOODOO3_MODEL_V3_3000:
+    default:
+        s->pllCtrl0 = 0x3207;   /* ~166 MHz */
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: model V3_3000 -> pllCtrl0=0x%04x (~166 MHz)\n",
+            s->pllCtrl0);
+        break;
+    }
 }
 
 /* =========================================================================
