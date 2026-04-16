@@ -1,0 +1,8 @@
+# Add this block to hw/display/meson.build (prepend at top of file)
+system_ss.add(when: 'CONFIG_VOODOO3', if_true: files(
+  'voodoo3.c',
+  'voodoo3_render.c',
+  'voodoo3_texture.c',
+  'voodoo3_display.c',
+  'voodoo3_setup.c',
+))

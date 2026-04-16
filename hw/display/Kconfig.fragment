@@ -1,0 +1,3 @@
+config VOODOO3
+    default y
+    depends on PCI_DEVICES
