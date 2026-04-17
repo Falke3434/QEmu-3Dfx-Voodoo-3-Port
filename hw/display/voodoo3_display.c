@@ -503,61 +503,101 @@ void voodoo3_draw_cursor(Voodoo3State *s,
 {
     if (!s->cursor_ena || !s->fb_mem) return;
 
-    int cx = s->cur_x;
-    int cy = s->cur_y;
-    int x11_mode = !!(s->vidProcCfg & (1u << 1));
+    int cx      = s->cur_x;
+    int cy      = s->cur_y;      /* already >= 0 after yoff adjustment */
+    int yoff    = s->cur_yoff;   /* sprite rows already consumed (top-clip) */
+    int x11_mode = !!(s->vidProcCfg & (1u << 1));  /* VIDPROCCFG_CURSOR_MODE */
     uint32_t col0 = s->cur_c0;
     uint32_t col1 = s->cur_c1;
 
-    int scr_y0 = (cy < 0) ? 0 : cy;
-    int scr_y1 = cy + 64;
+    /* Vertical range on screen */
+    int scr_y0 = cy;
+    int scr_y1 = cy + (64 - yoff);
     if (scr_y0 > dirty_hi || scr_y1 < dirty_lo) return;
+    if (scr_y0 < dirty_lo) scr_y0 = dirty_lo;
+    if (scr_y1 > dirty_hi + 1) scr_y1 = dirty_hi + 1;
     if (scr_y1 > s->screen_height) scr_y1 = s->screen_height;
 
     for (int row = scr_y0; row < scr_y1; row++) {
-        if (row < dirty_lo || row > dirty_hi) continue;
-        int sprite_row = row - cy;
-        if (sprite_row < 0 || sprite_row >= 64) continue;
+        /*
+         * sprite_row: which row of the 64-row sprite bitmap to use.
+         * yoff rows were already skipped (cursor partially above screen top).
+         * cursor_buf was loaded starting at row yoff, so cursor_buf[0]
+         * corresponds to sprite row yoff → screen row cy.
+         * buf_row = row - cy  (0-based index into cursor_buf).
+         */
+        int buf_row = row - cy;
+        if (buf_row < 0 || buf_row >= (64 - yoff)) continue;
 
-        /* Read from cursor_buf (host-byte-order shadow, endian-safe) */
-        const uint8_t *plane0 = s->cursor_buf + sprite_row * 16;
-        const uint8_t *plane1 = s->cursor_buf + sprite_row * 16 + 8;
+        /*
+         * Each sprite row = 16 bytes: 8 bytes plane0 + 8 bytes plane1.
+         * Ported from 86Box banshee_hwcursor_draw():
+         *   plane0[c] = vram[addr + c]        (c = 0..7)
+         *   plane1[c] = vram[addr + c + 8]    (c = 0..7)
+         *   addr += 16  after each row
+         */
+        const uint8_t *plane0 = s->cursor_buf + (size_t)buf_row * 16;
+        const uint8_t *plane1 = s->cursor_buf + (size_t)buf_row * 16 + 8;
         uint8_t *dst_row = dst_base + (size_t)row * dst_pitch;
 
-        for (int bx = 0; bx < 64; bx++) {
-            int scr_x = cx + bx;
-            if (scr_x < 0 || scr_x >= w) continue;
+        int x_off = cx;   /* screen X of the first cursor pixel in this row */
 
-            int p0 = (plane0[bx >> 3] >> (7 - (bx & 7))) & 1;
-            int p1 = (plane1[bx >> 3] >> (7 - (bx & 7))) & 1;
+        for (int bx = 0; bx < 64; bx += 8) {
+            if (x_off > -8) {
+                uint8_t p0byte = plane0[bx >> 3];
+                uint8_t p1byte = plane1[bx >> 3];
+                for (int xx = 0; xx < 8; xx++) {
+                    int scr_x = x_off + xx;
+                    int p0 = (p0byte >> 7) & 1;
+                    int p1 = (p1byte >> 7) & 1;
+                    p0byte <<= 1;
+                    p1byte <<= 1;
 
-            uint32_t pixel;
-            if (x11_mode) {
-                if (!p0) continue;
-                pixel = p1 ? col1 : col0;
-            } else {
-                if (p0 && !p1) continue;
-                if (!p0) {
-                    pixel = p1 ? col1 : col0;
-                } else {
-                    if (dst_bpp == 4)
-                        ((uint32_t *)dst_row)[scr_x] ^= 0x00ffffffu;
-                    continue;
+                    if (scr_x < 0 || scr_x >= w) continue;
+
+                    uint32_t pixel;
+                    if (x11_mode) {
+                        /* X11 mode: plane0=mask (1=draw), plane1=color */
+                        if (!p0) continue;
+                        pixel = p1 ? col1 : col0;
+                    } else {
+                        /* Windows AND/XOR mode (86Box default):
+                         *   p0=0, p1=0  → transparent (skip)
+                         *   p0=0, p1=1  → color1 (foreground)
+                         *   p1=0, p0=1  → color0 (background)  -- wait, no:
+                         *
+                         * 86Box logic:
+                         *   if !(plane0 & bit) → draw plane1 ? col1 : col0
+                         *   else if (plane1 & bit) → XOR pixel with 0xffffff
+                         *   else → transparent
+                         */
+                        if (!p0) {
+                            pixel = p1 ? col1 : col0;
+                        } else if (p1) {
+                            /* XOR invert */
+                            if (dst_bpp == 4)
+                                ((uint32_t *)dst_row)[scr_x] ^= 0x00ffffffu;
+                            continue;
+                        } else {
+                            continue;  /* transparent */
+                        }
+                    }
+
+                    if (dst_bpp == 4) {
+                        ((uint32_t *)dst_row)[scr_x] = 0xff000000u | pixel;
+                    } else if (dst_bpp == 3) {
+                        dst_row[scr_x*3+0] =  pixel        & 0xff;
+                        dst_row[scr_x*3+1] = (pixel >>  8) & 0xff;
+                        dst_row[scr_x*3+2] = (pixel >> 16) & 0xff;
+                    } else if (dst_bpp == 2) {
+                        ((uint16_t *)dst_row)[scr_x] = (uint16_t)(
+                            (((pixel>>16)&0xff)>>3)<<11 |
+                            (((pixel>> 8)&0xff)>>2)<< 5 |
+                            (( pixel     &0xff)>>3));
+                    }
                 }
             }
-
-            if (dst_bpp == 4) {
-                ((uint32_t *)dst_row)[scr_x] = 0xff000000u | pixel;
-            } else if (dst_bpp == 3) {
-                dst_row[scr_x*3+0] =  pixel        & 0xff;
-                dst_row[scr_x*3+1] = (pixel >>  8) & 0xff;
-                dst_row[scr_x*3+2] = (pixel >> 16) & 0xff;
-            } else if (dst_bpp == 2) {
-                ((uint16_t *)dst_row)[scr_x] = (uint16_t)(
-                    (((pixel>>16)&0xff)>>3)<<11 |
-                    (((pixel>> 8)&0xff)>>2)<< 5 |
-                    (( pixel     &0xff)>>3));
-            }
+            x_off += 8;
         }
     }
 }

@@ -24,6 +24,7 @@
 #include "hw/display/voodoo3_texture.h"  /* voodoo3_tex_params_t etc.  */
 #include "hw/display/voodoo3_render.h"    /* voodoo3_triangle, voodoo3_triangle_setup */
 #include "hw/display/voodoo3_display.h"  /* V3_DIRTY_LINES             */
+#include "vga_int.h"                      /* VGACommonState             */
 
 /* Floating-point/integer union used in reg decode and setup */
 typedef union { uint32_t i; float f; } fi_t;
@@ -134,9 +135,19 @@ typedef struct voodoo3_vert_t {
 /* =========================================================================
  * Banshee 2D blitter state (mirrors banshee_t BLT fields)
  * ========================================================================= */
+/*
+ * Clip rectangle — ported from 86Box banshee_blt clip_t.
+ * clip[0] = clip0 (registers 0x08/0x0c), clip[1] = clip1 (0x4c/0x50).
+ * COMMAND_CLIP_SEL (bit 23) selects which rect is active.
+ */
+typedef struct {
+    int x_min, y_min, x_max, y_max;
+} v3_clip_t;
+
 typedef struct voodoo3_blt_t {
     /* ---- Raw registers (from Banshee 2D reg map) ---- */
     uint32_t clip0Min, clip0Max;
+    uint32_t clip1Min, clip1Max;
     uint32_t dstBaseAddr, dstFormat;
     uint32_t srcColorkeyMin, srcColorkeyMax;
     uint32_t dstColorkeyMin, dstColorkeyMax;
@@ -145,27 +156,82 @@ typedef struct voodoo3_blt_t {
     uint32_t srcBaseAddr, srcFormat;
     uint32_t commandExtra;
     uint32_t lineStipple, lineStyle;
-    uint32_t pattern0, pattern1;
     uint32_t srcSize;           /* bits[12:0]=W, bits[28:16]=H */
     uint32_t srcXY;             /* bits[12:0]=X, bits[28:16]=Y */
     uint32_t colorBack, colorFore;
     uint32_t dstSize;           /* bits[12:0]=W, bits[28:16]=H */
     uint32_t dstXY;             /* bits[12:0]=X, bits[28:16]=Y */
     uint32_t command;
+
+    /* ---- Clip rectangles (decoded, 86Box banshee_blt clip[2]) ---- */
+    v3_clip_t clip[2];          /* [0]=clip0, [1]=clip1 */
+
     /* ---- Tiling flags (bit[31] of base addr registers) ---- */
     bool     dstTiled, srcTiled;
+    uint32_t dstBaseAddr_tiled; /* non-zero if tiled (mirrors bit31 of dstBaseAddr raw) */
+    uint32_t srcBaseAddr_tiled;
+
     /* ---- Launch-pending flag (86Box launch_pending) ---- */
     bool     launch_pending;
+
     /* ---- Decoded geometry (updated by reg writes) ---- */
     int      dstX, dstY, srcX, srcY;
-    int      dstW, dstH, srcW, srcH;
-    uint32_t dstStride, srcStride;
+    int      old_srcX;          /* saved srcX at launch (86Box) */
+    int      dstW, dstH, srcW, srcH;     /* dstSizeX/Y, srcSizeX/Y */
+    int      dstSizeX, dstSizeY;
+    int      srcSizeX, srcSizeY;
+    uint32_t dstStride;         /* dst_stride in bytes (computed) */
+    uint32_t srcStride;         /* src_stride in bytes (computed) */
+    uint32_t dst_stride;        /* same as dstStride (86Box naming) */
+    uint32_t src_stride;        /* same as srcStride (86Box naming) */
     int      dstBpp, srcBpp;
-    /* ---- H2S pixel accumulation (host-to-screen BLT) ---- */
+    int      src_bpp;           /* source bits-per-pixel (86Box blt.src_bpp) */
+
+    /* ---- ROP array (86Box banshee_blt rops[4]) ---- */
+    uint8_t  rops[4];           /* [0]=main ROP, [1..3]=colorkey ROP variants */
+
+    /* ---- Pattern state (86Box banshee_blt colorPattern*) ---- */
+    /*
+     * colorPattern[64]: 8×8 32-bit pixel pattern (256 bytes).
+     * Decoded views for faster 8/16/24-bpp access:
+     *   colorPattern8[64]:  8×8 bytes
+     *   colorPattern16[64]: 8×8 uint16
+     *   colorPattern24[64]: 8×8 uint32 (low 24 bits used)
+     * patoff_x/y: pattern offset from command register bits[20:17].
+     */
+    uint32_t colorPattern[64];
+    uint32_t colorPattern24[64];
+    uint16_t colorPattern16[64];
+    uint8_t  colorPattern8[64];
+    int      patoff_x, patoff_y;
+
+    /* ---- H2S / stretch-blt pixel accumulation ---- */
     uint8_t  host_data[8192];   /* per-row accumulation buffer */
     int      host_data_count;   /* bytes accumulated so far    */
-    int      src_stride_dest;   /* source bytes per row        */
-    int      cur_y;             /* current destination row     */
+    int      host_data_remainder;
+    int      host_data_size_src;  /* source row bytes (for stretch) */
+    int      host_data_size_dest; /* dest row bytes */
+    int      src_stride_src;      /* src stride for stretch src */
+    int      src_stride_dest;     /* src stride for stretch dest */
+    int      cur_x, cur_y;        /* current pixel/row position */
+
+    /* ---- Bresenham error terms (decoded from bresError0/1) ---- */
+    int      bres_error_0;      /* Y stretch error accumulator */
+    int      bres_error_1;      /* X stretch error accumulator (unused) */
+
+    /* ---- Line drawing state (86Box banshee_blt line_*) ---- */
+    int      line_rep_cnt;      /* lineStyle[7:0]:  pixel repeat count */
+    int      line_bit_mask_size;/* lineStyle[12:8]: stipple pattern size */
+    int      line_pix_pos;      /* lineStyle[23:16]: current pixel pos */
+    int      line_bit_pos;      /* lineStyle[28:24]: current bit pos */
+
+    /* ---- Polyfill state (86Box banshee_blt lx/rx/ly/ry) ---- */
+    int      lx[2], ly[2];     /* left  edge start/end vertices */
+    int      rx[2], ry[2];     /* right edge start/end vertices */
+    int      lx_cur, rx_cur;   /* current X intercepts */
+    int      dx[2], dy[2];     /* deltas for left/right edges */
+    int      x_inc[2];         /* X step direction for each edge */
+    int      error[2];         /* Bresenham errors for each edge */
 } voodoo3_blt_t;
 
 /* =========================================================================
@@ -174,15 +240,41 @@ typedef struct voodoo3_blt_t {
 struct Voodoo3State {
     PCIDevice   parent_obj;         /* MUST be first */
 
+    /*
+     * Embedded VGA core (pattern from hw/display/ati.c).
+     *
+     * vga_init() registers VGA I/O ports 0x3B0–0x3DF on the ISA bus and
+     * maps VGA MMIO at 0xA0000–0xBFFFF.  These are required for:
+     *
+     *   • BIOS/UEFI POST:  probes 0x3C2 (Misc Output) + 0x3DA (Input Status)
+     *   • Linux vesafb/efifb: programs CRTC regs before loading the KMS driver
+     *   • Linux fbdev/vgacon: uses the standard VGA text-mode path on boot
+     *   • Windows VGA miniport: accesses 0x3C0–0x3DF before the ICD loads
+     *
+     * Without these ports display_enabled never becomes true → black screen.
+     *
+     * The VGA console (vga.con, index 0) handles text mode and the early
+     * graphical boot phase.  Once the native Voodoo3 driver sets
+     * VIDPROCCFG_VIDPROC_ENABLE, we switch to the native console (s->con,
+     * index 1) and stop forwarding to vga_update_display().
+     *
+     * vga.vram_size_mb defaults to 4 MB (set in voodoo3_pci_realize before
+     * calling vga_common_init).  The Voodoo3's own SGRAM lives in fb_mem;
+     * the VGA VRAM is only used for VGA-compat text/graphic modes.
+     */
+    VGACommonState vga;
+
     /* BARs */
     MemoryRegion mmio, lfb, io;
 
-    /* Display */
+    /* Native Voodoo3 display console (index 1, used after driver init) */
     QemuConsole  *con;
     QEMUTimer    *vblank_timer;
     bool          in_vblank;
     int           screen_width, screen_height;
     bool          display_enabled;
+    bool          driver_active;    /* true once driver has set VIDPROC_ENABLE=1;
+                                     * disables VGA-fallback in vidProcCfg handler */
     int           pix_format;
 
     /* SGRAM */
@@ -199,6 +291,7 @@ struct Voodoo3State {
     bool          cursor_ena;
     uint32_t      cur_pat_addr;
     int           cur_x, cur_y;
+    int           cur_yoff;     /* sprite rows skipped when cursor clips above screen top */
     uint32_t      cur_c0, cur_c1;
     /*
      * Shadow copy of the cursor bitmap, kept in host byte order.
@@ -227,6 +320,64 @@ struct Voodoo3State {
     uint32_t hwCurPatAddr, hwCurLoc, hwCurC0, hwCurC1;
     uint32_t intrCtrl;
     uint32_t command_2d, srcBaseAddr_2d;
+
+    /*
+     * VGA register state — ported from 86Box svga_t fields used by
+     * banshee_in() / banshee_out() and svga_in() / svga_out().
+     *
+     * The Banshee/V3 exposes standard VGA I/O ports 0x3b0..0x3df via two paths:
+     *   1. Physical I/O ports 0x3c0..0x3df — registered with io_sethandler()
+     *      in 86Box; in QEMU this maps to BAR2 offsets 0xb0..0xdf.
+     *   2. BAR0 IO-remap window (offset 0xb0..0xdf), forwarded by
+     *      banshee_ext_out/in() → banshee_out/in() → svga_out/in().
+     *
+     * misc_out: Miscellaneous Output Register (0x3c2 write / 0x3cc read).
+     *   bit 0 = I/O address select (0=3Bx, 1=3Dx)
+     *   bit 1 = RAM enable
+     *   bits 3:2 = clock select (for pllCtrl recalc)
+     *   bit 5 = page select (odd/even)
+     *   bit 6 = horizontal sync polarity
+     *   bit 7 = vertical sync polarity
+     * 86Box svga_t: svga->miscout, initialised to 1 (I/O select = 3Dx).
+     *
+     * feat_reg: Feature Control Register (0x3da write / 0x3ca read).
+     *
+     * seq_idx / seq_regs[8]: Sequencer index (0x3c4) and data (0x3c5).
+     *   [0]=Reset, [1]=Clocking Mode, [2]=Map Mask, [3]=Char Map Sel, [4]=Mem Mode
+     *
+     * gr_idx / gr_regs[16]: Graphics Controller index (0x3ce) and data (0x3cf).
+     *   [5]=Mode, [6]=Misc (map select, chain4, odd/even)
+     *
+     * ar_idx / ar_regs[32] / ar_flip_flop: Attribute Controller (0x3c0).
+     *   The ATC shares one port for index and data, toggled by ar_flip_flop.
+     *   Reading 0x3da resets ar_flip_flop to index mode.
+     *
+     * dac_pel_mask: DAC PEL mask (0x3c6), default 0xff.
+     * dac_read_addr / dac_write_addr: DAC address registers (0x3c7 / 0x3c8).
+     * dac_rgb_idx: byte counter 0/1/2 for R/G/B triplet accumulation.
+     * dac_rgb_buf[3]: partial RGB triplet buffer for DAC writes.
+     * dac_state: 0=write mode, 3=read mode (matches 86Box svga->dac_state).
+     *
+     * Note: CRTC registers reuse the existing crtc_ctrl[64] array.
+     *   The ext path (0xd4/0xd5 via BAR0/BAR2) and the VGA path (0x3d4/0x3d5)
+     *   both read/write the same crtc_ctrl[] — identical to 86Box where
+     *   banshee_ext_outl(crtcCtrl) and banshee_out(0x3d4/0x3d5) both touch svga->crtc[].
+     */
+    uint8_t  misc_out;             /* Misc Output Register              */
+    uint8_t  feat_reg;             /* Feature Control Register          */
+    uint8_t  seq_idx;              /* Sequencer index (0x3c4)           */
+    uint8_t  seq_regs[8];          /* Sequencer registers [0..7]        */
+    uint8_t  gr_idx;               /* Graphics Controller index (0x3ce) */
+    uint8_t  gr_regs[16];          /* GRC registers [0..15]             */
+    uint8_t  ar_idx;               /* ATC index register                */
+    uint8_t  ar_regs[32];          /* ATC registers [0..31]             */
+    bool     ar_flip_flop;         /* false=index, true=data            */
+    uint8_t  dac_pel_mask;         /* DAC PEL mask (0x3c6), default 0xff */
+    uint8_t  dac_read_addr;        /* DAC read address (0x3c7)          */
+    uint8_t  dac_write_addr;       /* DAC write address (0x3c8)         */
+    uint8_t  dac_rgb_idx;          /* R/G/B byte counter (0, 1, 2)      */
+    uint8_t  dac_rgb_buf[3];       /* partial RGB triplet               */
+    uint8_t  dac_state;            /* 0=write, 3=read (86Box dac_state) */
 
     /* Generic register scratch (for misc unmapped regs) */
     uint32_t regs[512];
@@ -293,8 +444,6 @@ struct Voodoo3State {
     uint32_t model;
     bool     is_agp, bilinear, dac_filter;
 
-    /* PPC big-endian swap */
-
     /* --- Texture subsystem (ported from 86Box voodoo_t) ----------------- */
 
     /* Texture RAM: 4 MB per TMU (Voodoo 3 shares 8 MB SGRAM, split 4+4) */
@@ -326,9 +475,76 @@ struct Voodoo3State {
     uint32_t             swap_offset;     /* draw_offset to flip to       */
     int                  retrace_count;   /* vblanks since swap requested */
     uint32_t             frame_count;     /* total frames rendered         */
+
+    /* --- AGP host→VRAM DMA transfer registers (86Box banshee_t agp*) --- *
+     * Written via banshee_cmd_write() Agp_* cases (BAR0+0x80000 area).    *
+     * agpMoveCMD triggers the actual transfer; others set up the params.   */
+    uint32_t             agpReqSize;            /* bytes to transfer        */
+    uint32_t             agpHostAddressLow;     /* source host address      */
+    uint32_t             agpHostAddressHigh;    /* width[13:0]+stride[27:14]*/
+    uint32_t             agpGraphicsAddress;    /* dest VRAM byte address   */
+    uint32_t             agpGraphicsStride;     /* dest stride in bytes     */
+    uint32_t             agpMoveCMD;            /* trigger + dest type      */
+
+    /* --- CMDFIFO0 state (BAR0 + 0x80000, 86Box banshee_t cmdfifo_*) ---- *
+     *                                                                       *
+     * The hardware CMDFIFO is an AGP/PCI ring buffer that the driver        *
+     * configures via registers at BAR0+0x80020..0x80048.  The driver writes *
+     * these on every mode-set; without them the driver's init sequence       *
+     * spins forever on cmdFifoDepth and the system hangs/BSODs.             *
+     *                                                                       *
+     * FIFO0 is the primary command FIFO (PCI and AGP).                      *
+     * FIFO1 is the secondary FIFO (AGP burst only).                         *
+     * Both have the same register layout; FIFO1 starts at offset +0x30.     */
+    uint32_t             cmdfifo_base;        /* FIFO0 base address           */
+    uint32_t             cmdfifo_end;         /* FIFO0 end address (computed) */
+    uint32_t             cmdfifo_size;        /* raw cmdBaseSize0 value        */
+    bool                 cmdfifo_enabled;     /* bit 8 of cmdBaseSize0         */
+    bool                 cmdfifo_in_agp;      /* bit 9 of cmdBaseSize0         */
+    int                  cmdfifo_in_sub;      /* subroutine nesting depth      */
+    uint32_t             cmdfifo_rp;          /* read pointer                  */
+    uint32_t             cmdfifo_amin;        /* contiguous block lower bound  */
+    uint32_t             cmdfifo_amax;        /* contiguous block upper bound  */
+    uint32_t             cmdfifo_depth_rd;    /* depth read counter            */
+    uint32_t             cmdfifo_depth_wr;    /* depth write counter           */
+    uint32_t             cmdfifo_holecount;   /* outstanding holes in stream   */
+
+    /* --- CMDFIFO1 state ------------------------------------------------- */
+    uint32_t             cmdfifo_base_2;
+    uint32_t             cmdfifo_end_2;
+    uint32_t             cmdfifo_size_2;
+    bool                 cmdfifo_enabled_2;
+    bool                 cmdfifo_in_agp_2;
+    int                  cmdfifo_in_sub_2;
+    uint32_t             cmdfifo_rp_2;
+    uint32_t             cmdfifo_amin_2;
+    uint32_t             cmdfifo_amax_2;
+    uint32_t             cmdfifo_depth_rd_2;
+    uint32_t             cmdfifo_depth_wr_2;
+    uint32_t             cmdfifo_holecount_2;
+
+    /* --- VGA IRQ state -------------------------------------------------- */
+    bool                 vblank_irq_pending; /* set by vblank cb, cleared by ISR */
+
+    /* Diagnostic: counts status register reads after mode-set */
+    uint32_t             status_read_count;
+
+    /* --- PLL / pixel clock state ---------------------------------------- *
+     * pixel_clock_hz: current pixel clock frequency in Hz, computed from    *
+     *   pllCtrl0 by voodoo3_pll_recalc().  Used to derive the vblank timer  *
+     *   period so the emulated refresh rate tracks the programmed PLL.       *
+     *                                                                        *
+     * vblank_period_ns: nanoseconds per frame = (htotal * vtotal) /          *
+     *   pixel_clock_hz * 1e9.  Stored so voodoo3_vblank_cb() can reschedule  *
+     *   the timer without recomputing the PLL formula every vblank.          *
+     *                                                                        *
+     * 86Box equivalent: svga->clock (cycles per pixel) computed in           *
+     *   banshee_recalctimings() and used by svga_recalctimings() to derive   *
+     *   the scanline/frame timings.  We skip the scanline granularity and    *
+     *   go straight to the full-frame period.                                */
+    double               pixel_clock_hz;    /* Hz, 0 = use VBLANK_HZ default */
+    int64_t              vblank_period_ns;  /* ns per frame, 0 = use default  */
 };
-
-
 
 /* Internal function declared in voodoo3.c, used by voodoo3_setup.c */
 

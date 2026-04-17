@@ -50,10 +50,17 @@
  * [x] VMState for snapshots
  * [ ] Actual pixel-level triangle rasterizer (voodoo_triangle inner loop)
  * [ ] Texture fetch & filtering (voodoo_texture.c port)
- * [ ] Full Banshee 2D pixel operations (stretch-blt, line, polyline)
+ * [x] Full Banshee 2D pixel operations:
+ *       RectFill (ROP+pattern+clip+TRANS_MONO)
+ *       Screen-to-Screen BLT (ROP+colorkey+pattern+clip+YUV422+color-conv)
+ *       Screen-to-Screen Stretch BLT (Bresenham X+Y scaling)
+ *       Host-to-Screen BLT (byte/word swizzle, stride/byte/word/dword packing)
+ *       Host-to-Screen Stretch BLT
+ *       Line / Polyline (Bresenham + stipple + TRANS_MONO + clip)
+ *       Polyfill (span-fill with 2-edge Bresenham)
  * [ ] CMDFIFO (AGP ring buffer) processing
  * [ ] Hardware cursor compositing
- * [ ] DAC PLL clock recalculation
+ * [x] DAC PLL clock recalculation (voodoo3_pll_calc_freq / voodoo3_pll_update_vblank)
  * -------------------------------------------------------------------------
  */
 
@@ -121,8 +128,11 @@
 #define Init_vgaInit1                    0x2c
 #define Init_2dCommand                   0x30
 #define Init_2dSrcBaseAddr               0x34
-#define Init_2dSrcFormat                 0x38   /* Banshee 2D source format */
-#define Init_2dSrcSize                   0x3c   /* Banshee 2D source size   */
+#define Init_strapInfo                   0x38   /* Strap configuration: mem size, bus type, IRQ, BIOS size
+                                                 * Read-only. 86Box banshee_ext_inl() Init_strapInfo.
+                                                 * The real 3dfx BIOS reads this on boot to determine
+                                                 * SDRAM/SGRAM config and ROM size. Bit 6 set = PCI+IRQ. */
+#define Init_2dSrcSize                   0x3c   /* Banshee 2D source size (write-only scratch) */
 #define PLL_pllCtrl0                     0x40
 #define PLL_pllCtrl1                     0x44
 #define PLL_pllCtrl2                     0x48
@@ -365,8 +375,55 @@
 #define COMMAND_CMD_POLYLINE    (7u << 0)
 #define COMMAND_CMD_POLYFILL    (8u << 0)
 #define COMMAND_INITIATE        (1u << 8)
+#define COMMAND_INC_X_START     (1u << 10)
+#define COMMAND_INC_Y_START     (1u << 11)
+#define COMMAND_STIPPLE_LINE    (1u << 12)
+#define COMMAND_PATTERN_MONO    (1u << 13)
 #define COMMAND_DX              (1u << 14)
 #define COMMAND_DY              (1u << 15)
+#define COMMAND_TRANS_MONO      (1u << 16)
+#define COMMAND_PATOFF_X_MASK   (7u << 17)
+#define COMMAND_PATOFF_X_SHIFT  17
+#define COMMAND_PATOFF_Y_MASK   (7u << 20)
+#define COMMAND_PATOFF_Y_SHIFT  20
+#define COMMAND_CLIP_SEL        (1u << 23)
+
+#define CMDEXTRA_SRC_COLORKEY   (1u << 0)
+#define CMDEXTRA_DST_COLORKEY   (1u << 1)
+#define CMDEXTRA_FORCE_PAT_ROW0 (1u << 3)
+
+/* SRC_FORMAT bits (86Box vid_voodoo_banshee_blitter.c) */
+#define SRC_FORMAT_STRIDE_MASK   0x1fffu
+#define SRC_FORMAT_COL_MASK      (0xfu << 16)
+#define SRC_FORMAT_COL_1_BPP     (0u  << 16)
+#define SRC_FORMAT_COL_8_BPP     (1u  << 16)
+#define SRC_FORMAT_COL_16_BPP    (3u  << 16)
+#define SRC_FORMAT_COL_24_BPP    (4u  << 16)
+#define SRC_FORMAT_COL_32_BPP    (5u  << 16)
+#define SRC_FORMAT_COL_YUYV      (8u  << 16)
+#define SRC_FORMAT_COL_UYVY      (9u  << 16)
+#define SRC_FORMAT_BYTE_SWIZZLE  (1u  << 20)
+#define SRC_FORMAT_WORD_SWIZZLE  (1u  << 21)
+#define SRC_FORMAT_PACKING_MASK  (3u  << 22)
+#define SRC_FORMAT_PACKING_STRIDE (0u << 22)
+#define SRC_FORMAT_PACKING_BYTE  (1u  << 22)
+#define SRC_FORMAT_PACKING_WORD  (2u  << 22)
+#define SRC_FORMAT_PACKING_DWORD (3u  << 22)
+
+/* DST_FORMAT bits */
+#define DST_FORMAT_COL_MASK      (0xfu << 16)
+#define DST_FORMAT_COL_8_BPP     (1u  << 16)
+#define DST_FORMAT_COL_16_BPP    (3u  << 16)
+#define DST_FORMAT_COL_24_BPP    (4u  << 16)
+#define DST_FORMAT_COL_32_BPP    (5u  << 16)
+
+/* Colorkey format tags (for MIX/colorkey helpers) */
+#define BLT_COLORKEY_8    0
+#define BLT_COLORKEY_16   1
+#define BLT_COLORKEY_32   2
+
+#define BRES_ERROR_MASK   0xffffu
+#define BRES_ERROR_USE    (1u << 31)
 
 /* Setup mode bits (vid_voodoo_setup.c) */
 #define SETUPMODE_RGB           (1 << 0)
@@ -444,6 +501,169 @@ void voodoo3_queue_triangle(Voodoo3State *s, voodoo3_params_t *p)
     s->param_wr++;
     s->voodoo_busy = true;
     qemu_cond_broadcast(&s->render_cond);
+}
+
+/* =========================================================================
+ * PLL pixel-clock recalculation
+ *
+ * Ported from 86Box banshee_recalctimings() (vid_voodoo_banshee.c line 729).
+ *
+ * The Banshee/V3 has three PLLs (pllCtrl0/1/2).  Only pllCtrl0 is used for
+ * the pixel clock; pllCtrl1/2 are stored but not used in clock generation
+ * (confirmed: 86Box only reads pllCtrl0 in banshee_recalctimings).
+ *
+ * PLL formula (from 86Box and 3dfx Banshee datasheet):
+ *   k    = pllCtrl0[1:0]          — output divider (0..3, divide by 1/2/4/8)
+ *   m    = pllCtrl0[7:2]          — reference divider (0..63)
+ *   n    = pllCtrl0[15:8]         — feedback divider (0..255)
+ *   freq = ((n+2) / ((m+2) * (1<<k))) * 14318184.0  Hz
+ *
+ * The reference clock is the standard PC crystal: 14.318184 MHz.
+ *
+ * Misc Output Register bits[3:2] = clock select:
+ *   00 = 25.175 MHz  (standard VGA 640x480 @ 60 Hz)
+ *   01 = 28.322 MHz  (standard VGA 720x400 @ 70 Hz)
+ *   10 = reserved / external (not used on Banshee)
+ *   11 = PLL (pllCtrl0 formula above)
+ *
+ * 86Box: when clock_select != 3, svga_recalctimings() uses its own fixed
+ * clock table.  In QEMU we fall back to VBLANK_HZ for those modes.
+ *
+ * The computed pixel_clock_hz is used in voodoo3_pll_update_vblank() to
+ * derive the frame period from the CRTC total counts.  This makes the
+ * emulated vblank timer track the programmed refresh rate instead of always
+ * running at 60 Hz, which is important for drivers that check the DAC
+ * status register or use swapbuffer with a specific swap_interval.
+ *
+ * Trigger points (same as 86Box svga_recalctimings call sites):
+ *   - pllCtrl0 write  (primary: clock formula changes)
+ *   - misc_out write  (clock source select bits change)
+ *   - CRTC data write (htotal/vtotal change → frame period changes)
+ * ========================================================================= */
+
+/*
+ * voodoo3_pll_calc_freq — compute pixel clock Hz from pllCtrl0.
+ * Returns 0.0 if the PLL is not selected (misc_out clock select != 3).
+ * Pure calculation, no side effects.
+ */
+static double voodoo3_pll_calc_freq(Voodoo3State *s)
+{
+    /* Misc Output Register bits[3:2] = clock source select.
+     * 3 = PLL, anything else = fixed VGA clock. */
+    unsigned clk_sel = (s->misc_out >> 2) & 3u;
+    if (clk_sel != 3) {
+        /* Fixed VGA clocks — 86Box svga core handles these.
+         * Return standard frequencies so vblank period is reasonable. */
+        return (clk_sel == 0) ? 25175000.0 : 28322000.0;
+    }
+
+    /* PLL selected: decode pllCtrl0 fields (86Box banshee_recalctimings) */
+    unsigned k = s->pllCtrl0 & 0x3u;           /* bits[1:0]: output divider */
+    unsigned m = (s->pllCtrl0 >> 2) & 0x3fu;   /* bits[7:2]: ref divider    */
+    unsigned n = (s->pllCtrl0 >> 8) & 0xffu;   /* bits[15:8]: feedback div  */
+
+    /* Guard against degenerate values that produce division by zero.
+     * 86Box does no such check, but pllCtrl0=0 at reset would give freq=0. */
+    if ((m + 2) == 0 || (1u << k) == 0)
+        return 0.0;
+
+    double freq = ((double)(n + 2) / ((double)(m + 2) * (double)(1u << k)))
+                  * 14318184.0;
+    return freq;
+}
+
+/*
+ * voodoo3_pll_update_vblank — recompute vblank_period_ns from pixel clock
+ * and CRTC total counts, then reschedule the vblank timer.
+ *
+ * CRTC register layout (standard VGA + Banshee extensions):
+ *
+ *   htotal (pixel clocks per line, including blanking):
+ *     base  = (CRTC[0x00] + 5) * dots_per_clock
+ *     +ext  = CRTC[0x1a] bit0 → +0x100 character clocks
+ *     dots_per_clock = 8 (seq[1] bit3=0) or 16 (seq[1] bit3=1)
+ *     86Box: svga->htotal is in character clocks, then *dots_per_clock.
+ *     We compute total pixel clocks directly.
+ *
+ *   vtotal (lines per frame, including blanking):
+ *     base  = CRTC[0x06]
+ *           | ((CRTC[0x07] & 0x01) << 8)   overflow bit 8
+ *           | ((CRTC[0x07] & 0x20) << 4)   overflow bit 9
+ *     +ext  = CRTC[0x1b] bit0 → +0x400    (Banshee-specific extension)
+ *     +2    (VGA convention: register value is vtotal - 2)
+ *
+ * frame_period = (htotal_pixels * vtotal_lines) / pixel_clock_hz  seconds
+ * vblank_period_ns = frame_period * 1e9
+ *
+ * Falls back to VBLANK_HZ (60 Hz) if pixel_clock_hz is 0 or CRTC totals
+ * are not yet programmed (avoids division by zero and timer storm).
+ */
+static void voodoo3_pll_update_vblank(Voodoo3State *s)
+{
+    double freq = voodoo3_pll_calc_freq(s);
+    s->pixel_clock_hz = freq;
+
+    /* dots_per_clock: sequencer register [1] bit 3 = 8-dot/16-dot clock.
+     * 86Box: svga->dots_per_clock = (seqregs[1] & 8) ? 16 : 8 */
+    int dots = (s->seq_regs[1] & 0x08u) ? 16 : 8;
+
+    /* htotal in pixel clocks:
+     *   CRTC[0x00] = (htotal / char_clocks) - 5
+     *   +Banshee: CRTC[0x1a] bit0 = htotal bit 8 (in char clocks)
+     *   total char clocks = (CRTC[0x00] + 5) + (CRTC[0x1a]&1 ? 0x100 : 0)
+     *   total pixels      = char_clocks * dots_per_clock
+     */
+    int htotal_chars = ((int)s->crtc_ctrl[0x00] + 5)
+                     + ((s->crtc_ctrl[0x1a] & 0x01u) ? 0x100 : 0);
+    int htotal = htotal_chars * dots;
+
+    /* vtotal in lines (86Box banshee_recalctimings):
+     *   base = CRTC[0x06]
+     *        | ((CRTC[0x07] & 0x01) << 8)
+     *        | ((CRTC[0x07] & 0x20) << 4)
+     *        + 2
+     *   Banshee extension: CRTC[0x1b] bit0 → +0x400
+     */
+    int vtotal = ((int)s->crtc_ctrl[0x06]
+               | (((int)s->crtc_ctrl[0x07] & 0x01) << 8)
+               | (((int)s->crtc_ctrl[0x07] & 0x20) << 4))
+               + 2;
+    if (s->crtc_ctrl[0x1b] & 0x01u)
+        vtotal += 0x400;
+
+    int64_t period_ns;
+
+    if (freq > 1000.0 && htotal > 0 && vtotal > 0) {
+        /* Normal path: derive period from pixel clock and CRTC totals */
+        double frame_s = (double)(htotal * vtotal) / freq;
+        period_ns = (int64_t)(frame_s * 1e9);
+
+        /* Sanity clamp: 10 Hz .. 240 Hz (4 ms .. 100 ms) */
+        if (period_ns < 4000000LL)
+            period_ns = 4000000LL;    /* 250 Hz cap   */
+        if (period_ns > 100000000LL)
+            period_ns = 100000000LL;  /* 10 Hz floor  */
+    } else {
+        /* Fallback: CRTC not yet programmed or PLL disabled */
+        period_ns = NANOSECONDS_PER_SECOND / VBLANK_HZ;
+    }
+
+    s->vblank_period_ns = period_ns;
+
+    /* Reschedule the vblank timer with the new period.
+     * Only do this if the timer is active (after realize). */
+    if (s->vblank_timer) {
+        timer_mod(s->vblank_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + period_ns);
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+        "voodoo3: PLL recalc: pllCtrl0=0x%08x clk_sel=%u "
+        "pixel_clock=%.3f MHz htotal=%d vtotal=%d period=%" PRId64 " ns "
+        "(%.2f Hz)\n",
+        s->pllCtrl0, (s->misc_out >> 2) & 3u,
+        freq / 1e6, htotal, vtotal, period_ns,
+        period_ns > 0 ? 1e9 / (double)period_ns : 0.0);
 }
 
 /* =========================================================================
@@ -584,27 +804,99 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
     case Init_tmugbInit:   /* TMU global buffer — store, no effect needed */ break;
     case Init_2dCommand:   s->command_2d = val; break;
     case Init_2dSrcBaseAddr: s->srcBaseAddr_2d = val; break;
-    case Init_2dSrcFormat: s->regs[Init_2dSrcFormat >> 2] = val; break;
+    /* Init_strapInfo (0x38) is read-only — no write case */
     case Init_2dSrcSize:   s->regs[Init_2dSrcSize   >> 2] = val; break;
     case Init_vgaInit0:    s->vgaInit0  = val; break;
     case Init_vgaInit1:    s->vgaInit1  = val; break;
 
-    case PLL_pllCtrl0: s->pllCtrl0 = val; break; /* TODO: pixel-clock recalc */
-    case PLL_pllCtrl1: s->pllCtrl1 = val; break;
-    case PLL_pllCtrl2: s->pllCtrl2 = val; break;
+    case PLL_pllCtrl0:
+        s->pllCtrl0 = val;
+        /*
+         * Ported from 86Box banshee_recalctimings():
+         * The pixel clock formula is evaluated whenever pllCtrl0 changes.
+         * 86Box triggers this via svga_recalctimings() which calls
+         * banshee_recalctimings() as a callback.  In QEMU we call
+         * voodoo3_pll_update_vblank() directly.
+         */
+        voodoo3_pll_update_vblank(s);
+        break;
+    case PLL_pllCtrl1: s->pllCtrl1 = val; break;  /* stored, not used in clk */
+    case PLL_pllCtrl2: s->pllCtrl2 = val; break;  /* stored, not used in clk */
 
     case DAC_dacMode:
         s->dacMode = val;
         break;
-    case DAC_dacAddr:
-        s->dacAddr = (int)(val & 0x1ff);
+
+    /*
+     * DAC_dacAddr (0x50) — 32-bit DWORD write via BAR0 MMIO (ext_outl path).
+     * Byte-wise I/O to BAR2 also lands here for offset 0x50 (addr byte 0).
+     * Offsets 0x51..0x53 are the upper bytes of the 32-bit dacAddr register;
+     * the Banshee only uses bits[8:0] as the palette index, so bytes 1..3
+     * are always zero.  Silently accept them to suppress log spam.
+     *
+     * 86Box banshee_ext_outl(): banshee->dacAddr = val & 0x1ff
+     * (only dword writes; 86Box does not implement the byte-I/O path for ext
+     *  registers — it falls through to banshee_ext_out which only handles
+     *  VGA port proxy 0xb0..0xdf.  QEMU BAR2 delivers byte-I/O directly here.)
+     */
+    case DAC_dacAddr:           /* 0x50 — index byte 0 */
+        s->dacAddr      = (int)(val & 0x1ff);
+        s->dac_rgb_idx  = 0;   /* new address resets accumulator */
+        s->dac_write_addr = (uint8_t)(val & 0xff);
         break;
-    case DAC_dacData:
-        if (s->dacAddr < VOODOO3_CLUT_SIZE)
+    case 0x51:                  /* dacAddr byte 1 — always 0, ignore */
+    case 0x52:                  /* dacAddr byte 2 — always 0, ignore */
+    case 0x53:                  /* dacAddr byte 3 — always 0, ignore */
+        break;
+
+    /*
+     * DAC_dacData (0x54) — palette data.
+     *
+     * DWORD write (BAR0 ext_outl): val = 0x00RRGGBB, write pallook immediately.
+     * This is the 86Box path: banshee_ext_outl() DAC_dacData case.
+     *
+     * Byte write (BAR2 byte I/O): the guest writes R, G, B as three
+     * separate byte-wide I/O writes to offsets 0x54, 0x55, 0x56.
+     * We accumulate into dac_rgb_buf[] and commit on the third byte (0x56),
+     * then advance dacAddr — mirroring the VGA 0x3c9 accumulation logic.
+     *
+     * 86Box does not implement this byte-I/O path; AmigaOS/Tequila uses it
+     * because it accesses the Banshee I/O BAR one byte at a time.
+     */
+    case DAC_dacData:           /* 0x54 — R byte (or full DWORD) */
+        if (s->dac_rgb_idx == 0 && (val & 0xffff00u)) {
+            /*
+             * DWORD write: all three colour bytes present in val.
+             * 86Box path: pallook[dacAddr] = val & 0xffffff (R at bits[23:16]).
+             */
+            if (s->dacAddr < VOODOO3_CLUT_SIZE)
+                s->pallook[s->dacAddr] =
+                    (((val >> 16) & 0xff) << 16) |  /* R */
+                    (((val >>  8) & 0xff) <<  8) |  /* G */
+                    ( (val        & 0xff)      );   /* B */
+        } else {
+            /* Byte I/O path: accumulate R byte */
+            s->dac_rgb_buf[0] = (uint8_t)(val & 0xff);
+            s->dac_rgb_idx    = 1;
+        }
+        break;
+    case 0x55:                  /* dacData byte 1 = G */
+        s->dac_rgb_buf[1] = (uint8_t)(val & 0xff);
+        s->dac_rgb_idx    = 2;
+        break;
+    case 0x56:                  /* dacData byte 2 = B — commit on receipt */
+        s->dac_rgb_buf[2] = (uint8_t)(val & 0xff);
+        if (s->dacAddr < VOODOO3_CLUT_SIZE) {
             s->pallook[s->dacAddr] =
-				(((val >> 16) & 0xff) << 16) |  /* R */
-				(((val >>  8) & 0xff) <<  8) |  /* G */
-				( (val        & 0xff)      );   /* B */
+                ((uint32_t)s->dac_rgb_buf[0] << 16) |  /* R */
+                ((uint32_t)s->dac_rgb_buf[1] <<  8) |  /* G */
+                 (uint32_t)s->dac_rgb_buf[2];          /* B */
+        }
+        s->dacAddr        = (s->dacAddr + 1) & 0xff;
+        s->dac_write_addr = (uint8_t)s->dacAddr;
+        s->dac_rgb_idx    = 0;
+        break;
+    case 0x57:                  /* dacData byte 3 — padding, always 0, ignore */
         break;
 
     case Video_vidInFormat:
@@ -655,15 +947,40 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
     case Video_hwCurPatAddr:
         s->hwCurPatAddr = val;
         s->cur_pat_addr = val & 0xfffff0u;
-        /* Pre-populate cursor_buf from VRAM in case pattern was written before
-         * this register (e.g. driver sets up bitmap first, then sets address) */
-        if (s->cur_pat_addr + 1024u <= s->fb_size)
-            memcpy(s->cursor_buf, s->fb_mem + s->cur_pat_addr, 1024);
+        /*
+         * Ported from 86Box: addr = (val & 0xfffff0) + (yoff * 16)
+         * Pre-populate cursor_buf from the correct sprite row.
+         */
+        {
+            uint32_t base = s->cur_pat_addr + (uint32_t)s->cur_yoff * 16u;
+            uint32_t len  = 1024u - (uint32_t)s->cur_yoff * 16u;
+            if (base + len <= s->fb_size)
+                memcpy(s->cursor_buf, s->fb_mem + base, len);
+        }
         break;
     case Video_hwCurLoc:
         s->hwCurLoc = val;
-        s->cur_x    = (int)(val & 0x7ff) - 64;
-        s->cur_y    = (int)((val >> 16) & 0x7ff) - 64;
+        s->cur_x    = (int)(val & 0x7ffu) - 64;
+        s->cur_y    = (int)((val >> 16) & 0x7ffu) - 64;
+        /*
+         * Ported from 86Box banshee_ext_outl() Video_hwCurLoc:
+         * If cur_y < 0 the cursor is partially above the top of the screen.
+         * yoff = number of sprite rows to skip; addr is bumped by yoff*16
+         * so that banshee_hwcursor_draw() starts at the right row.
+         */
+        if (s->cur_y < 0) {
+            s->cur_yoff = -s->cur_y;
+            s->cur_y    = 0;
+        } else {
+            s->cur_yoff = 0;
+        }
+        /* Update cursor_buf to start at the correct sprite row */
+        {
+            uint32_t base = s->cur_pat_addr + (uint32_t)s->cur_yoff * 16u;
+            if (base + 1024u <= s->fb_size)
+                memcpy(s->cursor_buf, s->fb_mem + base,
+                       1024u - (uint32_t)s->cur_yoff * 16u);
+        }
         break;
     case Video_hwCurC0: s->cur_c0 = val; break;
     case Video_hwCurC1: s->cur_c1 = val; break;
@@ -791,6 +1108,7 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
             if (s->crtc_idx < 64) {
                 s->crtc_ctrl[s->crtc_idx] = (uint8_t)(val & 0xff);
                 voodoo3_crtc_update(s);
+                voodoo3_pll_update_vblank(s);
             }
             break;
         /* dacStatus is read-only — writes silently ignored */
@@ -821,14 +1139,36 @@ static uint32_t voodoo3_ext_read(Voodoo3State *s, uint32_t addr)
     case Init_vgaInit1:            return s->vgaInit1;
     case Init_2dCommand:           return s->command_2d;
     case Init_2dSrcBaseAddr:       return s->srcBaseAddr_2d;
+    case Init_strapInfo:
+        /*
+         * Strap configuration register — read-only, set by hardware straps.
+         * 86Box banshee_ext_inl() returns 0x00000040 for all Banshee/V3 models:
+         *   bit 6     = PCI bus (not AGP), IRQ enabled, 32kB BIOS present
+         *   bits 3:0  = memory configuration (8 MB SGRAM, per 86Box comment)
+         * The real 3dfx BIOS reads this register first during POST to determine
+         * SDRAM vs SGRAM and memory size.  Returning 0 causes silent init failure.
+         * 86Box vid_voodoo_banshee.c returns 0x40 for ALL models (PCI && AGP) — no AGP distinction.
+         * A proposed 0xC0 for AGP (bit 7 = AGP mode per 3dfx datasheet) is NOT in 86Box.
+         */
+        return 0x00000040;
     case PLL_pllCtrl0:             return s->pllCtrl0;
     case PLL_pllCtrl1:             return s->pllCtrl1;
     case PLL_pllCtrl2:             return s->pllCtrl2;
     case DAC_dacMode:              return s->dacMode;
     case DAC_dacAddr:              return (uint32_t)s->dacAddr;
+    case 0x51: return 0;           /* dacAddr byte 1 — always 0 */
+    case 0x52: return 0;           /* dacAddr byte 2 — always 0 */
+    case 0x53: return 0;           /* dacAddr byte 3 — always 0 */
     case DAC_dacData:
         return (s->dacAddr < VOODOO3_CLUT_SIZE)
                ? s->pallook[s->dacAddr] : 0xffffffff;
+    case 0x55:                     /* dacData byte 1 = G */
+        return (s->dacAddr < VOODOO3_CLUT_SIZE)
+               ? ((s->pallook[s->dacAddr] >> 8) & 0xff) : 0xff;
+    case 0x56:                     /* dacData byte 2 = B */
+        return (s->dacAddr < VOODOO3_CLUT_SIZE)
+               ? (s->pallook[s->dacAddr] & 0xff) : 0xff;
+    case 0x57: return 0;           /* dacData byte 3 — always 0 */
     case Video_vidProcCfg:         return s->vidProcCfg;
     case Video_vidScreenSize:      return s->vidScreenSize;
     case Video_vidDesktopStartAddr:     return s->vidDesktopStartAddr;
@@ -1244,233 +1584,934 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
 
 /* =========================================================================
  * Banshee 2D blitter dispatch
- * Ported from 86Box banshee_blt_execute() / banshee_blt_start()
+ * Full Banshee 2D blitter — ported from 86Box vid_voodoo_banshee_blitter.c
+ * Includes: ROP engine, clip rectangles, 8×8 pattern (mono+color),
+ * colorkey (src+dst), S2S/H2S stretch-blt (Bresenham), line/polyline
+ * (Bresenham + stipple + TRANS_MONO), polyfill (span-fill with 2 edges),
+ * YUV422 (YUYV/UYVY) → RGB conversion, byte/word data swizzle.
  * ========================================================================= */
+
+/* -------------------------------------------------------------------------
+ * Colorkey test — ported from 86Box colorkey()
+ * src_notdst: 1 = test src colorkey, 0 = test dst colorkey
+ * Returns 1 if the pixel should be treated as transparent (skip write).
+ * ------------------------------------------------------------------------- */
+static inline int blt_colorkey(voodoo3_blt_t *blt, uint32_t pixel,
+                                int src_notdst, int fmt)
+{
+    uint32_t min = src_notdst ? blt->srcColorkeyMin : blt->dstColorkeyMin;
+    uint32_t max = src_notdst ? blt->srcColorkeyMax : blt->dstColorkeyMax;
+    uint32_t flag = src_notdst ? CMDEXTRA_SRC_COLORKEY : CMDEXTRA_DST_COLORKEY;
+
+    if (!(blt->commandExtra & flag))
+        return 0;
+
+    switch (fmt) {
+    case BLT_COLORKEY_8:
+        return ((pixel & 0xffu) >= (min & 0xffu)) &&
+               ((pixel & 0xffu) <= (max & 0xffu));
+    case BLT_COLORKEY_16: {
+        int r = (pixel >> 11) & 0x1f, rm = (min >> 11) & 0x1f, rx_ = (max >> 11) & 0x1f;
+        int g = (pixel >>  5) & 0x3f, gm = (min >>  5) & 0x3f, gx_ = (max >>  5) & 0x3f;
+        int b =  pixel        & 0x1f, bm =  min        & 0x1f, bx_ =  max        & 0x1f;
+        return (r >= rm) && (r <= rx_) && (g >= gm) && (g <= gx_) && (b >= bm) && (b <= bx_);
+    }
+    default: { /* 32 */
+        int r = (pixel >> 16) & 0xff, rm = (min >> 16) & 0xff, rx_ = (max >> 16) & 0xff;
+        int g = (pixel >>  8) & 0xff, gm = (min >>  8) & 0xff, gx_ = (max >>  8) & 0xff;
+        int b =  pixel        & 0xff, bm =  min        & 0xff, bx_ =  max        & 0xff;
+        return (r >= rm) && (r <= rx_) && (g >= gm) && (g <= gx_) && (b >= bm) && (b <= bx_);
+    }
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * ROP mixer — ported from 86Box MIX()
+ * Selects rops[rop_nr] based on colorkey results for src and dst.
+ * ------------------------------------------------------------------------- */
+static inline uint32_t blt_mix(voodoo3_blt_t *blt, uint32_t dst, uint32_t src,
+                                uint32_t pattern, int src_fmt, int dst_fmt)
+{
+    int rop_nr = 0;
+    if (blt_colorkey(blt, src, 1, src_fmt)) rop_nr |= 2;
+    if (blt_colorkey(blt, dst, 0, dst_fmt)) rop_nr |= 1;
+    uint32_t rop = blt->rops[rop_nr];
+    uint32_t result = 0;
+    if (rop & 0x01) result |= (~pattern & ~src & ~dst);
+    if (rop & 0x02) result |= (~pattern & ~src &  dst);
+    if (rop & 0x04) result |= (~pattern &  src & ~dst);
+    if (rop & 0x08) result |= (~pattern &  src &  dst);
+    if (rop & 0x10) result |= ( pattern & ~src & ~dst);
+    if (rop & 0x20) result |= ( pattern & ~src &  dst);
+    if (rop & 0x40) result |= ( pattern &  src & ~dst);
+    if (rop & 0x80) result |= ( pattern &  src &  dst);
+    return result;
+}
+
+/* -------------------------------------------------------------------------
+ * Address calculation — ported from 86Box get_addr()
+ * Handles tiled and linear addressing for src and dst.
+ * ------------------------------------------------------------------------- */
+static inline uint32_t blt_get_addr(Voodoo3State *s, int x, int y,
+                                    int src_notdst, uint32_t src_stride_override)
+{
+    voodoo3_blt_t *blt = &s->blt;
+    uint32_t stride    = src_notdst ? src_stride_override : blt->dst_stride;
+    uint32_t base      = src_notdst ? blt->srcBaseAddr : blt->dstBaseAddr;
+    bool     tiled     = src_notdst ? !!blt->srcBaseAddr_tiled : !!blt->dstBaseAddr_tiled;
+
+    uint32_t addr;
+    if (tiled)
+        addr = base + (x & 127) + ((x >> 7) * 128 * 32) + ((y & 31) * 128) + (y >> 5) * stride;
+    else
+        addr = base + x + y * stride;
+
+    return addr & (s->fb_size - 1);
+}
+
+/* -------------------------------------------------------------------------
+ * PLOT — write one pixel at (x,y) with ROP + pattern + colorkey.
+ * Ported from 86Box PLOT() macro.
+ * ------------------------------------------------------------------------- */
+static inline void blt_plot(Voodoo3State *s, int x, int y,
+                             int pat_x, int pat_y, uint8_t pat_mono,
+                             uint32_t src, int src_ck_fmt)
+{
+    voodoo3_blt_t *blt = &s->blt;
+    uint8_t rop8 = (uint8_t)(blt->command >> 24);
+
+    switch (blt->dstFormat & DST_FORMAT_COL_MASK) {
+    case DST_FORMAT_COL_8_BPP: {
+        uint32_t addr = blt_get_addr(s, x, y, 0, 0);
+        if (addr >= s->fb_size) break;
+        uint32_t dst  = s->fb_mem[addr];
+        uint32_t pat  = (blt->command & COMMAND_PATTERN_MONO)
+            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? blt->colorFore : blt->colorBack)
+            : (uint32_t)blt->colorPattern8[(pat_x & 7) + (pat_y & 7) * 8];
+        s->fb_mem[addr] = (uint8_t)blt_mix(blt, dst, src, pat, src_ck_fmt, BLT_COLORKEY_8);
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+    case DST_FORMAT_COL_16_BPP: {
+        uint32_t addr = blt_get_addr(s, x * 2, y, 0, 0);
+        if (addr + 1 >= s->fb_size) break;
+        uint32_t dst  = *(uint16_t *)(s->fb_mem + addr);
+        uint32_t pat  = (blt->command & COMMAND_PATTERN_MONO)
+            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? blt->colorFore : blt->colorBack)
+            : (uint32_t)blt->colorPattern16[(pat_x & 7) + (pat_y & 7) * 8];
+        *(uint16_t *)(s->fb_mem + addr) = (uint16_t)blt_mix(blt, dst, src, pat, src_ck_fmt, BLT_COLORKEY_16);
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+    case DST_FORMAT_COL_24_BPP: {
+        uint32_t addr = blt_get_addr(s, x * 3, y, 0, 0);
+        if (addr + 3 >= s->fb_size) break;
+        uint32_t dst  = *(uint32_t *)(s->fb_mem + addr);
+        uint32_t pat  = (blt->command & COMMAND_PATTERN_MONO)
+            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? blt->colorFore : blt->colorBack)
+            : blt->colorPattern24[(pat_x & 7) + (pat_y & 7) * 8];
+        uint32_t res  = blt_mix(blt, dst, src, pat, src_ck_fmt, BLT_COLORKEY_32);
+        *(uint32_t *)(s->fb_mem + addr) = (res & 0xffffffu) | (dst & 0xff000000u);
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+    case DST_FORMAT_COL_32_BPP: {
+        uint32_t addr = blt_get_addr(s, x * 4, y, 0, 0);
+        if (addr + 3 >= s->fb_size) break;
+        uint32_t dst  = *(uint32_t *)(s->fb_mem + addr);
+        uint32_t pat  = (blt->command & COMMAND_PATTERN_MONO)
+            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? blt->colorFore : blt->colorBack)
+            : blt->colorPattern[(pat_x & 7) + (pat_y & 7) * 8];
+        *(uint32_t *)(s->fb_mem + addr) = blt_mix(blt, dst, src, pat, src_ck_fmt, BLT_COLORKEY_32);
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+    default: break;
+    }
+    (void)rop8;
+}
+
+/* -------------------------------------------------------------------------
+ * PLOT_LINE — write one pixel for line/polyline (uses colorFore, no pattern).
+ * Ported from 86Box PLOT_LINE() macro.
+ * ------------------------------------------------------------------------- */
+static inline void blt_plot_line(Voodoo3State *s, int x, int y, uint32_t pattern)
+{
+    voodoo3_blt_t *blt = &s->blt;
+
+    switch (blt->dstFormat & DST_FORMAT_COL_MASK) {
+    case DST_FORMAT_COL_8_BPP: {
+        uint32_t addr = blt_get_addr(s, x, y, 0, 0);
+        if (addr >= s->fb_size) break;
+        uint32_t dst = s->fb_mem[addr];
+        s->fb_mem[addr] = (uint8_t)blt_mix(blt, dst, blt->colorFore, pattern, BLT_COLORKEY_8, BLT_COLORKEY_8);
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+    case DST_FORMAT_COL_16_BPP: {
+        uint32_t addr = blt_get_addr(s, x * 2, y, 0, 0);
+        if (addr + 1 >= s->fb_size) break;
+        uint32_t dst = *(uint16_t *)(s->fb_mem + addr);
+        *(uint16_t *)(s->fb_mem + addr) = (uint16_t)blt_mix(blt, dst, blt->colorFore, pattern, BLT_COLORKEY_16, BLT_COLORKEY_16);
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+    case DST_FORMAT_COL_24_BPP: {
+        uint32_t addr = blt_get_addr(s, x * 3, y, 0, 0);
+        if (addr + 3 >= s->fb_size) break;
+        uint32_t dst = *(uint32_t *)(s->fb_mem + addr);
+        uint32_t res = blt_mix(blt, dst, blt->colorFore, pattern, BLT_COLORKEY_32, BLT_COLORKEY_32);
+        *(uint32_t *)(s->fb_mem + addr) = (res & 0xffffffu) | (dst & 0xff000000u);
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+    case DST_FORMAT_COL_32_BPP: {
+        uint32_t addr = blt_get_addr(s, x * 4, y, 0, 0);
+        if (addr + 3 >= s->fb_size) break;
+        uint32_t dst = *(uint32_t *)(s->fb_mem + addr);
+        *(uint32_t *)(s->fb_mem + addr) = blt_mix(blt, dst, blt->colorFore, pattern, BLT_COLORKEY_32, BLT_COLORKEY_32);
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+    default: break;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * YUV422 decode — ported from 86Box DECODE_YUYV422 / DECODE_YUYV422_16BPP
+ * ------------------------------------------------------------------------- */
+static inline void blt_decode_yuyv422_32(uint32_t *out, const uint8_t *src)
+{
+    int y1 = src[0], cr = (int8_t)(src[1] - 0x80);
+    int y2 = src[2], cb = (int8_t)(src[3] - 0x80);
+    int dR = (359 * cr) >> 8, dG = (88 * cb + 183 * cr) >> 8, dB = (453 * cb) >> 8;
+    int r, g, b;
+    r = CLAMP(y1 + dR); g = CLAMP(y1 - dG); b = CLAMP(y1 + dB);
+    out[0] = (uint32_t)(r | (g << 8) | (b << 16));
+    r = CLAMP(y2 + dR); g = CLAMP(y2 - dG); b = CLAMP(y2 + dB);
+    out[1] = (uint32_t)(r | (g << 8) | (b << 16));
+}
+
+static inline void blt_decode_yuyv422_16(uint16_t *out, const uint8_t *src)
+{
+    int y1 = src[0], cr = (int8_t)(src[1] - 0x80);
+    int y2 = src[2], cb = (int8_t)(src[3] - 0x80);
+    int dR = (359 * cr) >> 8, dG = (88 * cb + 183 * cr) >> 8, dB = (453 * cb) >> 8;
+    int r, g, b;
+    r = CLAMP(y1 + dR) >> 3; g = CLAMP(y1 - dG) >> 2; b = CLAMP(y1 + dB) >> 3;
+    out[0] = (uint16_t)(r | (g << 5) | (b << 11));
+    r = CLAMP(y2 + dR) >> 3; g = CLAMP(y2 - dG) >> 2; b = CLAMP(y2 + dB) >> 3;
+    out[1] = (uint16_t)(r | (g << 5) | (b << 11));
+}
+
+/* -------------------------------------------------------------------------
+ * src colorkey format from srcFormat
+ * ------------------------------------------------------------------------- */
+static inline int blt_src_ck_fmt(voodoo3_blt_t *blt)
+{
+    switch (blt->srcFormat & SRC_FORMAT_COL_MASK) {
+    case SRC_FORMAT_COL_8_BPP:  return BLT_COLORKEY_8;
+    case SRC_FORMAT_COL_16_BPP: return BLT_COLORKEY_16;
+    default:                     return BLT_COLORKEY_32;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * end_command — update dstXY if INC_X/Y_START set
+ * Ported from 86Box end_command()
+ * ------------------------------------------------------------------------- */
+static inline void blt_end_command(voodoo3_blt_t *blt)
+{
+    if (blt->command & COMMAND_INC_X_START) {
+        blt->dstXY = (blt->dstXY & 0xffff0000u) | (blt->dstX & 0xffffu);
+    }
+    if (blt->command & COMMAND_INC_Y_START) {
+        blt->dstXY = (blt->dstXY & 0x0000ffffu) | ((uint32_t)blt->dstY << 16);
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * update_src_stride — decode packing mode → src_stride_src/dest
+ * Ported from 86Box update_src_stride()
+ * ------------------------------------------------------------------------- */
+static void blt_update_src_stride_full(Voodoo3State *s)
+{
+    voodoo3_blt_t *blt = &s->blt;
+    int bpp;
+    switch (blt->srcFormat & SRC_FORMAT_COL_MASK) {
+    case SRC_FORMAT_COL_1_BPP:  bpp =  1; break;
+    case SRC_FORMAT_COL_8_BPP:  bpp =  8; break;
+    case SRC_FORMAT_COL_16_BPP: bpp = 16; break;
+    case SRC_FORMAT_COL_24_BPP: bpp = 24; break;
+    default:                     bpp = 32; break;
+    }
+    switch (blt->srcFormat & SRC_FORMAT_PACKING_MASK) {
+    case SRC_FORMAT_PACKING_STRIDE:
+        blt->src_stride_src      = blt->src_stride;
+        blt->src_stride_dest     = blt->src_stride;
+        blt->host_data_size_src  = (blt->srcSizeX * bpp + 7) >> 3;
+        blt->host_data_size_dest = (blt->dstSizeX * bpp + 7) >> 3;
+        break;
+    case SRC_FORMAT_PACKING_BYTE:
+        blt->src_stride_src      = (blt->srcSizeX * bpp + 7) >> 3;
+        blt->src_stride_dest     = (blt->dstSizeX * bpp + 7) >> 3;
+        blt->host_data_size_src  = blt->src_stride_src;
+        blt->host_data_size_dest = blt->src_stride_dest;
+        break;
+    case SRC_FORMAT_PACKING_WORD:
+        blt->src_stride_src      = ((blt->srcSizeX * bpp + 15) >> 4) * 2;
+        blt->src_stride_dest     = ((blt->dstSizeX * bpp + 15) >> 4) * 2;
+        blt->host_data_size_src  = blt->src_stride_src;
+        blt->host_data_size_dest = blt->src_stride_dest;
+        break;
+    case SRC_FORMAT_PACKING_DWORD:
+        blt->src_stride_src      = ((blt->srcSizeX * bpp + 31) >> 5) * 4;
+        blt->src_stride_dest     = ((blt->dstSizeX * bpp + 31) >> 5) * 4;
+        blt->host_data_size_src  = blt->src_stride_src;
+        blt->host_data_size_dest = blt->src_stride_dest;
+        break;
+    default: break;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * do_screen_to_screen_line — blit one scan line with full ROP/pattern/clip
+ * Ported from 86Box do_screen_to_screen_line()
+ * src_p    : pointer to source scan line in VRAM
+ * use_x_dir: 1 = respect COMMAND_DX for direction
+ * src_x    : starting source X pixel index
+ * src_tiled: source address is tiled
+ * ------------------------------------------------------------------------- */
+static void blt_do_s2s_line(Voodoo3State *s, const uint8_t *src_p,
+                             int use_x_dir, int src_x, int src_tiled)
+{
+    voodoo3_blt_t *blt   = &s->blt;
+    v3_clip_t     *clip  = &blt->clip[(blt->command & COMMAND_CLIP_SEL) ? 1 : 0];
+    int            dst_y = blt->dstY;
+    int            pat_y = (blt->commandExtra & CMDEXTRA_FORCE_PAT_ROW0) ? 0
+                           : (blt->patoff_y + blt->dstY);
+    uint8_t       *pmono = (uint8_t *)blt->colorPattern;
+    bool  use_pt = ((blt->command & (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO))
+                   == (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO));
+    int   src_ck = blt_src_ck_fmt(blt);
+    bool  same_fmt = ((blt->srcFormat & SRC_FORMAT_COL_MASK) ==
+                      (blt->dstFormat & DST_FORMAT_COL_MASK));
+
+    if (dst_y >= clip->y_min && dst_y < clip->y_max) {
+        int     dst_x  = blt->dstX;
+        int     pat_x  = blt->patoff_x + blt->dstX;
+        uint8_t pmask  = pmono[pat_y & 7];
+        int     cur_sx = src_x;
+
+        for (blt->cur_x = 0; blt->cur_x < blt->dstSizeX; blt->cur_x++) {
+            bool pt = use_pt ? !!(pmask & (1u << (7 - (pat_x & 7)))) : true;
+            int  sxr = (cur_sx * blt->src_bpp) >> 3;
+            if (src_tiled) sxr = (sxr & 127) + ((sxr >> 7) * 128 * 32);
+
+            if (dst_x >= clip->x_min && dst_x < clip->x_max && pt) {
+                if (same_fmt) {
+                    /* No colour conversion */
+                    uint32_t src_pix = 0;
+                    switch (blt->dstFormat & DST_FORMAT_COL_MASK) {
+                    case DST_FORMAT_COL_8_BPP:  src_pix = src_p[sxr]; break;
+                    case DST_FORMAT_COL_16_BPP: src_pix = *(const uint16_t *)(src_p + sxr); break;
+                    case DST_FORMAT_COL_24_BPP: src_pix = *(const uint32_t *)(src_p + sxr); break;
+                    case DST_FORMAT_COL_32_BPP: src_pix = *(const uint32_t *)(src_p + sxr); break;
+                    default: break;
+                    }
+                    blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, src_pix, src_ck);
+                } else {
+                    /* Colour conversion required */
+                    uint32_t src_data = 0;
+                    uint32_t yuv_data = 0;
+                    bool transparent = false;
+
+                    switch (blt->srcFormat & SRC_FORMAT_COL_MASK) {
+                    case SRC_FORMAT_COL_1_BPP: {
+                        uint8_t b = src_p[sxr];
+                        src_data = (b & (0x80u >> (cur_sx & 7))) ? blt->colorFore : blt->colorBack;
+                        if (blt->command & COMMAND_TRANS_MONO)
+                            transparent = !(b & (0x80u >> (cur_sx & 7)));
+                        break;
+                    }
+                    case SRC_FORMAT_COL_8_BPP:
+                        src_data = src_p[sxr]; break;
+                    case SRC_FORMAT_COL_16_BPP: {
+                        uint16_t s16 = *(const uint16_t *)(src_p + sxr);
+                        int r = (s16 >> 11) & 0x1f, g = (s16 >> 5) & 0x3f, b = s16 & 0x1f;
+                        r = (r << 3)|(r >> 2); g = (g << 2)|(g >> 4); b = (b << 3)|(b >> 2);
+                        src_data = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+                        break;
+                    }
+                    case SRC_FORMAT_COL_24_BPP:
+                    case SRC_FORMAT_COL_32_BPP:
+                        src_data = *(const uint32_t *)(src_p + sxr); break;
+                    case SRC_FORMAT_COL_YUYV:
+                        yuv_data = *(const uint32_t *)(src_p + sxr); break;
+                    case SRC_FORMAT_COL_UYVY:
+                        yuv_data = *(const uint32_t *)(src_p + sxr);
+                        yuv_data = ((yuv_data & 0xff00u) >> 8) | ((yuv_data & 0xffu) << 8) |
+                                   ((yuv_data & 0xff000000u) >> 8) | ((yuv_data & 0xff0000u) << 8);
+                        break;
+                    default: src_data = *(const uint32_t *)(src_p + sxr); break;
+                    }
+
+                    /* Downconvert to 16-bpp if dst is 16-bpp and src is not 1-bpp */
+                    if ((blt->dstFormat & DST_FORMAT_COL_MASK) == DST_FORMAT_COL_16_BPP &&
+                        (blt->srcFormat & SRC_FORMAT_COL_MASK) != SRC_FORMAT_COL_1_BPP &&
+                        (blt->srcFormat & SRC_FORMAT_COL_MASK) != SRC_FORMAT_COL_YUYV &&
+                        (blt->srcFormat & SRC_FORMAT_COL_MASK) != SRC_FORMAT_COL_UYVY) {
+                        int r = (src_data >> 16) & 0xff, g = (src_data >> 8) & 0xff, b = src_data & 0xff;
+                        src_data = (b >> 3) | ((g >> 2) << 5) | ((r >> 3) << 11);
+                    }
+
+                    if ((blt->srcFormat & SRC_FORMAT_COL_MASK) == SRC_FORMAT_COL_YUYV ||
+                        (blt->srcFormat & SRC_FORMAT_COL_MASK) == SRC_FORMAT_COL_UYVY) {
+                        /* YUV → plot two pixels */
+                        if ((blt->dstFormat & DST_FORMAT_COL_MASK) == DST_FORMAT_COL_16_BPP) {
+                            uint16_t rgb16[2] = {0,0};
+                            blt_decode_yuyv422_16(rgb16, (const uint8_t *)&yuv_data);
+                            if (!transparent) blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, rgb16[0], src_ck);
+                            if (use_x_dir) dst_x += (blt->command & COMMAND_DX) ? -1 : 1;
+                            else           dst_x++;
+                            if (!transparent) blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, rgb16[1], src_ck);
+                        } else {
+                            uint32_t rgb32[2] = {0,0};
+                            blt_decode_yuyv422_32(rgb32, (const uint8_t *)&yuv_data);
+                            if (!transparent) blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, rgb32[0], src_ck);
+                            if (use_x_dir) dst_x += (blt->command & COMMAND_DX) ? -1 : 1;
+                            else           dst_x++;
+                            if (!transparent) blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, rgb32[1], src_ck);
+                        }
+                    } else {
+                        if (!transparent)
+                            blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, src_data, src_ck);
+                    }
+                }
+            }
+
+            if (use_x_dir) {
+                cur_sx += (blt->command & COMMAND_DX) ? -1 : 1;
+                dst_x  += (blt->command & COMMAND_DX) ? -1 : 1;
+                pat_x  += (blt->command & COMMAND_DX) ? -1 : 1;
+            } else {
+                cur_sx++; dst_x++; pat_x++;
+            }
+        }
+    }
+    blt->srcY += (blt->command & COMMAND_DY) ? -1 : 1;
+    blt->dstY += (blt->command & COMMAND_DY) ? -1 : 1;
+}
+
+/* -------------------------------------------------------------------------
+ * do_screen_to_screen_stretch_line — one scanline of stretch-blt
+ * Ported from 86Box do_screen_to_screen_stretch_line()
+ * Uses Bresenham X-scaling; caller manages Y-scaling via bres_error_0.
+ * ------------------------------------------------------------------------- */
+static void blt_do_stretch_line(Voodoo3State *s, const uint8_t *src_p,
+                                 int src_x, int *p_src_y)
+{
+    voodoo3_blt_t *blt  = &s->blt;
+    v3_clip_t     *clip = &blt->clip[(blt->command & COMMAND_CLIP_SEL) ? 1 : 0];
+    int            dst_y = blt->dstY;
+    int            pat_y = (blt->commandExtra & CMDEXTRA_FORCE_PAT_ROW0) ? 0
+                           : (blt->patoff_y + blt->dstY);
+    uint8_t       *pmono = (uint8_t *)blt->colorPattern;
+    bool  use_pt = ((blt->command & (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO))
+                   == (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO));
+    int   src_ck = blt_src_ck_fmt(blt);
+    bool  same_fmt = ((blt->srcFormat & SRC_FORMAT_COL_MASK) ==
+                      (blt->dstFormat & DST_FORMAT_COL_MASK));
+
+    if (dst_y >= clip->y_min && dst_y < clip->y_max) {
+        int     dst_x   = blt->dstX;
+        int     pat_x   = blt->patoff_x + blt->dstX;
+        uint8_t pmask   = pmono[pat_y & 7];
+        int     error_x = blt->dstSizeX / 2;
+        int     cur_sx  = src_x;
+
+        for (blt->cur_x = 0; blt->cur_x < blt->dstSizeX; blt->cur_x++) {
+            bool pt = use_pt ? !!(pmask & (1u << (7 - (pat_x & 7)))) : true;
+
+            if (dst_x >= clip->x_min && dst_x < clip->x_max && pt) {
+                if (same_fmt) {
+                    uint32_t src_pix = 0;
+                    switch (blt->dstFormat & DST_FORMAT_COL_MASK) {
+                    case DST_FORMAT_COL_8_BPP:  src_pix = src_p[cur_sx]; break;
+                    case DST_FORMAT_COL_16_BPP: src_pix = *(const uint16_t *)(src_p + cur_sx * 2); break;
+                    case DST_FORMAT_COL_24_BPP: src_pix = *(const uint32_t *)(src_p + cur_sx * 3); break;
+                    case DST_FORMAT_COL_32_BPP: src_pix = *(const uint32_t *)(src_p + cur_sx * 4); break;
+                    default: break;
+                    }
+                    blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, src_pix, src_ck);
+                } else {
+                    int      sxr = (cur_sx * blt->src_bpp) >> 3;
+                    uint32_t src_data = 0, yuv_data = 0;
+                    bool     transparent = false;
+                    switch (blt->srcFormat & SRC_FORMAT_COL_MASK) {
+                    case SRC_FORMAT_COL_1_BPP: {
+                        uint8_t b = src_p[sxr];
+                        src_data = (b & (0x80u >> (cur_sx & 7))) ? blt->colorFore : blt->colorBack;
+                        if (blt->command & COMMAND_TRANS_MONO)
+                            transparent = !(b & (0x80u >> (cur_sx & 7)));
+                        break;
+                    }
+                    case SRC_FORMAT_COL_8_BPP:  src_data = src_p[sxr]; break;
+                    case SRC_FORMAT_COL_16_BPP: {
+                        uint16_t s16 = *(const uint16_t *)(src_p + sxr);
+                        int r=(s16>>11)&0x1f, g=(s16>>5)&0x3f, b=s16&0x1f;
+                        r=(r<<3)|(r>>2); g=(g<<2)|(g>>4); b=(b<<3)|(b>>2);
+                        src_data=((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                        break;
+                    }
+                    case SRC_FORMAT_COL_24_BPP:
+                    case SRC_FORMAT_COL_32_BPP: src_data = *(const uint32_t *)(src_p+sxr); break;
+                    case SRC_FORMAT_COL_YUYV: yuv_data = *(const uint32_t *)(src_p+sxr); break;
+                    case SRC_FORMAT_COL_UYVY:
+                        yuv_data = *(const uint32_t *)(src_p+sxr);
+                        yuv_data = ((yuv_data&0xff00u)>>8)|((yuv_data&0xffu)<<8)|
+                                   ((yuv_data&0xff000000u)>>8)|((yuv_data&0xff0000u)<<8);
+                        break;
+                    default: src_data = *(const uint32_t *)(src_p+sxr); break;
+                    }
+                    if ((blt->dstFormat & DST_FORMAT_COL_MASK) == DST_FORMAT_COL_16_BPP &&
+                        (blt->srcFormat & SRC_FORMAT_COL_MASK) != SRC_FORMAT_COL_1_BPP &&
+                        (blt->srcFormat & SRC_FORMAT_COL_MASK) != SRC_FORMAT_COL_YUYV &&
+                        (blt->srcFormat & SRC_FORMAT_COL_MASK) != SRC_FORMAT_COL_UYVY) {
+                        int r=(src_data>>16)&0xff, g=(src_data>>8)&0xff, b=src_data&0xff;
+                        src_data=(b>>3)|((g>>2)<<5)|((r>>3)<<11);
+                    }
+                    if ((blt->srcFormat & SRC_FORMAT_COL_MASK) == SRC_FORMAT_COL_YUYV ||
+                        (blt->srcFormat & SRC_FORMAT_COL_MASK) == SRC_FORMAT_COL_UYVY) {
+                        if ((blt->dstFormat & DST_FORMAT_COL_MASK) == DST_FORMAT_COL_16_BPP) {
+                            uint16_t rgb16[2]={0,0};
+                            blt_decode_yuyv422_16(rgb16,(const uint8_t*)&yuv_data);
+                            if (!transparent) blt_plot(s,dst_x,dst_y,pat_x,pat_y,pmask,rgb16[0],src_ck);
+                            dst_x++;
+                            if (!transparent) blt_plot(s,dst_x,dst_y,pat_x,pat_y,pmask,rgb16[1],src_ck);
+                        } else {
+                            uint32_t rgb32[2]={0,0};
+                            blt_decode_yuyv422_32(rgb32,(const uint8_t*)&yuv_data);
+                            if (!transparent) blt_plot(s,dst_x,dst_y,pat_x,pat_y,pmask,rgb32[0],src_ck);
+                            dst_x++;
+                            if (!transparent) blt_plot(s,dst_x,dst_y,pat_x,pat_y,pmask,rgb32[1],src_ck);
+                        }
+                    } else {
+                        if (!transparent)
+                            blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, src_data, src_ck);
+                    }
+                }
+            }
+
+            /* Bresenham X step */
+            error_x -= blt->srcSizeX;
+            while (error_x < 0) { error_x += blt->dstSizeX; cur_sx++; }
+            dst_x++; pat_x++;
+        }
+    }
+
+    /* Bresenham Y step */
+    blt->bres_error_0 -= blt->srcSizeY;
+    while (blt->bres_error_0 < 0) {
+        blt->bres_error_0 += blt->dstSizeY;
+        if (p_src_y) (*p_src_y) += (blt->command & COMMAND_DY) ? -1 : 1;
+    }
+    blt->dstY += (blt->command & COMMAND_DY) ? -1 : 1;
+}
+
+/* -------------------------------------------------------------------------
+ * do_rectfill — ported from 86Box banshee_do_rectfill()
+ * Full clip, pattern, ROP, TRANS_MONO.
+ * ------------------------------------------------------------------------- */
+static void blt_do_rectfill(Voodoo3State *s)
+{
+    voodoo3_blt_t *blt  = &s->blt;
+    v3_clip_t     *clip = &blt->clip[(blt->command & COMMAND_CLIP_SEL) ? 1 : 0];
+    uint8_t       *pmono = (uint8_t *)blt->colorPattern;
+    bool use_pt = ((blt->command & (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO))
+                   == (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO));
+    int pat_y = (blt->commandExtra & CMDEXTRA_FORCE_PAT_ROW0) ? 0
+                : (blt->patoff_y + blt->dstY);
+    int dst_y = blt->dstY;
+
+    for (blt->cur_y = 0; blt->cur_y < blt->dstSizeY; blt->cur_y++) {
+        if (dst_y >= clip->y_min && dst_y < clip->y_max) {
+            int     dst_x  = blt->dstX;
+            int     pat_x  = blt->patoff_x + blt->dstX;
+            uint8_t pmask  = pmono[pat_y & 7];
+
+            for (blt->cur_x = 0; blt->cur_x < blt->dstSizeX; blt->cur_x++) {
+                bool pt = use_pt ? !!(pmask & (1u << (7 - (pat_x & 7)))) : true;
+                if (dst_x >= clip->x_min && dst_x < clip->x_max && pt)
+                    blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, blt->colorFore, BLT_COLORKEY_32);
+                dst_x += (blt->command & COMMAND_DX) ? -1 : 1;
+                pat_x += (blt->command & COMMAND_DX) ? -1 : 1;
+            }
+        }
+        dst_y += (blt->command & COMMAND_DY) ? -1 : 1;
+        if (!(blt->commandExtra & CMDEXTRA_FORCE_PAT_ROW0))
+            pat_y += (blt->command & COMMAND_DY) ? -1 : 1;
+    }
+    blt_end_command(blt);
+}
+
+/* -------------------------------------------------------------------------
+ * do_screen_to_screen_blt — full S2S with ROP/clip/pattern/colorkey
+ * Ported from 86Box banshee_do_screen_to_screen_blt()
+ * ------------------------------------------------------------------------- */
+static void blt_do_s2s_blt(Voodoo3State *s)
+{
+    voodoo3_blt_t *blt = &s->blt;
+    for (blt->cur_y = 0; blt->cur_y < blt->dstSizeY; blt->cur_y++) {
+        uint32_t src_addr = blt_get_addr(s, 0, blt->srcY, 1, blt->src_stride_dest);
+        blt_do_s2s_line(s, s->fb_mem + src_addr, 1, blt->srcX, !!blt->srcBaseAddr_tiled);
+    }
+    blt_end_command(blt);
+}
+
+/* -------------------------------------------------------------------------
+ * do_screen_to_screen_stretch_blt — S2S with Bresenham X+Y scaling
+ * Ported from 86Box banshee_do_screen_to_screen_stretch_blt()
+ * ------------------------------------------------------------------------- */
+static void blt_do_stretch_blt(Voodoo3State *s)
+{
+    voodoo3_blt_t *blt = &s->blt;
+    for (blt->cur_y = 0; blt->cur_y < blt->dstSizeY; blt->cur_y++) {
+        uint32_t src_addr = blt_get_addr(s, 0, blt->srcY, 1, blt->src_stride_src);
+        blt_do_stretch_line(s, s->fb_mem + src_addr, blt->srcX, &blt->srcY);
+    }
+    blt_end_command(blt);
+}
+
+/* -------------------------------------------------------------------------
+ * do_host_to_screen_blt — H2S: accumulate dwords, flush on complete row
+ * Ported from 86Box banshee_do_host_to_screen_blt()
+ * ------------------------------------------------------------------------- */
+static void blt_do_h2s_blt(Voodoo3State *s, uint32_t data)
+{
+    voodoo3_blt_t *blt = &s->blt;
+
+    /* Byte/word swizzle */
+    if (blt->srcFormat & SRC_FORMAT_BYTE_SWIZZLE)
+        data = ((data >> 24)) | ((data >> 8) & 0xff00u) | ((data << 8) & 0xff0000u) | (data << 24);
+    if (blt->srcFormat & SRC_FORMAT_WORD_SWIZZLE)
+        data = (data >> 16) | (data << 16);
+
+    if ((blt->srcFormat & SRC_FORMAT_PACKING_MASK) == SRC_FORMAT_PACKING_STRIDE) {
+        int last_byte;
+        if ((blt->srcFormat & SRC_FORMAT_COL_MASK) == SRC_FORMAT_COL_1_BPP)
+            last_byte = ((blt->srcX & 31) + blt->dstSizeX + 7) >> 3;
+        else
+            last_byte = (blt->srcX & 3) + blt->host_data_size_dest;
+
+        *(uint32_t *)(blt->host_data + blt->host_data_count) = data;
+        blt->host_data_count += 4;
+        if (blt->host_data_count >= last_byte) {
+            if (blt->cur_y < blt->dstSizeY) {
+                if ((blt->srcFormat & SRC_FORMAT_COL_MASK) == SRC_FORMAT_COL_1_BPP)
+                    blt_do_s2s_line(s, blt->host_data + ((blt->srcX >> 3) & 3), 0, blt->srcX & 7, 0);
+                else
+                    blt_do_s2s_line(s, blt->host_data + (blt->srcX & 3), 0, 0, 0);
+                blt->cur_y++;
+                if (blt->cur_y == blt->dstSizeY) blt_end_command(blt);
+            }
+            if ((blt->srcFormat & SRC_FORMAT_COL_MASK) == SRC_FORMAT_COL_1_BPP)
+                blt->srcX += (blt->srcFormat & SRC_FORMAT_STRIDE_MASK) << 3;
+            else
+                blt->srcX += (blt->srcFormat & SRC_FORMAT_STRIDE_MASK);
+            blt->host_data_count = 0;
+        }
+    } else {
+        *(uint32_t *)(blt->host_data + blt->host_data_count) = data;
+        blt->host_data_count += 4;
+        while (blt->host_data_count >= blt->src_stride_dest) {
+            blt->host_data_count -= blt->src_stride_dest;
+            if (blt->cur_y < blt->dstSizeY) {
+                blt_do_s2s_line(s, blt->host_data, 0, 0, 0);
+                blt->cur_y++;
+                if (blt->cur_y == blt->dstSizeY) blt_end_command(blt);
+            }
+            if (blt->host_data_count)
+                *(uint32_t *)(blt->host_data) = data >> ((4 - blt->host_data_count) * 8);
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * do_host_to_screen_stretch_blt — H2S stretch variant
+ * Ported from 86Box banshee_do_host_to_screen_stretch_blt()
+ * ------------------------------------------------------------------------- */
+static void blt_do_h2s_stretch_blt(Voodoo3State *s, uint32_t data)
+{
+    voodoo3_blt_t *blt = &s->blt;
+
+    if (blt->srcFormat & SRC_FORMAT_BYTE_SWIZZLE)
+        data = (data >> 24) | ((data >> 8) & 0xff00u) | ((data << 8) & 0xff0000u) | (data << 24);
+    if (blt->srcFormat & SRC_FORMAT_WORD_SWIZZLE)
+        data = (data >> 16) | (data << 16);
+
+    if ((blt->srcFormat & SRC_FORMAT_PACKING_MASK) == SRC_FORMAT_PACKING_STRIDE) {
+        int last_byte = (blt->srcX & 3) + blt->host_data_size_src;
+        *(uint32_t *)(blt->host_data + blt->host_data_count) = data;
+        blt->host_data_count += 4;
+        if (blt->host_data_count >= last_byte) {
+            if (blt->cur_y < blt->dstSizeY) {
+                if ((blt->srcFormat & SRC_FORMAT_COL_MASK) == SRC_FORMAT_COL_1_BPP)
+                    blt_do_stretch_line(s, blt->host_data + ((blt->srcX >> 3) & 3), blt->srcX & 7, NULL);
+                else
+                    blt_do_stretch_line(s, blt->host_data + (blt->srcX & 3), 0, NULL);
+                blt->cur_y++;
+                if (blt->cur_y == blt->dstSizeY) blt_end_command(blt);
+            }
+            if ((blt->srcFormat & SRC_FORMAT_COL_MASK) == SRC_FORMAT_COL_1_BPP)
+                blt->srcX += (blt->srcFormat & SRC_FORMAT_STRIDE_MASK) << 3;
+            else
+                blt->srcX += (blt->srcFormat & SRC_FORMAT_STRIDE_MASK);
+            blt->host_data_count = 0;
+        }
+    } else {
+        *(uint32_t *)(blt->host_data + blt->host_data_count) = data;
+        blt->host_data_count += 4;
+        while (blt->host_data_count >= blt->src_stride_src) {
+            blt->host_data_count -= blt->src_stride_src;
+            if (blt->cur_y < blt->dstSizeY) {
+                blt_do_stretch_line(s, blt->host_data, 0, NULL);
+                blt->cur_y++;
+                if (blt->cur_y == blt->dstSizeY) blt_end_command(blt);
+            }
+            if (blt->host_data_count)
+                *(uint32_t *)(blt->host_data) = data >> ((4 - blt->host_data_count) * 8);
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * step_line — advance stipple/repeat state for line drawing
+ * Ported from 86Box step_line()
+ * ------------------------------------------------------------------------- */
+static inline void blt_step_line(voodoo3_blt_t *blt)
+{
+    if (blt->line_pix_pos == blt->line_rep_cnt) {
+        blt->line_pix_pos = 0;
+        if (blt->line_bit_pos == blt->line_bit_mask_size)
+            blt->line_bit_pos = 0;
+        else
+            blt->line_bit_pos++;
+    } else {
+        blt->line_pix_pos++;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * do_line — Bresenham line with stipple, TRANS_MONO, clip
+ * Ported from 86Box banshee_do_line()
+ * draw_last: 1 = line, 0 = polyline (don't draw endpoint)
+ * ------------------------------------------------------------------------- */
+static void blt_do_line(Voodoo3State *s, bool draw_last)
+{
+    voodoo3_blt_t *blt  = &s->blt;
+    v3_clip_t     *clip = &blt->clip[(blt->command & COMMAND_CLIP_SEL) ? 1 : 0];
+    int dx = abs(blt->dstX - blt->srcX);
+    int dy = abs(blt->dstY - blt->srcY);
+    int x_inc = (blt->dstX > blt->srcX) ? 1 : -1;
+    int y_inc = (blt->dstY > blt->srcY) ? 1 : -1;
+    int x = blt->srcX, y = blt->srcY;
+    int error;
+    uint32_t stipple = (blt->command & COMMAND_STIPPLE_LINE) ? blt->lineStipple : ~0u;
+
+    if (dx > dy) { /* X-major */
+        error = dx / 2;
+        while (x != blt->dstX) {
+            uint32_t mask = stipple & (1u << blt->line_bit_pos);
+            bool pt = (blt->command & COMMAND_TRANS_MONO) ? !!mask : true;
+            if (y >= clip->y_min && y < clip->y_max &&
+                x >= clip->x_min && x < clip->x_max && pt)
+                blt_plot_line(s, x, y, mask ? blt->colorFore : blt->colorBack);
+            error -= dy;
+            if (error < 0) { error += dx; y += y_inc; }
+            x += x_inc;
+            blt_step_line(blt);
+        }
+    } else { /* Y-major */
+        error = dy / 2;
+        while (y != blt->dstY) {
+            uint32_t mask = stipple & (1u << blt->line_bit_pos);
+            bool pt = (blt->command & COMMAND_TRANS_MONO) ? !!mask : true;
+            if (y >= clip->y_min && y < clip->y_max &&
+                x >= clip->x_min && x < clip->x_max && pt)
+                blt_plot_line(s, x, y, mask ? blt->colorFore : blt->colorBack);
+            error -= dx;
+            if (error < 0) { error += dy; x += x_inc; }
+            y += y_inc;
+            blt_step_line(blt);
+        }
+    }
+
+    if (draw_last) {
+        uint32_t mask = stipple & (1u << blt->line_bit_pos);
+        bool pt = (blt->command & COMMAND_TRANS_MONO) ? !!mask : true;
+        if (y >= clip->y_min && y < clip->y_max &&
+            x >= clip->x_min && x < clip->x_max && pt)
+            blt_plot_line(s, x, y, mask ? blt->colorFore : blt->colorBack);
+    }
+
+    /* Update srcXY to current endpoint — polyline chaining */
+    blt->srcXY = ((uint32_t)(x & 0xffffu)) | ((uint32_t)y << 16);
+    blt->srcX = x; blt->srcY = y;
+}
+
+/* -------------------------------------------------------------------------
+ * polyfill_start — initialise polyfill edge state from srcXY/dstXY
+ * Ported from 86Box banshee_polyfill_start()
+ * ------------------------------------------------------------------------- */
+static void blt_polyfill_start(voodoo3_blt_t *blt)
+{
+    blt->lx[0] = blt->srcX; blt->ly[0] = blt->srcY;
+    blt->rx[0] = blt->dstX; blt->ry[0] = blt->dstY;
+    blt->lx[1] = blt->srcX; blt->ly[1] = blt->srcY;
+    blt->rx[1] = blt->dstX; blt->ry[1] = blt->dstY;
+    blt->lx_cur = blt->srcX;
+    blt->rx_cur = blt->dstX;
+}
+
+/* -------------------------------------------------------------------------
+ * polyfill_continue — receive next vertex, fill spans between edges
+ * Ported from 86Box banshee_polyfill_continue()
+ * data: packed vertex = bits[12:0]=X (sign-extended from 13), bits[28:16]=Y
+ * ------------------------------------------------------------------------- */
+static void blt_polyfill_continue(Voodoo3State *s, uint32_t data)
+{
+    voodoo3_blt_t *blt  = &s->blt;
+    v3_clip_t     *clip = &blt->clip[(blt->command & COMMAND_CLIP_SEL) ? 1 : 0];
+    uint8_t       *pmono = (uint8_t *)blt->colorPattern;
+    bool use_pt = ((blt->command & (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO))
+                   == (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO));
+    int y_start = MAX(blt->ly[0], blt->ry[0]);
+    int y_end;
+
+    /* Determine which edge gets the new vertex */
+    if (blt->ry[1] >= blt->ly[1]) {
+        /* Left edge */
+        blt->lx[1] = ((int32_t)(data << 19)) >> 19;
+        blt->ly[1] = ((int32_t)(data <<  3)) >> 19;
+        blt->dx[0]    = abs(blt->lx[1] - blt->lx[0]);
+        blt->dy[0]    = abs(blt->ly[1] - blt->ly[0]);
+        blt->x_inc[0] = (blt->lx[1] > blt->lx[0]) ? 1 : -1;
+        blt->error[0] = blt->dy[0] / 2;
+    } else {
+        /* Right edge */
+        blt->rx[1] = ((int32_t)(data << 19)) >> 19;
+        blt->ry[1] = ((int32_t)(data <<  3)) >> 19;
+        blt->dx[1]    = abs(blt->rx[1] - blt->rx[0]);
+        blt->dy[1]    = abs(blt->ry[1] - blt->ry[0]);
+        blt->x_inc[1] = (blt->rx[1] > blt->rx[0]) ? 1 : -1;
+        blt->error[1] = blt->dy[1] / 2;
+    }
+
+    y_end = MIN(blt->ly[1], blt->ry[1]);
+
+    for (int y = y_start; y < y_end; y++) {
+        if (y >= clip->y_min && y < clip->y_max) {
+            int     pat_y  = (blt->commandExtra & CMDEXTRA_FORCE_PAT_ROW0) ? 0
+                             : (blt->patoff_y + y);
+            uint8_t pmask  = pmono[pat_y & 7];
+
+            for (int x = blt->lx_cur; x < blt->rx_cur; x++) {
+                int  pat_x = blt->patoff_x + x;
+                bool pt    = use_pt ? !!(pmask & (1u << (7 - (pat_x & 7)))) : true;
+                if (x >= clip->x_min && x < clip->x_max && pt)
+                    blt_plot(s, x, y, pat_x, pat_y, pmask, blt->colorFore, BLT_COLORKEY_32);
+            }
+        }
+        /* Advance left edge */
+        blt->error[0] -= blt->dx[0];
+        while (blt->error[0] < 0) { blt->error[0] += blt->dy[0]; blt->lx_cur += blt->x_inc[0]; }
+        /* Advance right edge */
+        blt->error[1] -= blt->dx[1];
+        while (blt->error[1] < 0) { blt->error[1] += blt->dy[1]; blt->rx_cur += blt->x_inc[1]; }
+    }
+
+    /* Retire completed vertices */
+    if (blt->ry[1] == blt->ly[1]) {
+        blt->lx[0]=blt->lx[1]; blt->ly[0]=blt->ly[1];
+        blt->rx[0]=blt->rx[1]; blt->ry[0]=blt->ry[1];
+    } else if (blt->ry[1] >= blt->ly[1]) {
+        blt->lx[0]=blt->lx[1]; blt->ly[0]=blt->ly[1];
+    } else {
+        blt->rx[0]=blt->rx[1]; blt->ry[0]=blt->ry[1];
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * blt_do_launch — decode geometry at launch time
+ * Ported from 86Box banshee_do_2d_launch()
+ * ------------------------------------------------------------------------- */
+static void blt_do_launch(Voodoo3State *s)
+{
+    voodoo3_blt_t *blt = &s->blt;
+    blt->launch_pending          = false;
+    blt->rops[0]                 = (uint8_t)(blt->command >> 24);
+    blt->patoff_x                = (blt->command & COMMAND_PATOFF_X_MASK) >> COMMAND_PATOFF_X_SHIFT;
+    blt->patoff_y                = (blt->command & COMMAND_PATOFF_Y_MASK) >> COMMAND_PATOFF_Y_SHIFT;
+    blt->cur_x                   = 0;
+    blt->cur_y                   = 0;
+    blt->dstX = ((int32_t)(blt->dstXY << 19)) >> 19;
+    blt->dstY = ((int32_t)(blt->dstXY <<  3)) >> 19;
+    blt->srcX = ((int32_t)(blt->srcXY << 19)) >> 19;
+    blt->srcY = ((int32_t)(blt->srcXY <<  3)) >> 19;
+    blt->old_srcX                = blt->srcX;
+    blt->host_data_remainder     = 0;
+    blt->host_data_count         = 0;
+}
+
 static void voodoo3_blt_execute(Voodoo3State *s)
 {
     voodoo3_blt_t *blt = &s->blt;
-    uint32_t cmd = blt->command & COMMAND_CMD_MASK;
 
-    /*
-     * dst/src geometry is now decoded directly in the register write handlers
-     * (dstW/dstH/dstX/dstY/srcX/srcY from dstSize/dstXY/srcXY).
-     * dstStride/srcStride are kept up-to-date by voodoo3_blt_update_*_stride().
-     *
-     * dstBpp: decode from dstFormat bits[2:0] (DST_FORMAT_COL field).
-     *   0 = 8bpp, 1 = 16bpp, 2 = 24bpp, 3 = 32bpp  (same as pix_format).
-     * Default to 16bpp (RGB565) which is what AmigaOS P96 uses.
-     */
-    /* DST_FORMAT_COL = bits[19:16] (86Box: DST_FORMAT_COL_MASK = 0xf<<16) */
-    switch ((blt->dstFormat >> 16) & 0xfu) {
-    case 1:  blt->dstBpp = 1; break;   /* 8-bpp  */
-    case 3:  blt->dstBpp = 2; break;   /* 16-bpp */
-    case 4:  blt->dstBpp = 3; break;   /* 24-bpp */
-    case 5:  blt->dstBpp = 4; break;   /* 32-bpp */
-    default: blt->dstBpp = 2; break;   /* default 16-bpp */
+    if (blt->launch_pending)
+        blt_do_launch(s);
+
+    /* Decode dstBpp from dstFormat bits[19:16] */
+    switch (blt->dstFormat & DST_FORMAT_COL_MASK) {
+    case DST_FORMAT_COL_8_BPP:  blt->dstBpp = 1; break;
+    case DST_FORMAT_COL_16_BPP: blt->dstBpp = 2; break;
+    case DST_FORMAT_COL_24_BPP: blt->dstBpp = 3; break;
+    case DST_FORMAT_COL_32_BPP: blt->dstBpp = 4; break;
+    default:                     blt->dstBpp = 2; break;
     }
 
-    switch (cmd) {
+    switch (blt->command & COMMAND_CMD_MASK) {
     case COMMAND_CMD_NOP:
         break;
-
-    case COMMAND_CMD_RECTFILL: {
-        /*
-         * Solid rectangle fill.
-         * Ported from 86Box banshee_do_rectfill().
-         */
-        uint32_t color    = blt->colorFore;
-        uint32_t dst_base = blt->dstBaseAddr & 0xffffffu;
-        int bpp           = blt->dstBpp;
-        int x, y;
-
-        for (y = 0; y < blt->dstH && (blt->dstY + y) < s->screen_height; y++) {
-            uint8_t *row = s->fb_mem + dst_base
-                         + (size_t)(blt->dstY + y) * blt->dstStride
-                         + (size_t)blt->dstX * bpp;
-            for (x = 0; x < blt->dstW; x++) {
-                switch (bpp) {
-                case 1: row[x] = (uint8_t)color; break;
-                case 2: ((uint16_t *)row)[x] = (uint16_t)color; break;
-                case 3:
-                    row[x*3+0] =  color        & 0xff;
-                    row[x*3+1] = (color >>  8) & 0xff;
-                    row[x*3+2] = (color >> 16) & 0xff;
-                    break;
-                case 4: ((uint32_t *)row)[x] = color; break;
-                }
-            }
-            /* Mark dirty if drawing to front buffer */
-            int abs_y = blt->dstY + y;
-            if (dst_base == (uint32_t)s->params.front_offset
-                && abs_y < V3_DIRTY_LINES)
-                s->dirty_line[abs_y] = 1;
-        }
+    case COMMAND_CMD_RECTFILL:
+        blt_do_rectfill(s);
         break;
-    }
-
     case COMMAND_CMD_S2S_BLT:
-    /*
-     * Cmd 9 = Screen-to-Screen Transparent Blt (chroma-key).
-     * Cmd 12 = variant used by AmigaOS OS4 P96 (Banshee extended cmd,
-     *          functionally S2S with optional chroma; treat as plain S2S).
-     * All three share the same copy engine; chroma-key filtering is a
-     * TODO (colorkeyMin/Max are stored but not yet applied).
-     */
-    case 9:
-    case 12:
-    case COMMAND_CMD_S2S_STRETCH: {
-        /*
-         * Screen-to-screen blit.
-         * Ported from 86Box banshee_do_screen_to_screen_blt().
-         * Simple copy with correct src/dst stride, no ROP yet.
-         */
-        uint32_t src_base = blt->srcBaseAddr & 0xffffffu;
-        uint32_t dst_base = blt->dstBaseAddr & 0xffffffu;
-        int bpp = blt->dstBpp;
-        int y;
-
-        for (y = 0; y < blt->dstH; y++) {
-            const uint8_t *src_row = s->fb_mem + src_base
-                                   + (size_t)(blt->srcY + y) * blt->srcStride
-                                   + (size_t)blt->srcX * bpp;
-            uint8_t *dst_row = s->fb_mem + dst_base
-                              + (size_t)(blt->dstY + y) * blt->dstStride
-                              + (size_t)blt->dstX * bpp;
-            memmove(dst_row, src_row, (size_t)blt->dstW * bpp);
-
-            int abs_y = blt->dstY + y;
-            if (dst_base == (uint32_t)s->params.front_offset
-                && abs_y < V3_DIRTY_LINES)
-                s->dirty_line[abs_y] = 1;
-        }
+    case 9: case 12:    /* AmigaOS transparent / extended S2S variants */
+        blt_do_s2s_blt(s);
         break;
-    }
-
+    case COMMAND_CMD_S2S_STRETCH:
+        blt_do_stretch_blt(s);
+        break;
+    case COMMAND_CMD_LINE:
+        blt_do_line(s, true);
+        break;
+    case COMMAND_CMD_POLYLINE:
+        blt_do_line(s, false);
+        break;
     case COMMAND_CMD_H2S_BLT:
-        /* Host-to-screen: initialise the per-row accumulation state.
-         * Pixel data arrives as 32-bit words written to the launch registers
-         * (0x80..0xfc); each write calls voodoo3_blt_h2s_write(). */
+    case COMMAND_CMD_H2S_STRETCH:
+        /* H2S: launched by register write — data arrives in launch handler */
         blt->host_data_count = 0;
         blt->cur_y           = 0;
-        /* src_stride_dest: bytes per source row aligned to dword boundary */
-        {
-            /* SRC_FORMAT_COL = bits[19:16] of srcFormat (86Box spec) */
-            int src_col = (int)((blt->srcFormat >> 16) & 0xf);
-            int src_bpp;
-            switch (src_col) {
-            case 0:  src_bpp = 1; break;   /* 1-bpp mono   */
-            case 1:  src_bpp = 1; break;   /* 8-bpp        */
-            case 3:  src_bpp = 2; break;   /* 16-bpp       */
-            case 4:  src_bpp = 3; break;   /* 24-bpp       */
-            case 5:  src_bpp = 4; break;   /* 32-bpp       */
-            default: src_bpp = blt->dstBpp; break; /* fallback */
-            }
-            blt->src_stride_dest = ((blt->dstW * src_bpp) + 3) & ~3;
-            /* Also update dstBpp to match for correct memcpy */
-            if (src_col != 0)   /* don't override for 1bpp mono */
-                blt->dstBpp = src_bpp;
-        }
+        blt_update_src_stride_full(s);
         break;
-
-    case COMMAND_CMD_LINE: {
-        /*
-         * Banshee 2D Line Draw — Bresenham algorithm.
-         *
-         * Register mapping (confirmed from 86Box vid_voodoo_banshee_blitter.c):
-         *   dstXY      (0x6c): bits[12:0]=X0, bits[28:16]=Y0  (start point)
-         *   dstSize    (0x68): bits[12:0]=dX (abs), bits[28:16]=dY (abs)
-         *   bresError0 (0x28): initial error term E
-         *   bresError1 (0x2c): K1 = 2*dMinor (error increment for minor step)
-         *   colorFore  (0x64): line colour
-         *   COMMAND_DX (bit 14): X direction (0=+, 1=-)
-         *   COMMAND_DY (bit 15): Y direction (0=+, 1=-)
-         *   dstSize axis convention: the LARGER delta is the major axis.
-         *
-         * The Launch Area write (0x80..0xfc) provides the END coordinate
-         * (dstXY of the endpoint) — we use it just to trigger execution;
-         * the pixel count is encoded in dstSize (the major-axis length).
-         *
-         * Bresenham state:
-         *   x, y         = current pixel
-         *   err          = bresError0 (signed 32-bit)
-         *   k1           = bresError1 = 2 * dMinor
-         *   k2           = 2 * dMinor - 2 * dMajor  (computed here)
-         *   major_steps  = major-axis length in pixels
-         *
-         * Step rule (standard Bresenham, matches 86Box):
-         *   if (err > 0) { step_minor(); err += k2; }
-         *   else         {              err += k1; }
-         *   always: step_major();
-         */
-        uint32_t color    = blt->colorFore;
-        uint32_t dst_base = blt->dstBaseAddr & 0xffffffu;
-        int bpp           = blt->dstBpp;
-        int dx_mag        = blt->dstW;   /* |ΔX| */
-        int dy_mag        = blt->dstH;   /* |ΔY| */
-        int dx_sign       = (blt->command & COMMAND_DX) ? -1 : 1;
-        int dy_sign       = (blt->command & COMMAND_DY) ? -1 : 1;
-
-        /* Determine major / minor axes */
-        bool x_major = (dx_mag >= dy_mag);
-        int major_steps = x_major ? dx_mag : dy_mag;
-
-        /* Bresenham error terms */
-        int32_t err = (int32_t)blt->bresError0;
-        int32_t k1  = (int32_t)blt->bresError1;   /* 2 * dMinor */
-        int dMajor  = x_major ? dx_mag : dy_mag;
-        int32_t k2  = k1 - 2 * dMajor;            /* 2*dMinor - 2*dMajor */
-
-        int x = blt->dstX;
-        int y = blt->dstY;
-
-        for (int step = 0; step <= major_steps; step++) {
-            /* Plot pixel (x, y) */
-            if (x >= 0 && y >= 0 &&
-                x < s->screen_width &&
-                y < s->screen_height) {
-                uint8_t *row = s->fb_mem + dst_base
-                             + (size_t)y * blt->dstStride
-                             + (size_t)x * bpp;
-                switch (bpp) {
-                case 1: *row = (uint8_t)color; break;
-                case 2: *(uint16_t *)row = (uint16_t)color; break;
-                case 3:
-                    row[0] =  color        & 0xff;
-                    row[1] = (color >>  8) & 0xff;
-                    row[2] = (color >> 16) & 0xff;
-                    break;
-                case 4: *(uint32_t *)row = color; break;
-                }
-                if (dst_base == (uint32_t)s->params.front_offset
-                    && y < V3_DIRTY_LINES)
-                    s->dirty_line[y] = 1;
-            }
-
-            /* Bresenham step */
-            if (err > 0) {
-                /* Step minor axis */
-                if (x_major) y += dy_sign;
-                else         x += dx_sign;
-                err += k2;
-            } else {
-                err += k1;
-            }
-            /* Step major axis */
-            if (x_major) x += dx_sign;
-            else         y += dy_sign;
-        }
-        break;
-    }
-
-    case COMMAND_CMD_POLYLINE:
     case COMMAND_CMD_POLYFILL:
-    case COMMAND_CMD_H2S_STRETCH:
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: 2D cmd %u (stub)\n", cmd);
+        /* Polyfill: handled entirely via polyfill_start/continue */
         break;
-
     default:
-        qemu_log_mask(LOG_UNIMP, "voodoo3: unknown 2D cmd %u\n", cmd);
+        qemu_log_mask(LOG_UNIMP, "voodoo3: unknown 2D cmd %u\n",
+                      blt->command & COMMAND_CMD_MASK);
         break;
     }
 }
@@ -1481,101 +2522,90 @@ static void voodoo3_blt_execute(Voodoo3State *s)
  * DST_FORMAT_STRIDE_MASK = bits[12:0] = stride in bytes (non-tiled)
  *                        or number of 128-byte tile columns (tiled).
  */
-/*
- * DST/SRC_FORMAT stride field: bits[13:0] = direct byte stride (86Box confirmed).
- * Mask is 0x3fff not 0x1fff — old value capped stride at 8191 bytes.
- */
-#define DST_FORMAT_STRIDE_MASK  0x3fffu
-#define SRC_FORMAT_STRIDE_MASK  0x3fffu
+#define DST_FORMAT_STRIDE_MASK  0x1fffu   /* bits[12:0] per 86Box DST_FORMAT_STRIDE_MASK */
+#define SRC_FORMAT_STRIDE_MASK_BLT 0x1fffu /* same for src */
 
 static void voodoo3_blt_update_dst_stride(Voodoo3State *s)
 {
-    if (s->blt.dstBaseAddr & 0x80000000u)
-        s->blt.dstStride = (s->blt.dstFormat & DST_FORMAT_STRIDE_MASK) * 128u * 32u;
+    if (s->blt.dstBaseAddr_tiled)
+        s->blt.dst_stride = s->blt.dstStride =
+            (s->blt.dstFormat & DST_FORMAT_STRIDE_MASK) * 128u * 32u;
     else
-        s->blt.dstStride = s->blt.dstFormat & DST_FORMAT_STRIDE_MASK;
+        s->blt.dst_stride = s->blt.dstStride =
+            s->blt.dstFormat & DST_FORMAT_STRIDE_MASK;
 }
 
 static void voodoo3_blt_update_src_stride(Voodoo3State *s)
 {
-    if (s->blt.srcBaseAddr & 0x80000000u)
-        s->blt.srcStride = (s->blt.srcFormat & SRC_FORMAT_STRIDE_MASK) * 128u * 32u;
+    if (s->blt.srcBaseAddr_tiled)
+        s->blt.src_stride = s->blt.srcStride =
+            (s->blt.srcFormat & SRC_FORMAT_STRIDE_MASK_BLT) * 128u * 32u;
     else
-        s->blt.srcStride = s->blt.srcFormat & SRC_FORMAT_STRIDE_MASK;
+        s->blt.src_stride = s->blt.srcStride =
+            s->blt.srcFormat & SRC_FORMAT_STRIDE_MASK_BLT;
 }
 
 static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
 {
     voodoo3_blt_t *blt = &s->blt;
     /*
-     * Banshee 2D engine register map (BAR0 + 0x100000 base).
-     * Ported from 86Box voodoo_2d_reg_writel() in vid_voodoo_banshee_blitter.c.
+     * Banshee 2D engine register map — ported from 86Box voodoo_2d_reg_writel()
+     * in vid_voodoo_banshee_blitter.c.
      *
-     * Registers 0x80..0xfc are "launch" registers: writing them stores srcXY
-     * (for S2S_BLT) or host pixel data (for H2S_BLT) and then triggers
-     * execution if launch_pending is set.  This is how AmigaOS OS4 P96 drivers
-     * initiate blits — they write the command to 0x70 (no INITIATE bit), then
-     * write srcXY to 0x80 which fires the blt.
+     * Launch registers 0x80..0xfc: writing triggers blit execution for
+     * S2S (passes srcXY), H2S (passes pixel data), LINE/POLYLINE (passes
+     * endpoint), RECTFILL (passes dstXY), POLYFILL (passes next vertex).
+     *
+     * Pattern registers 0x100..0x1fc: 8×8 32-bit color pattern with
+     * decoded 8/16/24-bpp views for fast pixel access.
      */
     uint32_t off = addr & 0x1fc;
 
     /* ---- Launch registers 0x80..0xfc ---- */
     if (off >= 0x80 && off <= 0xfc) {
-        if (s->blt.launch_pending) {
-            /* Resolve dst_stride/src_stride before execute */
-            voodoo3_blt_update_dst_stride(s);
-            voodoo3_blt_update_src_stride(s);
-            s->blt.launch_pending = 0;
-        }
-        /* Dispatch per-command launch data */
-        switch (s->blt.command & COMMAND_CMD_MASK) {
+        if (blt->launch_pending)
+            blt_do_launch(s);
+
+        switch (blt->command & COMMAND_CMD_MASK) {
         case COMMAND_CMD_S2S_BLT:
+            blt->srcXY = val;
+            blt->srcX  = ((int32_t)(val << 19)) >> 19;
+            blt->srcY  = ((int32_t)(val <<  3)) >> 19;
+            blt_do_s2s_blt(s);
+            break;
         case COMMAND_CMD_S2S_STRETCH:
-            /* val = srcXY: bits[12:0]=srcX, bits[28:16]=srcY */
-            s->blt.srcXY = val;
-            s->blt.srcX  = (int)(val & 0x1fff);
-            s->blt.srcY  = (int)((val >> 16) & 0x1fff);
-            voodoo3_blt_execute(s);
+            blt->srcXY = val;
+            blt->srcX  = ((int32_t)(val << 19)) >> 19;
+            blt->srcY  = ((int32_t)(val <<  3)) >> 19;
+            blt_do_stretch_blt(s);
             break;
         case COMMAND_CMD_H2S_BLT:
-        case COMMAND_CMD_H2S_STRETCH:
-        {
-            /* Accumulate 4 bytes of host pixel data */
-            if (blt->host_data_count + 4 <= (int)sizeof(blt->host_data)) {
-                blt->host_data[blt->host_data_count+0] = (uint8_t)(val);
-                blt->host_data[blt->host_data_count+1] = (uint8_t)(val >> 8);
-                blt->host_data[blt->host_data_count+2] = (uint8_t)(val >> 16);
-                blt->host_data[blt->host_data_count+3] = (uint8_t)(val >> 24);
-                blt->host_data_count += 4;
-            }
-            /* When we have accumulated a full source row, write it out */
-            while (blt->src_stride_dest > 0 &&
-                   blt->host_data_count >= blt->src_stride_dest &&
-                   blt->cur_y < blt->dstH) {
-                /* Compute destination address in VRAM */
-                uint32_t dst_addr = (blt->dstBaseAddr & 0xffffffu)
-                    + (size_t)(blt->dstY + blt->cur_y) * blt->dstStride
-                    + (size_t)blt->dstX * blt->dstBpp;
-                if (dst_addr + blt->dstW * blt->dstBpp <= s->fb_size) {
-                    memcpy(s->fb_mem + dst_addr,
-                           blt->host_data,
-                           (size_t)blt->dstW * blt->dstBpp);
-                    /* Mark scanline dirty */
-                    int abs_y = blt->dstY + blt->cur_y;
-                    if (abs_y >= 0 && abs_y < V3_DIRTY_LINES)
-                        s->dirty_line[abs_y] = 1;
-                }
-                blt->cur_y++;
-                /* Shift remaining bytes to front */
-                int remaining = blt->host_data_count - blt->src_stride_dest;
-                if (remaining > 0)
-                    memmove(blt->host_data,
-                            blt->host_data + blt->src_stride_dest,
-                            (size_t)remaining);
-                blt->host_data_count = remaining;
-            }
+            blt_do_h2s_blt(s, val);
             break;
-        }
+        case COMMAND_CMD_H2S_STRETCH:
+            blt_do_h2s_stretch_blt(s, val);
+            break;
+        case COMMAND_CMD_RECTFILL:
+            blt->dstXY = val;
+            blt->dstX  = ((int32_t)(val << 19)) >> 19;
+            blt->dstY  = ((int32_t)(val <<  3)) >> 19;
+            blt_do_rectfill(s);
+            break;
+        case COMMAND_CMD_LINE:
+            blt->dstXY = val;
+            blt->dstX  = ((int32_t)(val << 19)) >> 19;
+            blt->dstY  = ((int32_t)(val <<  3)) >> 19;
+            blt_do_line(s, true);
+            break;
+        case COMMAND_CMD_POLYLINE:
+            blt->dstXY = val;
+            blt->dstX  = ((int32_t)(val << 19)) >> 19;
+            blt->dstY  = ((int32_t)(val <<  3)) >> 19;
+            blt_do_line(s, false);
+            break;
+        case COMMAND_CMD_POLYFILL:
+            blt_polyfill_continue(s, val);
+            break;
         default:
             voodoo3_blt_execute(s);
             break;
@@ -1583,100 +2613,432 @@ static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         return;
     }
 
+    /* ---- Pattern registers 0x100..0x1fc — 8×8 colour pattern ---- */
+    if (off >= 0x100 && off <= 0x1fc) {
+        /*
+         * Ported from 86Box voodoo_2d_reg_writel() 0x100..0x1fc case.
+         * colorPattern[64] stores 32-bit pixels; decoded into 8/16/24-bpp
+         * views for fast per-bpp access in PLOT().
+         */
+        int idx = (off >> 2) & 63;
+        blt->colorPattern[idx] = val;
+
+        /* 24-bpp view: 4 pixels per 3 dwords */
+        if (off < 0x1c0) {
+            int base24 = (off & 0xfc) / 0x0c;
+            uintptr_t sp = (uintptr_t)&blt->colorPattern[base24 * 3];
+            int col24 = base24 * 4;
+            blt->colorPattern24[col24]   = *(uint32_t *)sp & 0xffffffu;
+            blt->colorPattern24[col24+1] = *(uint32_t *)(sp+3) & 0xffffffu;
+            blt->colorPattern24[col24+2] = *(uint32_t *)(sp+6) & 0xffffffu;
+            blt->colorPattern24[col24+3] = *(uint32_t *)(sp+9) & 0xffffffu;
+        }
+        /* 16-bpp view */
+        if (off < 0x180) {
+            blt->colorPattern16[((off >> 1) & 62)    ] = (uint16_t)(val & 0xffffu);
+            blt->colorPattern16[((off >> 1) & 62) + 1] = (uint16_t)(val >> 16);
+        }
+        /* 8-bpp view */
+        if (off < 0x140) {
+            blt->colorPattern8[ off & 60      ] = (uint8_t)(val);
+            blt->colorPattern8[(off & 60) + 1  ] = (uint8_t)(val >> 8);
+            blt->colorPattern8[(off & 60) + 2  ] = (uint8_t)(val >> 16);
+            blt->colorPattern8[(off & 60) + 3  ] = (uint8_t)(val >> 24);
+        }
+        return;
+    }
+
+    /* ---- Control registers 0x08..0x7c ---- */
     switch (off) {
-    /* ---- Complete Banshee 2D register map from 86Box ---- */
     case 0x08:
-        s->blt.clip0Min = val;
+        blt->clip0Min        = val;
+        blt->clip[0].x_min   = (int)(val & 0xfffu);
+        blt->clip[0].y_min   = (int)((val >> 16) & 0xfffu);
         break;
     case 0x0c:
-        s->blt.clip0Max = val;
+        blt->clip0Max        = val;
+        blt->clip[0].x_max   = (int)(val & 0xfffu);
+        blt->clip[0].y_max   = (int)((val >> 16) & 0xfffu);
         break;
     case 0x10:
-        /*
-         * dstBaseAddr: bit[31] = tiled flag.
-         * Recompute dst_stride whenever base addr or tiling changes.
-         */
-        s->blt.dstBaseAddr = val & 0xffffffu;
-        s->blt.dstTiled    = !!(val & 0x80000000u);
+        blt->dstBaseAddr       = val & 0xffffffu;
+        blt->dstBaseAddr_tiled = val & 0x80000000u;
+        blt->dstTiled          = !!(val & 0x80000000u);
         voodoo3_blt_update_dst_stride(s);
         break;
     case 0x14:
-        s->blt.dstFormat = val;
+        blt->dstFormat = val;
         voodoo3_blt_update_dst_stride(s);
         break;
-    case 0x18: s->blt.srcColorkeyMin = val & 0xffffffu; break;
-    case 0x1c: s->blt.srcColorkeyMax = val & 0xffffffu; break;
-    case 0x20: s->blt.dstColorkeyMin = val & 0xffffffu; break;
-    case 0x24: s->blt.dstColorkeyMax = val & 0xffffffu; break;
-    case 0x28: s->blt.bresError0  = val; break;
-    case 0x2c: s->blt.bresError1  = val; break;
-    case 0x30: s->blt.rop         = val; break;
-    case 0x34:
-        s->blt.srcBaseAddr = val & 0xffffffu;
-        s->blt.srcTiled    = !!(val & 0x80000000u);
-        voodoo3_blt_update_src_stride(s);
+    case 0x18: blt->srcColorkeyMin = val & 0xffffffu; break;
+    case 0x1c: blt->srcColorkeyMax = val & 0xffffffu; break;
+    case 0x20: blt->dstColorkeyMin = val & 0xffffffu; break;
+    case 0x24: blt->dstColorkeyMax = val & 0xffffffu; break;
+    case 0x28:
+        blt->bresError0  = val;
+        blt->bres_error_0 = (int)(val & BRES_ERROR_MASK);
         break;
-    case 0x38: s->blt.commandExtra = val; break;
-    case 0x3c: s->blt.lineStipple  = val; break;
-    case 0x40: s->blt.lineStyle    = val; break;
-    case 0x44: s->blt.pattern0    = val; break;
-    case 0x48: s->blt.pattern1    = val; break;
-    case 0x4c: /* reserved */ break;
-    case 0x50: /* reserved */ break;
-    case 0x54:
-        /*
-         * srcFormat: colour depth, packing, stride.
-         * 86Box: also recomputes src_stride here.
-         */
-        s->blt.srcFormat = val;
+    case 0x2c:
+        blt->bresError1  = val;
+        blt->bres_error_1 = (int)(val & BRES_ERROR_MASK);
+        break;
+    case 0x30:
+        blt->rop     = val;
+        blt->rops[1] = (uint8_t)(val);
+        blt->rops[2] = (uint8_t)(val >> 8);
+        blt->rops[3] = (uint8_t)(val >> 16);
+        break;
+    case 0x34:
+        blt->srcBaseAddr       = val & 0xffffffu;
+        blt->srcBaseAddr_tiled = val & 0x80000000u;
+        blt->srcTiled          = !!(val & 0x80000000u);
         voodoo3_blt_update_src_stride(s);
+        blt_update_src_stride_full(s);
+        break;
+    case 0x38: blt->commandExtra = val; break;
+    case 0x3c: blt->lineStipple  = val; break;
+    case 0x40:
+        blt->lineStyle          = val;
+        blt->line_rep_cnt       = (int)(val & 0xffu);
+        blt->line_bit_mask_size = (int)((val >> 8) & 0x1fu);
+        blt->line_pix_pos       = (int)((val >> 16) & 0xffu);
+        blt->line_bit_pos       = (int)((val >> 24) & 0x1fu);
+        break;
+    /* 0x44/0x48: first two colorPattern dwords (also decoded to 8/16/24-bpp) */
+    case 0x44:
+        blt->colorPattern[0]   = val;
+        blt->colorPattern24[0] = val & 0xffffffu;
+        blt->colorPattern24[1] = (blt->colorPattern24[1] & 0xffff00u) | (val >> 24);
+        blt->colorPattern16[0] = (uint16_t)(val & 0xffffu);
+        blt->colorPattern16[1] = (uint16_t)(val >> 16);
+        blt->colorPattern8[0]  = (uint8_t)(val);
+        blt->colorPattern8[1]  = (uint8_t)(val >> 8);
+        blt->colorPattern8[2]  = (uint8_t)(val >> 16);
+        blt->colorPattern8[3]  = (uint8_t)(val >> 24);
+        break;
+    case 0x48:
+        blt->colorPattern[1]   = val;
+        blt->colorPattern24[1] = (blt->colorPattern24[1] & 0xffu) | ((val & 0xffffu) << 8);
+        blt->colorPattern24[2] = (blt->colorPattern24[2] & 0xff0000u) | (val >> 16);
+        blt->colorPattern16[2] = (uint16_t)(val & 0xffffu);
+        blt->colorPattern16[3] = (uint16_t)(val >> 16);
+        blt->colorPattern8[4]  = (uint8_t)(val);
+        blt->colorPattern8[5]  = (uint8_t)(val >> 8);
+        blt->colorPattern8[6]  = (uint8_t)(val >> 16);
+        blt->colorPattern8[7]  = (uint8_t)(val >> 24);
+        break;
+    case 0x4c:
+        blt->clip1Min        = val;
+        blt->clip[1].x_min   = (int)(val & 0xfffu);
+        blt->clip[1].y_min   = (int)((val >> 16) & 0xfffu);
+        break;
+    case 0x50:
+        blt->clip1Max        = val;
+        blt->clip[1].x_max   = (int)(val & 0xfffu);
+        blt->clip[1].y_max   = (int)((val >> 16) & 0xfffu);
+        break;
+    case 0x54:
+        blt->srcFormat = val;
+        voodoo3_blt_update_src_stride(s);
+        switch (val & SRC_FORMAT_COL_MASK) {
+        case SRC_FORMAT_COL_1_BPP:  blt->src_bpp =  1; break;
+        case SRC_FORMAT_COL_8_BPP:  blt->src_bpp =  8; break;
+        case SRC_FORMAT_COL_24_BPP: blt->src_bpp = 24; break;
+        case SRC_FORMAT_COL_32_BPP:
+        case SRC_FORMAT_COL_YUYV:
+        case SRC_FORMAT_COL_UYVY:   blt->src_bpp = 32; break;
+        default:                     blt->src_bpp = 16; break;
+        }
+        blt_update_src_stride_full(s);
         break;
     case 0x58:
-        s->blt.srcSize = val;
-        s->blt.srcW    = (int)(val & 0x1fffu);
-        s->blt.srcH    = (int)((val >> 16) & 0x1fffu);
+        blt->srcSize  = val;
+        blt->srcSizeX = blt->srcW = (int)(val & 0x1fffu);
+        blt->srcSizeY = blt->srcH = (int)((val >> 16) & 0x1fffu);
+        blt_update_src_stride_full(s);
         break;
     case 0x5c:
-        s->blt.srcXY = val;
-        s->blt.srcX  = (int)(val & 0x1fffu);
-        s->blt.srcY  = (int)((val >> 16) & 0x1fffu);
+        blt->srcXY = val;
+        blt->srcX  = ((int32_t)(val << 19)) >> 19;
+        blt->srcY  = ((int32_t)(val <<  3)) >> 19;
+        blt_update_src_stride_full(s);
         break;
-    case 0x60: s->blt.colorBack = val; break;
-    case 0x64: s->blt.colorFore = val; break;
+    case 0x60: blt->colorBack = val; break;
+    case 0x64: blt->colorFore = val; break;
     case 0x68:
-        s->blt.dstSize = val;
-        s->blt.dstW    = (int)(val & 0x1fffu);
-        s->blt.dstH    = (int)((val >> 16) & 0x1fffu);
+        blt->dstSize  = val;
+        blt->dstSizeX = blt->dstW = (int)(val & 0x1fffu);
+        blt->dstSizeY = blt->dstH = (int)((val >> 16) & 0x1fffu);
+        blt_update_src_stride_full(s);
         break;
     case 0x6c:
-        s->blt.dstXY = val;
-        s->blt.dstX  = (int)(val & 0x1fffu);
-        s->blt.dstY  = (int)((val >> 16) & 0x1fffu);
+        blt->dstXY = val;
+        blt->dstX  = ((int32_t)(val << 19)) >> 19;
+        blt->dstY  = ((int32_t)(val <<  3)) >> 19;
         break;
     case 0x70:
         /*
-         * Command register.  86Box: sets launch_pending=1, then dispatches
-         * only POLYFILL and H2S specially; all others wait for a launch-reg
-         * write (0x80..0xfc) to actually fire.  If COMMAND_INITIATE is set,
-         * fire immediately (same as 86Box default-case INITIATE path).
+         * Command register — ported from 86Box 0x70 handler.
+         * Sets launch_pending; some commands fire immediately.
          */
-        s->blt.command       = val;
-        s->blt.launch_pending = 1;
-        if (val & COMMAND_INITIATE) {
-            voodoo3_blt_update_dst_stride(s);
-            voodoo3_blt_update_src_stride(s);
-            s->blt.launch_pending = 0;
-            voodoo3_blt_execute(s);
+        blt->command      = val;
+        blt->launch_pending = true;
+        blt->rops[0]      = (uint8_t)(val >> 24);
+        blt->patoff_x     = (val & COMMAND_PATOFF_X_MASK) >> COMMAND_PATOFF_X_SHIFT;
+        blt->patoff_y     = (val & COMMAND_PATOFF_Y_MASK) >> COMMAND_PATOFF_Y_SHIFT;
+
+        switch (val & COMMAND_CMD_MASK) {
+        case COMMAND_CMD_POLYFILL:
+            blt_do_launch(s);
+            if (val & COMMAND_INITIATE) {
+                blt->dstXY = blt->srcXY;
+                blt->dstX  = blt->srcX;
+                blt->dstY  = blt->srcY;
+            }
+            blt_polyfill_start(blt);
+            break;
+        case COMMAND_CMD_H2S_BLT:
+        case COMMAND_CMD_H2S_STRETCH:
+            /* H2S: wait for data in launch registers */
+            break;
+        default:
+            if (val & COMMAND_INITIATE) {
+                blt_do_launch(s);
+                voodoo3_blt_execute(s);
+            }
+            break;
         }
         break;
-    /*
-     * 0x054 = srcFormat in write path (handled by case 0x54 above).
-     *         engineStatus is read-only; reads return 0 (idle) in the
-     *         read handler. No write case needed here.
-     * 0x080..0xfc = launch registers (handled at top of function).
-     */
+
     default:
-        s->regs[(off) >> 2] = val;
+        s->regs[off >> 2] = val;
+        break;
+    }
+}
+
+/* =========================================================================
+ * CMDFIFO register read/write
+ *
+ * Ported from 86Box banshee_cmd_read() / banshee_cmd_write()
+ * in vid_voodoo_banshee.c.
+ *
+ * These registers live at BAR0 offset 0x80000–0x8ffff (the IO-remap
+ * window with bit 19 set).  The local offset = addr & 0x1fc selects
+ * the register.  The two FIFOs share the same layout; FIFO1 starts at
+ * local offset 0x30 above FIFO0.
+ *
+ * AGP offsets (local 0x00–0x14):
+ *   0x00  Agp_agpReqSize          byte count for DMA transfer
+ *   0x04  Agp_agpHostAddressLow   source host address
+ *   0x08  Agp_agpHostAddressHigh  [13:0]=width [27:14]=stride
+ *   0x0c  Agp_agpGraphicsAddress  dest VRAM byte address
+ *   0x10  Agp_agpGraphicsStride   dest stride in bytes
+ *   0x14  Agp_agpMoveCMD          [4:3]=dest-type, triggers transfer
+ *
+ * CMDFIFO0 offsets (local 0x20–0x48):
+ *   0x20  cmdBaseAddr0    FIFO ring base  (bits [23:12] << 12)
+ *   0x24  cmdBaseSize0    ring size + enable/AGP flags
+ *   0x28  cmdBump0        (write: no-op)
+ *   0x2c  cmdRdPtrL0      read pointer low
+ *   0x30  cmdRdPtrH0      read pointer high (stub)
+ *   0x34  cmdAMin0        contiguous-hole lower bound
+ *   0x3c  cmdAMax0        contiguous-hole upper bound
+ *   0x40  cmdStatus0      (read-only)
+ *   0x44  cmdFifoDepth0   write = reset depth; read = wr-rd
+ *   0x48  cmdHoleCnt0     hole count
+ *
+ * CMDFIFO1 offsets are FIFO0 + 0x30 (local 0x50–0x78).
+ * ========================================================================= */
+
+#define CMDFIFO_BASE_ADDR0  0x20
+#define CMDFIFO_SIZE0       0x24
+#define CMDFIFO_BUMP0       0x28
+#define CMDFIFO_RDPTR_L0    0x2c
+#define CMDFIFO_RDPTR_H0    0x30
+#define CMDFIFO_AMIN0       0x34
+#define CMDFIFO_AMAX0       0x3c
+#define CMDFIFO_STATUS0     0x40
+#define CMDFIFO_DEPTH0      0x44
+#define CMDFIFO_HOLECNT0    0x48
+
+#define CMDFIFO_BASE_ADDR1  0x50
+#define CMDFIFO_SIZE1       0x54
+#define CMDFIFO_BUMP1       0x58
+#define CMDFIFO_RDPTR_L1    0x5c
+#define CMDFIFO_RDPTR_H1    0x60
+#define CMDFIFO_AMIN1       0x64
+#define CMDFIFO_AMAX1       0x6c
+#define CMDFIFO_STATUS1     0x70
+#define CMDFIFO_DEPTH1      0x74
+#define CMDFIFO_HOLECNT1    0x78
+
+#define AGP_REQSIZE         0x00
+#define AGP_HOST_ADDR_LO    0x04
+#define AGP_HOST_ADDR_HI    0x08
+#define AGP_GRAPHICS_ADDR   0x0c
+#define AGP_GRAPHICS_STRIDE 0x10
+#define AGP_MOVE_CMD        0x14
+
+static uint32_t voodoo3_cmd_read(Voodoo3State *s, uint32_t local)
+{
+    switch (local) {
+    /* AGP */
+    case AGP_HOST_ADDR_LO:    return s->agpHostAddressLow;
+    case AGP_HOST_ADDR_HI:    return s->agpHostAddressHigh;
+    case AGP_GRAPHICS_ADDR:   return s->agpGraphicsAddress;
+    case AGP_GRAPHICS_STRIDE: return s->agpGraphicsStride;
+    case AGP_REQSIZE:         return s->agpReqSize;
+    case AGP_MOVE_CMD:        return s->agpMoveCMD;
+
+    /* FIFO0 */
+    case CMDFIFO_BASE_ADDR0:  return s->cmdfifo_base >> 12;
+    case CMDFIFO_RDPTR_L0:    return s->cmdfifo_rp;
+    case CMDFIFO_DEPTH0:      return s->cmdfifo_depth_wr - s->cmdfifo_depth_rd;
+    case CMDFIFO_STATUS0:     return 0; /* always idle */
+    case CMDFIFO_SIZE0:
+        return s->cmdfifo_size
+               | (s->cmdfifo_enabled  ? 0x100u : 0u)
+               | (s->cmdfifo_in_agp   ? 0x200u : 0u);
+    case CMDFIFO_AMIN0:       return s->cmdfifo_amin;
+    case CMDFIFO_AMAX0:       return s->cmdfifo_amax;
+    case CMDFIFO_HOLECNT0:    return s->cmdfifo_holecount;
+
+    /* FIFO1 */
+    case CMDFIFO_BASE_ADDR1:  return s->cmdfifo_base_2 >> 12;
+    case CMDFIFO_RDPTR_L1:    return s->cmdfifo_rp_2;
+    case CMDFIFO_DEPTH1:      return s->cmdfifo_depth_wr_2 - s->cmdfifo_depth_rd_2;
+    case CMDFIFO_STATUS1:     return 0;
+    case CMDFIFO_SIZE1:
+        return s->cmdfifo_size_2
+               | (s->cmdfifo_enabled_2 ? 0x100u : 0u)
+               | (s->cmdfifo_in_agp_2  ? 0x200u : 0u);
+    case CMDFIFO_AMIN1:       return s->cmdfifo_amin_2;
+    case CMDFIFO_AMAX1:       return s->cmdfifo_amax_2;
+    case CMDFIFO_HOLECNT1:    return s->cmdfifo_holecount_2;
+
+    default:
+        return 0xffffffffu;
+    }
+}
+
+static void voodoo3_cmd_write(Voodoo3State *s, uint32_t local, uint32_t val)
+{
+    switch (local) {
+    /* ---- AGP host→VRAM DMA transfer ------------------------------------ */
+    case AGP_HOST_ADDR_LO:
+        s->agpHostAddressLow  = val;
+        break;
+    case AGP_HOST_ADDR_HI:
+        s->agpHostAddressHigh = val;
+        break;
+    case AGP_GRAPHICS_ADDR:
+        s->agpGraphicsAddress = val;
+        break;
+    case AGP_GRAPHICS_STRIDE:
+        s->agpGraphicsStride  = val;
+        break;
+    case AGP_REQSIZE:
+        s->agpReqSize = val;
+        break;
+    case AGP_MOVE_CMD: {
+        /*
+         * Trigger AGP DMA transfer.
+         * dest type = (val >> 3) & 3:
+         *   0 = linear framebuffer   1 = planar YUV
+         *   2 = framebuffer (tiled)  3 = texture
+         *
+         * On a PCI card (no AGP) this is a programmed-IO copy from
+         * guest RAM.  We do not have access to physical host memory in
+         * QEMU's device model, so we accept the write and return 0 from
+         * agpMoveCMD reads.  The driver only uses this for texture upload
+         * on AGP variants; PCI cards use the LFB aperture instead.
+         */
+        s->agpMoveCMD = val;
+        /* Stub: no DMA engine – silently ignore */
+        break;
+    }
+
+    /* ---- CMDFIFO0 ------------------------------------------------------- */
+    case CMDFIFO_BASE_ADDR0:
+        s->cmdfifo_base = (val & 0xfffu) << 12;
+        s->cmdfifo_end  = s->cmdfifo_base +
+                          (((s->cmdfifo_size & 0xffu) + 1u) << 12);
+        break;
+    case CMDFIFO_SIZE0:
+        s->cmdfifo_size    = val;
+        s->cmdfifo_end     = s->cmdfifo_base +
+                             (((val & 0xffu) + 1u) << 12);
+        s->cmdfifo_enabled = !!(val & 0x100u);
+        if (!s->cmdfifo_enabled)
+            s->cmdfifo_in_sub = 0;
+        s->cmdfifo_in_agp  = !!(val & 0x200u);
+        break;
+    case CMDFIFO_BUMP0:
+        /* write-only bump register – no persistent state */
+        break;
+    case CMDFIFO_RDPTR_L0:
+        s->cmdfifo_rp = val;
+        break;
+    case CMDFIFO_RDPTR_H0:
+        /* high 32 bits of 64-bit pointer – not used on 32-bit PCI */
+        break;
+    case CMDFIFO_AMIN0:
+        s->cmdfifo_amin = val;
+        break;
+    case CMDFIFO_AMAX0:
+        s->cmdfifo_amax = val;
+        break;
+    case CMDFIFO_DEPTH0:
+        s->cmdfifo_depth_rd = 0;
+        s->cmdfifo_depth_wr = val & 0xffffu;
+        break;
+    case CMDFIFO_HOLECNT0:
+        s->cmdfifo_holecount = val;
+        break;
+    case CMDFIFO_STATUS0:
+        /* read-only */
+        break;
+
+    /* ---- CMDFIFO1 ------------------------------------------------------- */
+    case CMDFIFO_BASE_ADDR1:
+        s->cmdfifo_base_2 = (val & 0xfffu) << 12;
+        s->cmdfifo_end_2  = s->cmdfifo_base_2 +
+                            (((s->cmdfifo_size_2 & 0xffu) + 1u) << 12);
+        break;
+    case CMDFIFO_SIZE1:
+        s->cmdfifo_size_2    = val;
+        s->cmdfifo_end_2     = s->cmdfifo_base_2 +
+                               (((val & 0xffu) + 1u) << 12);
+        s->cmdfifo_enabled_2 = !!(val & 0x100u);
+        if (!s->cmdfifo_enabled_2)
+            s->cmdfifo_in_sub_2 = 0;
+        s->cmdfifo_in_agp_2  = !!(val & 0x200u);
+        break;
+    case CMDFIFO_BUMP1:
+        break;
+    case CMDFIFO_RDPTR_L1:
+        s->cmdfifo_rp_2 = val;
+        break;
+    case CMDFIFO_RDPTR_H1:
+        break;
+    case CMDFIFO_AMIN1:
+        s->cmdfifo_amin_2 = val;
+        break;
+    case CMDFIFO_AMAX1:
+        s->cmdfifo_amax_2 = val;
+        break;
+    case CMDFIFO_DEPTH1:
+        s->cmdfifo_depth_rd_2 = 0;
+        s->cmdfifo_depth_wr_2 = val & 0xffffu;
+        break;
+    case CMDFIFO_HOLECNT1:
+        s->cmdfifo_holecount_2 = val;
+        break;
+    case CMDFIFO_STATUS1:
+        break;
+
+    default:
+        /* Shadow/unknown registers — silently ignore */
         break;
     }
 }
@@ -1691,8 +3053,9 @@ static uint64_t voodoo3_mmio_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (addr & 0x1f00000) {
     case BAR0_IO_REMAP:
-        ret = (addr & 0x80000) ? 0xffffffff
-                               : voodoo3_ext_read(s, addr & 0xff);
+        ret = (addr & 0x80000u)
+              ? voodoo3_cmd_read(s, (uint32_t)(addr & 0x1fc))
+              : voodoo3_ext_read(s, addr & 0xff);
         break;
     case BAR0_2D_REGS:
         switch (addr & 0x1fc) {
@@ -1755,12 +3118,10 @@ static void voodoo3_mmio_write(void *opaque, hwaddr addr,
 
     switch (addr & 0x1f00000) {
     case BAR0_IO_REMAP:
-        if (!(addr & 0x80000))
+        if (!(addr & 0x80000u))
             voodoo3_ext_write(s, addr & 0xff, val);
         else
-            qemu_log_mask(LOG_UNIMP,
-                "voodoo3: CMDFIFO write 0x%"HWADDR_PRIx" = 0x%08x\n",
-                addr, val);
+            voodoo3_cmd_write(s, (uint32_t)(addr & 0x1fc), val);
         break;
     case BAR0_2D_REGS:
         if ((addr & 0x3fc) == SST_intrCtrl)
@@ -1879,22 +3240,356 @@ static const MemoryRegionOps voodoo3_lfb_ops = {
 };
 
 /* =========================================================================
- * BAR2: Legacy I/O
+ * BAR2: Legacy I/O — VGA port proxy
+ *
+ * The Banshee/V3 BAR2 is a 256-byte I/O aperture that mirrors the Banshee
+ * extended register space at BAR0 offset 0x00..0xff AND the VGA I/O ports
+ * 0x3b0..0x3df (mapped at BAR2 offset 0xb0..0xdf).
+ *
+ * Ported from 86Box:
+ *   banshee_ext_out/in()  — the byte-wide ext register handler which
+ *                           forwards 0xb0..0xdf to banshee_out/in()
+ *   banshee_out/in()      — handles 0x3D4/0x3D5 (CRTC) plus delegates
+ *                           everything else to svga_out/svga_in()
+ *   svga_out/svga_in()    — the full VGA port implementation
+ *
+ * Port mapping (BAR2 offset → VGA port → function):
+ *   0xb0..0xb7  → 0x3b0..0x3b7  MDA / unused on colour adapters
+ *   0xba        → 0x3ba         Input Status 1 (mono)
+ *   0xc0        → 0x3c0         ATC index+data (write) / ATC data (alt read)
+ *   0xc1        → 0x3c1         ATC data read
+ *   0xc2        → 0x3c2         Misc Output Write / Input Status 0 (read)
+ *   0xc4        → 0x3c4         Sequencer index
+ *   0xc5        → 0x3c5         Sequencer data
+ *   0xc6        → 0x3c6         DAC PEL mask
+ *   0xc7        → 0x3c7         DAC read address (write) / DAC state (read)
+ *   0xc8        → 0x3c8         DAC write address
+ *   0xc9        → 0x3c9         DAC data (R/G/B triplets)
+ *   0xca        → 0x3ca         Feature Control read (read-only)
+ *   0xcc        → 0x3cc         Misc Output read (read-only)
+ *   0xce        → 0x3ce         GRC index
+ *   0xcf        → 0x3cf         GRC data
+ *   0xd4        → 0x3d4         CRTC index
+ *   0xd5        → 0x3d5         CRTC data (with protect logic)
+ *   0xda        → 0x3da         Input Status 1 / Feature Control write
+ *
+ * Offsets 0x00..0xaf and 0xe0..0xff go to voodoo3_ext_read/write().
  * ========================================================================= */
+
+/*
+ * VGA I/O write helper — ported from 86Box banshee_out() + svga_out().
+ * addr is the full VGA port address (0x3b0..0x3df).
+ */
+static void voodoo3_vga_out(Voodoo3State *s, uint16_t addr, uint8_t val)
+{
+    /*
+     * 86Box banshee_out() line 366:
+     *   if (((addr & 0xfff0) == 0x3d0 || (addr & 0xfff0) == 0x3b0)
+     *       && !(svga->miscout & 1))
+     *       addr ^= 0x60;
+     * Meaning: if misc_out bit 0 is 0, 3Dx <-> 3Bx (MDA compat mode).
+     */
+    if (((addr & 0xfff0) == 0x3d0 || (addr & 0xfff0) == 0x3b0)
+        && !(s->misc_out & 1))
+        addr ^= 0x60;
+
+    switch (addr) {
+    /*
+     * 0x3c0 — Attribute Controller (ATC) index + data.
+     * 86Box svga_out(): ar_flip_flop toggles between index write and data write.
+     * Reading 0x3da/0x3ba resets ar_flip_flop to index mode.
+     */
+    case 0x3c0:
+        if (!s->ar_flip_flop) {
+            /* Index write: bits[4:0] = register select, bit 5 = palette enable */
+            s->ar_idx = val & 0x3f;
+        } else {
+            /* Data write: store into ATC register */
+            if (s->ar_idx < 32)
+                s->ar_regs[s->ar_idx] = val;
+        }
+        s->ar_flip_flop = !s->ar_flip_flop;
+        break;
+
+    /*
+     * 0x3c2 — Miscellaneous Output Register.
+     * Bits: [0]=IO select(0=3Bx,1=3Dx), [1]=RAM enable,
+     *       [3:2]=clock select, [5]=page sel, [7:6]=sync polarity.
+     */
+    case 0x3c2:
+        s->misc_out = val;
+        /*
+         * 86Box: writing misc_out triggers svga_recalctimings() which calls
+         * banshee_recalctimings() — the clock select bits[3:2] determine
+         * whether the PLL or a fixed VGA clock is used.
+         */
+        voodoo3_pll_update_vblank(s);
+        break;
+
+    /* 0x3c4 — Sequencer index. */
+    case 0x3c4:
+        s->seq_idx = val & 0x07;
+        break;
+    /* 0x3c5 — Sequencer data. */
+    case 0x3c5:
+        if (s->seq_idx < 8) {
+            s->seq_regs[s->seq_idx] = val;
+            /* seq[1] bit3 = 8/16 dot clock → affects htotal pixel count */
+            if (s->seq_idx == 1)
+                voodoo3_pll_update_vblank(s);
+        }
+        break;
+
+    /* 0x3c6 — DAC PEL mask. */
+    case 0x3c6:
+        s->dac_pel_mask = val;
+        break;
+
+    /*
+     * 0x3c7 — DAC read address.
+     * 86Box svga_out(): svga->dac_read = val; svga->dac_state = 3.
+     */
+    case 0x3c7:
+        s->dac_read_addr = val;
+        s->dac_rgb_idx   = 0;
+        s->dac_state     = 3;   /* read mode */
+        break;
+
+    /*
+     * 0x3c8 — DAC write address.
+     * 86Box svga_out(): svga->dac_write = val; svga->dac_state = 0.
+     */
+    case 0x3c8:
+        s->dac_write_addr = val;
+        s->dacAddr        = (int)(val & 0xff);
+        s->dac_rgb_idx    = 0;
+        s->dac_state      = 0;   /* write mode */
+        break;
+
+    /*
+     * 0x3c9 — DAC data (R/G/B triplet).
+     * The Banshee DAC is 8-bit (not 6-bit VGA), so val is stored directly
+     * (no << 2 shift), matching 86Box banshee behaviour.
+     */
+    case 0x3c9:
+        s->dac_rgb_buf[s->dac_rgb_idx++] = val;
+        if (s->dac_rgb_idx == 3) {
+            s->dac_rgb_idx = 0;
+            if (s->dacAddr < VOODOO3_CLUT_SIZE) {
+                s->pallook[s->dacAddr] =
+                    ((uint32_t)s->dac_rgb_buf[0] << 16) |  /* R */
+                    ((uint32_t)s->dac_rgb_buf[1] <<  8) |  /* G */
+                     (uint32_t)s->dac_rgb_buf[2];          /* B */
+            }
+            s->dacAddr = (s->dacAddr + 1) & 0xff;
+            s->dac_write_addr = (uint8_t)s->dacAddr;
+        }
+        break;
+
+    /* 0x3ce — Graphics Controller index. */
+    case 0x3ce:
+        s->gr_idx = val & 0x0f;
+        break;
+    /* 0x3cf — Graphics Controller data. */
+    case 0x3cf:
+        if (s->gr_idx < 16)
+            s->gr_regs[s->gr_idx] = val;
+        break;
+
+    /*
+     * 0x3d4 — CRTC index.
+     * 86Box banshee_out(): svga->crtcreg = val & 0x3f.
+     */
+    case 0x3d4:
+        s->crtc_idx = val & 0x3f;
+        break;
+
+    /*
+     * 0x3d5 — CRTC data.
+     * 86Box banshee_out(): protect regs 0x00..0x06 if crtc[0x11] bit 7 set.
+     * Reg 0x07: only bit 4 writable when protected.
+     */
+    case 0x3d5:
+        if (s->crtc_idx < 64) {
+            /* Protection: CRTC[0x00..0x06] locked when CRTC[0x11] bit 7 set */
+            if (s->crtc_idx < 7 && (s->crtc_ctrl[0x11] & 0x80))
+                break;
+            /* CRTC[0x07]: only bit 4 writable when protected */
+            if (s->crtc_idx == 7 && (s->crtc_ctrl[0x11] & 0x80))
+                val = (s->crtc_ctrl[7] & ~0x10u) | (val & 0x10u);
+
+            s->crtc_ctrl[s->crtc_idx] = (uint8_t)val;
+            voodoo3_crtc_update(s);
+            /*
+             * CRTC[0x00] (htotal), [0x06] (vtotal low), [0x07] (overflow),
+             * [0x1a] (Banshee htotal ext), [0x1b] (Banshee vtotal ext) all
+             * affect the frame period.  Recompute whenever any CRTC reg
+             * changes — matches 86Box which calls svga_recalctimings() on
+             * every CRTC data write that changes the stored value.
+             */
+            voodoo3_pll_update_vblank(s);
+        }
+        break;
+
+    /*
+     * 0x3da — Input Status 1 / Feature Control write.
+     * Writing resets the ATC flip-flop to index mode.
+     */
+    case 0x3da:
+    case 0x3ba:   /* mono alias */
+        s->ar_flip_flop = false;
+        s->feat_reg     = val & 0x03;
+        break;
+
+    default:
+        break;
+    }
+}
+
+/*
+ * VGA I/O read helper — ported from 86Box banshee_in() + svga_in().
+ * addr is the full VGA port address (0x3b0..0x3df).
+ */
+static uint8_t voodoo3_vga_in(Voodoo3State *s, uint16_t addr)
+{
+    /* Mono/colour alias swap — same logic as voodoo3_vga_out() */
+    if (((addr & 0xfff0) == 0x3d0 || (addr & 0xfff0) == 0x3b0)
+        && !(s->misc_out & 1))
+        addr ^= 0x60;
+
+    switch (addr) {
+    /*
+     * 0x3c0 / 0x3c1 — ATC data read.
+     * 86Box svga_in(): returns ar_regs[ar_idx & 0x1f].
+     * Does NOT toggle ar_flip_flop on read.
+     */
+    case 0x3c0:
+    case 0x3c1:
+        return s->ar_regs[s->ar_idx & 0x1f];
+
+    /*
+     * 0x3c2 — Input Status Register 0.
+     * 86Box: bit 4 = monitor sense, bit 7 = vblank IRQ pending.
+     * Return 0x00: colour monitor present, no IRQ pending.
+     */
+    case 0x3c2:
+        return 0x00;
+
+    case 0x3c4:
+        return s->seq_idx;
+    case 0x3c5:
+        return (s->seq_idx < 8) ? s->seq_regs[s->seq_idx] : 0xff;
+
+    case 0x3c6:
+        return s->dac_pel_mask;
+
+    /*
+     * 0x3c7 — DAC state (0=write mode ready, 3=read mode ready).
+     */
+    case 0x3c7:
+        return s->dac_state;
+
+    case 0x3c8:
+        return s->dac_write_addr;
+
+    /*
+     * 0x3c9 — DAC data read (R/G/B triplet cycling).
+     */
+    case 0x3c9:
+    {
+        /* dac_read_addr is uint8_t (0..255) == VOODOO3_CLUT_SIZE-1, always valid */
+        uint32_t colour = s->pallook[s->dac_read_addr];
+        uint8_t byte;
+        switch (s->dac_rgb_idx) {
+        case 0: byte = (uint8_t)((colour >> 16) & 0xff); break;  /* R */
+        case 1: byte = (uint8_t)((colour >>  8) & 0xff); break;  /* G */
+        default:byte = (uint8_t)( colour        & 0xff); break;  /* B */
+        }
+        s->dac_rgb_idx++;
+        if (s->dac_rgb_idx == 3) {
+            s->dac_rgb_idx   = 0;
+            s->dac_read_addr = (s->dac_read_addr + 1) & 0xff;
+        }
+        return byte;
+    }
+
+    case 0x3ca:   /* Feature Control read */
+        return s->feat_reg;
+
+    case 0x3cc:   /* Misc Output read */
+        return s->misc_out;
+
+    case 0x3ce:
+        return s->gr_idx;
+    case 0x3cf:
+        return (s->gr_idx < 16) ? s->gr_regs[s->gr_idx] : 0xff;
+
+    case 0x3d4:
+        return (uint8_t)(s->crtc_idx & 0x3f);
+    case 0x3d5:
+        return (s->crtc_idx < 64) ? s->crtc_ctrl[s->crtc_idx] : 0xff;
+
+    /*
+     * 0x3da / 0x3ba — Input Status Register 1.
+     * bit 3 = vblank active (BIOS waits for this before palette writes).
+     * Reading resets the ATC flip-flop to index mode.
+     */
+    case 0x3da:
+    case 0x3ba:
+        s->ar_flip_flop = false;
+        return s->in_vblank ? 0x08u : 0x00u;
+
+    default:
+        return 0xff;
+    }
+}
+
 static uint64_t voodoo3_io_read(void *opaque, hwaddr addr, unsigned size)
 {
-    return (uint64_t)voodoo3_ext_read(VOODOO3_PCI(opaque), (uint32_t)(addr & 0xff));
+    Voodoo3State *s   = VOODOO3_PCI(opaque);
+    uint32_t      off = (uint32_t)(addr & 0xff);
+
+    /*
+     * BAR2 offset decode:
+     *   0x00..0xaf → ext register (same as BAR0 0x00..0xaf)
+     *   0xb0..0xdf → VGA port 0x3b0..0x3df  (offset + 0x300)
+     *   0xe0..0xff → ext register (remainder of ext space)
+     *
+     * 86Box banshee_ext_in(): 0xb0..0xdf → banshee_in(off + 0x300).
+     */
+    if (off >= 0xb0 && off <= 0xdf)
+        return (uint64_t)voodoo3_vga_in(s, (uint16_t)(off + 0x300u));
+
+    return (uint64_t)voodoo3_ext_read(s, off);
 }
+
 static void voodoo3_io_write(void *opaque, hwaddr addr,
                              uint64_t data, unsigned size)
 {
-    voodoo3_ext_write(VOODOO3_PCI(opaque), (uint32_t)(addr & 0xff),
-                      (uint32_t)data);
+    Voodoo3State *s   = VOODOO3_PCI(opaque);
+    uint32_t      off = (uint32_t)(addr & 0xff);
+    uint8_t       val = (uint8_t)data;   /* VGA ports are byte-wide */
+
+    /* 86Box banshee_ext_out(): 0xb0..0xdf → banshee_out(off + 0x300, val) */
+    if (off >= 0xb0 && off <= 0xdf) {
+        voodoo3_vga_out(s, (uint16_t)(off + 0x300u), val);
+        return;
+    }
+
+    voodoo3_ext_write(s, off, (uint32_t)data);
 }
+
 static const MemoryRegionOps voodoo3_io_ops = {
     .read  = voodoo3_io_read,
     .write = voodoo3_io_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+    /*
+     * VGA I/O ports are byte-wide (BAR2 is an 8-bit I/O aperture).
+     * impl min/max = 1 forces QEMU to pass each byte access separately
+     * (critical for ATC flip-flop and DAC RGB byte counter correctness).
+     */
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl  = { .min_access_size = 1, .max_access_size = 1 },
 };
 
 /* =========================================================================
@@ -1941,7 +3636,8 @@ static void voodoo3_vblank_cb(void *opaque)
 
     timer_mod(s->vblank_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / VBLANK_HZ);
+              (s->vblank_period_ns > 0 ? s->vblank_period_ns
+                                       : NANOSECONDS_PER_SECOND / VBLANK_HZ));
 }
 
 /* =========================================================================
@@ -2015,6 +3711,9 @@ static void voodoo3_reset_state(Voodoo3State *s)
     memset(s->pallook, 0, sizeof(s->pallook));
     memset(&s->params, 0, sizeof(s->params));
     memset(&s->blt,    0, sizeof(s->blt));
+    /* Default clip rects: full screen (86Box initialises to max extents) */
+    s->blt.clip[0].x_max = s->blt.clip[1].x_max = 4095;
+    s->blt.clip[0].y_max = s->blt.clip[1].y_max = 4095;
     memset(s->verts,   0, sizeof(s->verts));
 
     s->miscInit0  = 0;
@@ -2070,6 +3769,29 @@ static void voodoo3_reset_state(Voodoo3State *s)
     s->crtc_idx       = 0;
     s->crtc_freq_idx  = 0;
     s->dac_reset_idx  = 0;
+
+    /* VGA register reset — mirrors 86Box svga_init() defaults */
+    s->misc_out      = 0x01;   /* I/O select = 3Dx (bit 0 set), RAM disabled */
+    s->feat_reg      = 0x00;
+    s->seq_idx       = 0x00;
+    memset(s->seq_regs,  0, sizeof(s->seq_regs));
+    s->gr_idx        = 0x00;
+    memset(s->gr_regs,   0, sizeof(s->gr_regs));
+    s->ar_idx        = 0x00;
+    memset(s->ar_regs,   0, sizeof(s->ar_regs));
+    s->ar_flip_flop  = false;
+    s->dac_pel_mask  = 0xff;   /* 86Box svga_init: dac_mask = 0xff */
+    s->dac_read_addr = 0x00;
+    s->dac_write_addr= 0x00;
+    s->dac_rgb_idx   = 0x00;
+    memset(s->dac_rgb_buf, 0, sizeof(s->dac_rgb_buf));
+    s->dac_state     = 0x00;   /* write mode */
+
+    /* PLL / pixel clock — reset to 0 so vblank_cb falls back to VBLANK_HZ
+     * until the driver programs pllCtrl0 and misc_out clock select.      */
+    s->pixel_clock_hz   = 0.0;
+    s->vblank_period_ns = 0;
+
     s->vidSerialParallelPort = 0;
     s->swap_pending  = false;
     s->swap_interval = 0;
@@ -2402,17 +4124,7 @@ static void voodoo3_class_init(ObjectClass *klass, const void *data)
     k->device_id = PCI_DEVICE_ID_3DFX_VOODOO3;
     k->revision  = 0x01;
     k->class_id  = PCI_CLASS_DISPLAY_VGA;
-    /*
-     * ROM image: QEMU will map this automatically as expansion ROM (BAR 6).
-     * Provide "vgabios-voodoo3.bin" in the QEMU data/firmware search path.
-     * Override at runtime with -device voodoo3,romfile=<path>.
-     * Setting romfile="" disables ROM mapping entirely.
-     *
-     * This uses the standard QEMU PCIDeviceClass::romfile API — no manual
-     * MemoryRegion setup needed.  86Box didn't need this but QEMU guests
-     * (x86 BIOS, UEFI) probe the expansion ROM for VGA BIOS entry points.
-     */
-    k->romfile   = "vgabios-voodoo3.bin";
+    k->romfile   = NULL;
 
     device_class_set_legacy_reset(dc, voodoo3_reset);
     dc->vmsd     = &vmstate_voodoo3;
