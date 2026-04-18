@@ -1,4 +1,4 @@
-# QEMU Voodoo 3 ported from 86Box
+# Voodoo3 for QEMU (ported from 86Box)
 
 ## Anwenden
 
@@ -72,3 +72,17 @@ include/hw/display/
 - Dirty-Line Display-Ausgabe (nur veränderte Scanlines)
 - 4×4 Bayer-Dither-Tabellen (Laufzeit-generiert)
 - Big-Endian Byte-Swap für PPC-Gäste (AmigaOne, Pegasos2)
+
+## License
+
+This project is licensed under the GNU General Public License v2 (GPLv2).
+
+This project contains code derived in part from the 86Box project:
+https://github.com/86Box/86Box
+
+All original code remains property of its respective authors.
+
+## Credits
+
+- 86Box Contributors (original Voodoo3 implementation)
+- QEMU Project
