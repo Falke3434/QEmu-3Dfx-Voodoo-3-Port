@@ -11,6 +11,33 @@
 #ifndef HW_DISPLAY_VOODOO3_INT_H
 #define HW_DISPLAY_VOODOO3_INT_H
 
+/* -----------------------------------------------------------------------
+ * I2C / DDC bit-bang state machine
+ * vidSerialParallelPort GPIO: bit3=SCL-out, bit1=SDA-out, bit8=SDA-in
+ * We act as DDC EEPROM slave at I2C address 0x50.
+ * ----------------------------------------------------------------------- */
+typedef enum {
+    I2C_IDLE = 0,
+    I2C_RECV_ADDR,
+    I2C_SEND_ACK,
+    I2C_RECV_REG,
+    I2C_SEND_ACK2,
+    I2C_SEND_DATA,
+    I2C_WAIT_ACK,
+} Voodoo3I2CState;
+
+typedef struct {
+    Voodoo3I2CState state;
+    uint8_t  shift_reg;
+    int      bit_count;
+    uint8_t  addr;
+    uint8_t  reg;
+    int      data_idx;
+    int      scl_last;
+    int      sda_last;
+    uint8_t  sda_out;
+} Voodoo3I2C;
+
 /* Maximum LOD level */
 #ifndef V3_LOD_MAX
 #define V3_LOD_MAX  8
@@ -56,6 +83,11 @@ typedef struct voodoo3_tmu_params_t {
     int64_t  dSdY, dTdY, dWdY;
     uint32_t textureMode;
     uint32_t texBaseAddr;
+    uint32_t texBaseAddr1;   /* second LOD base (LOD_SPLIT+ODD+MULTIBASEADDR) */
+    uint32_t texBaseAddr2;   /* third  LOD base */
+    uint32_t texBaseAddr38;  /* fourth LOD base */
+    uint32_t tLOD;           /* tLOD register snapshot (lod_min/max/bias)    */
+    int      lodbias;        /* signed 6-bit LOD bias decoded from tLOD[17:12] */
     int      tformat;
     int      lod_min, lod_max;
 } voodoo3_tmu_params_t;
@@ -542,6 +574,10 @@ struct Voodoo3State {
      *   banshee_recalctimings() and used by svga_recalctimings() to derive   *
      *   the scanline/frame timings.  We skip the scanline granularity and    *
      *   go straight to the full-frame period.                                */
+    /* I2C/DDC state + EDID */
+    Voodoo3I2C           ddc;
+    uint8_t              ddc_edid[128];
+
     double               pixel_clock_hz;    /* Hz, 0 = use VBLANK_HZ default */
     int64_t              vblank_period_ns;  /* ns per frame, 0 = use default  */
 };
