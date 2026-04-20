@@ -4978,7 +4978,36 @@ static void voodoo3_reset_state(Voodoo3State *s)
     s->miscInit0  = 0;
     s->miscInit1  = 0;
     s->pciInit0   = 0x01000100;
-    s->dramInit0  = 0x00050000;
+    /*
+     * dramInit0 — SGRAM/SDRAM configuration register.
+     * Bit 27: SGRAM present (0 = SDRAM).
+     * Bit 26: 2×SGRAM = 16 MB (only when bit27=1).
+     * Bit 16: refresh-clock enable (always set).
+     * Ported from 86Box banshee_init():
+     *   dramInit0 = (1<<27)|(1<<26) for 16 MB SGRAM.
+     *   dramInit1 = (1<<30)         for SDRAM (Banshee).
+     * Programs like EVEREST/GPU-Z read bit26+27 to report VRAM size.
+     */
+    switch (s->model) {
+    case VOODOO3_MODEL_BANSHEE:
+        /* Banshee: SDRAM only, 16 MB */
+        s->dramInit0 = (1u << 16);             /* no SGRAM bit */
+        s->dramInit1 = (1u << 30);             /* SDRAM select */
+        break;
+    case VOODOO3_MODEL_V3_1000:
+        /* Velocity 100: 8 MB SGRAM (single chip) */
+        s->dramInit0 = (1u << 27) | (1u << 16); /* SGRAM, 8 MB */
+        s->dramInit1 = 0;
+        break;
+    case VOODOO3_MODEL_V3_2000:
+    case VOODOO3_MODEL_V3_3000:
+    case VOODOO3_MODEL_V3_3500TV:
+    default:
+        /* V3 2000/3000/3500: 16 MB SGRAM (2 chips) */
+        s->dramInit0 = (1u << 27) | (1u << 26) | (1u << 16);
+        s->dramInit1 = 0;
+        break;
+    }
     s->pllCtrl0 = s->pllCtrl1 = s->pllCtrl2 = 0;
     s->dacMode  = 0;
     s->dacAddr  = 0;
