@@ -341,7 +341,11 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                         uint32_t r  = ((px >> 11) & 0x1f); r = (r << 3) | (r >> 2);
                         uint32_t g  = ((px >>  5) & 0x3f); g = (g << 2) | (g >> 4);
                         uint32_t b  =  (px        & 0x1f); b = (b << 3) | (b >> 2);
-                        dst[x] = rgb_to_pixel32bgr(r, g, b);
+                        /*
+                         * QEMU DisplaySurface is PIXMAN_x8r8g8b8 (little-endian):
+                         * word = 0x00RRGGBB.  Use rgb_to_pixel32() not bgr variant.
+                         */
+                        dst[x] = rgb_to_pixel32(r, g, b);
                     }
                 } else if (dst_bpp == 2) {
                     memcpy(dst_row, src, (size_t)w * 2);
@@ -482,6 +486,9 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
     }
 
     if (dirty_lo <= dirty_hi) {
+        /* Overlay: composite video surface before cursor and screen update */
+        voodoo3_overlay_draw(s, dst_base, dst_bpp, dst_pitch,
+                             w, dirty_lo, dirty_hi);
         voodoo3_draw_cursor(s, dst_base, dst_bpp, dst_pitch,
                             w, dirty_lo, dirty_hi);
         dpy_gfx_update(s->con, 0, dirty_lo, w, dirty_hi - dirty_lo + 1);
@@ -599,5 +606,376 @@ void voodoo3_draw_cursor(Voodoo3State *s,
             }
             x_off += 8;
         }
+    }
+}
+
+/* =========================================================================
+ * Video Overlay compositing
+ *
+ * Ported from 86Box banshee_overlay_draw() in vid_voodoo_banshee.c.
+ *
+ * The Banshee/V3 hardware overlay composites a separate video surface on
+ * top of the desktop framebuffer.  The overlay surface lives in VRAM at
+ * an address derived from vidDesktopOverlayStride bits[30:16] × pitch.
+ *
+ * Pixel formats (ov.pix_fmt / OVERLAY_FMT_*):
+ *   YUYV422 (5): packed [Y0 Cr Y1 Cb] — 4 bytes per 2 pixels
+ *   UYVY422 (6): packed [Cr Y0 Cb Y1] — 4 bytes per 2 pixels
+ *   RGB565  (1): standard 16-bit RGB, optional CLUT look-up
+ *   RGB565_DITHER (7): same, with dither hint (treated as RGB565 here)
+ *
+ * YCbCr → RGB conversion (ITU-R BT.601, same coefficients as 86Box):
+ *   dR = (359 * Cr) >> 8
+ *   dG = (88 * Cb + 183 * Cr) >> 8
+ *   dB = (453 * Cb) >> 8
+ *   R = clamp(Y + dR), G = clamp(Y - dG), B = clamp(Y + dB)
+ *
+ * Scaling:
+ *   H: ov.vidOverlayDudx = source X step in 20.12 fixed-point
+ *      (1<<20 = no scaling, <1<<20 = upscale, >1<<20 = downscale)
+ *   V: ov.vidOverlayDvdy = source Y step in 20.12 fixed-point
+ *      ov.src_y accumulates; integer part = source line index
+ *
+ * Filtering:
+ *   BILINEAR: vertical bilinear between current and next source line.
+ *   POINT / DITHER4X4 / DITHER2X2: nearest-neighbour (no filter tables).
+ *
+ * Chroma-key: if vidChromaKeyMin/Max match the desktop pixel at the same
+ * screen coordinate, the overlay pixel is written; otherwise skipped.
+ *
+ * Called from voodoo3_update_display_dirty() after the desktop scanout
+ * and before the cursor, for every dirty scanline inside the overlay rect.
+ *
+ * 86Box reference: banshee_overlay_draw(), DECODE_RGB565, DECODE_YUYV422,
+ *                 DECODE_UYUV422, OVERLAY_SAMPLE, banshee_chroma_key().
+ * ========================================================================= */
+
+/* YCbCr clamping macro — identical to 86Box CLAMP(x) in overlay context */
+#ifndef OV_CLAMP
+#define OV_CLAMP(x) ((x) < 0 ? 0 : ((x) > 255 ? 255 : (x)))
+#endif
+
+/*
+ * ov_decode_line — decode one source scanline into buf[buf_idx][].
+ *
+ * Ported from 86Box DECODE_RGB565 / DECODE_YUYV422 / DECODE_UYUV422 /
+ * DECODE_RGB565_TILED macros.
+ *
+ * src_addr: byte offset into fb_mem of the start of this source line.
+ * buf_idx:  which of the two decode buffers to fill (0 or 1).
+ * The decoded output is XRGB8888 stored as (R<<16)|(G<<8)|B.
+ */
+static void ov_decode_line(Voodoo3State *s, uint32_t src_addr, int buf_idx)
+{
+    uint32_t *buf   = s->ov.buf[buf_idx];
+    int       bytes = s->ov.overlay_bytes;
+    int       wp    = 0;
+
+    /* CLUT base: pallook[0..255] or pallook[256..511] per OVERLAY_CLUT_SEL */
+    const uint32_t *clut = s->pallook +
+        ((s->vidProcCfg & VIDPROCCFG_OVERLAY_CLUT_SEL) ? 256 : 0);
+    bool clut_bypass = !!(s->vidProcCfg & VIDPROCCFG_OVERLAY_CLUT_BYPASS);
+    bool tiled       = !!(s->vidProcCfg & VIDPROCCFG_OVERLAY_TILE);
+
+    switch (s->ov.pix_fmt) {
+
+    /* ---- YUYV422: Y0 Cr Y1 Cb per 4 bytes → 2 pixels ---- */
+    case OVERLAY_FMT_YUYV422:
+        for (int c = 0; c < bytes; c += 4) {
+            uint32_t off = (src_addr + c) & (s->fb_size - 1);
+            if (off + 3 >= s->fb_size) break;
+            int y1 = s->fb_mem[off + 0];
+            int Cr = (int)s->fb_mem[off + 1] - 0x80;
+            int y2 = s->fb_mem[off + 2];
+            int Cb = (int)s->fb_mem[off + 3] - 0x80;
+            int dR = (359 * Cr) >> 8;
+            int dG = (88 * Cb + 183 * Cr) >> 8;
+            int dB = (453 * Cb) >> 8;
+            int r, g, b;
+            r = OV_CLAMP(y1 + dR); g = OV_CLAMP(y1 - dG); b = OV_CLAMP(y1 + dB);
+            buf[wp++] = (uint32_t)((r << 16) | (g << 8) | b);
+            r = OV_CLAMP(y2 + dR); g = OV_CLAMP(y2 - dG); b = OV_CLAMP(y2 + dB);
+            buf[wp++] = (uint32_t)((r << 16) | (g << 8) | b);
+        }
+        break;
+
+    /* ---- UYVY422: Cr Y0 Cb Y1 per 4 bytes → 2 pixels ---- */
+    case OVERLAY_FMT_UYVY422:
+        for (int c = 0; c < bytes; c += 4) {
+            uint32_t off = (src_addr + c) & (s->fb_size - 1);
+            if (off + 3 >= s->fb_size) break;
+            int Cr = (int)s->fb_mem[off + 0] - 0x80;
+            int y1 = s->fb_mem[off + 1];
+            int Cb = (int)s->fb_mem[off + 2] - 0x80;
+            int y2 = s->fb_mem[off + 3];
+            int dR = (359 * Cr) >> 8;
+            int dG = (88 * Cb + 183 * Cr) >> 8;
+            int dB = (453 * Cb) >> 8;
+            int r, g, b;
+            r = OV_CLAMP(y1 + dR); g = OV_CLAMP(y1 - dG); b = OV_CLAMP(y1 + dB);
+            buf[wp++] = (uint32_t)((r << 16) | (g << 8) | b);
+            r = OV_CLAMP(y2 + dR); g = OV_CLAMP(y2 - dG); b = OV_CLAMP(y2 + dB);
+            buf[wp++] = (uint32_t)((r << 16) | (g << 8) | b);
+        }
+        break;
+
+    /* ---- RGB565 (tiled and linear) ---- */
+    case OVERLAY_FMT_565:
+    case OVERLAY_FMT_565_DITHER:
+        if (tiled) {
+            /*
+             * 86Box DECODE_RGB565_TILED: each 128-byte strip holds 64 pixels.
+             * offset = (c & 127) + (c >> 7) * 128 * 32
+             */
+            for (int c = 0; c < bytes; c += 2) {
+                uint32_t tile_off = (uint32_t)(c & 127) + ((uint32_t)(c >> 7) * 128u * 32u);
+                uint32_t addr = (src_addr + tile_off) & (s->fb_size - 1);
+                if (addr + 1 >= s->fb_size) break;
+                uint16_t px;
+                memcpy(&px, s->fb_mem + addr, 2);
+                int r = (px      ) & 0x1f;
+                int g = (px >>  5) & 0x3f;
+                int b = (px >> 11) & 0x1f;
+                if (clut_bypass)
+                    buf[wp++] = (uint32_t)((r << 3) | (g << 10) | (b << 19));
+                else
+                    buf[wp++] = (clut[r << 3] & 0x0000ffu) |
+                                (clut[g << 2] & 0x00ff00u) |
+                                (clut[b << 3] & 0xff0000u);
+            }
+        } else {
+            for (int c = 0; c < bytes; c += 2) {
+                uint32_t addr = (src_addr + c) & (s->fb_size - 1);
+                if (addr + 1 >= s->fb_size) break;
+                uint16_t px;
+                memcpy(&px, s->fb_mem + addr, 2);
+                int r = (px      ) & 0x1f;
+                int g = (px >>  5) & 0x3f;
+                int b = (px >> 11) & 0x1f;
+                if (clut_bypass)
+                    buf[wp++] = (uint32_t)((r << 3) | (g << 10) | (b << 19));
+                else
+                    buf[wp++] = (clut[r << 3] & 0x0000ffu) |
+                                (clut[g << 2] & 0x00ff00u) |
+                                (clut[b << 3] & 0xff0000u);
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/*
+ * ov_chroma_key — returns true if overlay should be drawn at screen (x, y).
+ *
+ * Ported from 86Box banshee_chroma_key() in vid_voodoo_banshee.c.
+ * Reads the desktop pixel at the given screen coordinate and checks if
+ * it falls within [vidChromaKeyMin, vidChromaKeyMax] per channel.
+ * Returns true (draw overlay) if chroma match; XORed with vidProcCfg bit 6.
+ *
+ * When chroma-key is not configured (vidProcCfg bit 5 = 0), always returns
+ * true (draw overlay everywhere in the overlay rectangle).
+ */
+static bool ov_chroma_key(Voodoo3State *s, int scr_x, int scr_y)
+{
+    /* bit 5 = chroma-key enable */
+    if (!(s->vidProcCfg & (1u << 5)))
+        return true;
+
+    uint32_t desktop_stride = s->vidDesktopOverlayStride & 0x3fffu;
+    uint32_t src_addr = s->desktop_start + (uint32_t)scr_y * desktop_stride;
+
+    bool match = false;
+    switch (s->pix_format) {
+    case 0: { /* 8bpp palette index */
+        uint8_t idx = s->fb_mem[(src_addr + scr_x) & (s->fb_size - 1)];
+        uint8_t lo  = s->vidChromaKeyMin & 0xff;
+        uint8_t hi  = s->vidChromaKeyMax & 0xff;
+        match = (idx >= lo && idx <= hi);
+        break;
+    }
+    case 1: { /* RGB565 */
+        uint32_t addr = (src_addr + (uint32_t)scr_x * 2u) & (s->fb_size - 1);
+        uint16_t px = 0;
+        if (addr + 1 < s->fb_size) memcpy(&px, s->fb_mem + addr, 2);
+        int r = px & 0x1f, g = (px >> 5) & 0x3f, b = px >> 11;
+        match = r >= (int)((s->vidChromaKeyMin >> 11) & 0x1f) &&
+                r <= (int)((s->vidChromaKeyMax >> 11) & 0x1f) &&
+                g >= (int)((s->vidChromaKeyMin >>  5) & 0x3f) &&
+                g <= (int)((s->vidChromaKeyMax >>  5) & 0x3f) &&
+                b >= (int)( s->vidChromaKeyMin        & 0x1f) &&
+                b <= (int)( s->vidChromaKeyMax        & 0x1f);
+        break;
+    }
+    case 2: { /* RGB24 */
+        uint32_t addr = (src_addr + (uint32_t)scr_x * 3u) & (s->fb_size - 1);
+        uint8_t r = s->fb_mem[(addr    ) & (s->fb_size-1)];
+        uint8_t g = s->fb_mem[(addr + 1) & (s->fb_size-1)];
+        uint8_t b = s->fb_mem[(addr + 2) & (s->fb_size-1)];
+        match = r >= ((s->vidChromaKeyMin >> 16) & 0xff) &&
+                r <= ((s->vidChromaKeyMax >> 16) & 0xff) &&
+                g >= ((s->vidChromaKeyMin >>  8) & 0xff) &&
+                g <= ((s->vidChromaKeyMax >>  8) & 0xff) &&
+                b >= ( s->vidChromaKeyMin        & 0xff) &&
+                b <= ( s->vidChromaKeyMax        & 0xff);
+        break;
+    }
+    case 3: { /* RGB32 */
+        uint32_t addr = (src_addr + (uint32_t)scr_x * 4u) & (s->fb_size - 1);
+        uint8_t r = s->fb_mem[(addr    ) & (s->fb_size-1)];
+        uint8_t g = s->fb_mem[(addr + 1) & (s->fb_size-1)];
+        uint8_t b = s->fb_mem[(addr + 2) & (s->fb_size-1)];
+        match = r >= ((s->vidChromaKeyMin >> 16) & 0xff) &&
+                r <= ((s->vidChromaKeyMax >> 16) & 0xff) &&
+                g >= ((s->vidChromaKeyMin >>  8) & 0xff) &&
+                g <= ((s->vidChromaKeyMax >>  8) & 0xff) &&
+                b >= ( s->vidChromaKeyMin        & 0xff) &&
+                b <= ( s->vidChromaKeyMax        & 0xff);
+        break;
+    }
+    default:
+        return true;
+    }
+
+    /* XOR with invert bit (vidProcCfg bit 6) */
+    return match ^ !!(s->vidProcCfg & (1u << 6));
+}
+
+/*
+ * voodoo3_overlay_draw — composite overlay for scanlines [dirty_lo..dirty_hi].
+ *
+ * Ported from 86Box banshee_overlay_draw() in vid_voodoo_banshee.c.
+ *
+ * Called from voodoo3_update_display_dirty() after the desktop blit and
+ * before the cursor for every dirty region that intersects the overlay.
+ *
+ * Scaling model (20.12 fixed-point, same as 86Box):
+ *   ov.src_y tracks the current source line (integer = y >> 20, frac = y & 0xfffff).
+ *   For each display line, src_y += vidOverlayDvdy (V scale step).
+ *   For each display pixel, src_x += vidOverlayDudx (H scale step).
+ *   src_y and src_x are reset to 0 on each new frame (vblank callback).
+ *
+ * Filtering (VIDPROCCFG_FILTER_MODE_*):
+ *   POINT / DITHER4X4 / DITHER2X2 → nearest-neighbour (86Box scrfilter path
+ *   is not ported; the emulator-option path = nearest-neighbour is used).
+ *   BILINEAR → vertical blend between buf[0] (current line) and buf[1]
+ *   (next source line) using the fractional part of src_y as coefficient.
+ */
+void voodoo3_overlay_draw(Voodoo3State *s,
+                          uint8_t *dst_base, int dst_bpp, int dst_pitch,
+                          int scr_w, int dirty_lo, int dirty_hi)
+{
+    if (!s->ov.ena || !s->fb_mem) return;
+    if (s->ov.size_x <= 0 || s->ov.size_y <= 0) return;
+    if (s->ov.overlay_bytes <= 0) return;
+
+    /* Overlay pitch: bits[30:16] of vidDesktopOverlayStride */
+    uint32_t ov_pitch = (s->vidDesktopOverlayStride & VID_STRIDE_OVERLAY_MASK)
+                        >> VID_STRIDE_OVERLAY_SHIFT;
+    if (s->vidProcCfg & VIDPROCCFG_OVERLAY_TILE)
+        ov_pitch *= 128u * 32u;
+
+    /* Base VRAM address of overlay surface — addr word 0 of overlay region.
+     * 86Box: svga->overlay_latch.addr = (vidDesktopOverlayStride bits[30:16]) × stride.
+     * We use ov_pitch as both the VRAM base stride and the line pitch.
+     * The actual start address comes from the start coordinate relative
+     * to the desktop start, consistent with 86Box behaviour. */
+    uint32_t ov_base = s->desktop_start;   /* overlay shares VRAM with desktop */
+
+    uint32_t filter = s->vidProcCfg & VIDPROCCFG_FILTER_MODE_MASK;
+    bool h_scale    = !!(s->vidProcCfg & VIDPROCCFG_H_SCALE_ENABLE);
+    bool v_scale    = !!(s->vidProcCfg & VIDPROCCFG_V_SCALE_ENABLE);
+
+    int ov_x0 = s->ov.start_x;
+    int ov_y0 = s->ov.start_y;
+    int ov_w  = s->ov.size_x;
+
+    /* Clamp overlay to screen */
+    if (ov_x0 < 0) ov_x0 = 0;
+    if (ov_x0 >= scr_w) return;
+    if (ov_x0 + ov_w > scr_w) ov_w = scr_w - ov_x0;
+
+    for (int scr_y = dirty_lo; scr_y <= dirty_hi; scr_y++) {
+        /* Only draw within the overlay vertical extent */
+        if (scr_y < s->ov.start_y || scr_y >= s->ov.end_y)
+            continue;
+
+        /* Source line index from accumulated src_y */
+        int   src_line  = s->ov.src_y >> 20;
+        /* Y fractional part for bilinear filter (0..0xfffff → 0..0xffff) */
+        unsigned int y_coeff = (unsigned int)((s->ov.src_y & 0xfffffu) >> 4);
+
+        /* Compute source addresses for current and next lines */
+        uint32_t src_addr0, src_addr1;
+        if (s->vidProcCfg & VIDPROCCFG_OVERLAY_TILE) {
+            /* Tiled: 86Box: (y & 31)*128 + (y >> 5)*pitch */
+            src_addr0 = ov_base + (uint32_t)(src_line       & 31) * 128u
+                        + (uint32_t)(src_line       >> 5) * ov_pitch;
+            src_addr1 = ov_base + (uint32_t)((src_line + 1) & 31) * 128u
+                        + (uint32_t)((src_line + 1) >> 5) * ov_pitch;
+        } else {
+            src_addr0 = ov_base + (uint32_t) src_line       * ov_pitch;
+            src_addr1 = ov_base + (uint32_t)(src_line + 1)  * ov_pitch;
+        }
+
+        /* Decode current line into buf[0] */
+        ov_decode_line(s, src_addr0, 0);
+        /* Decode next line into buf[1] for bilinear */
+        if (filter == VIDPROCCFG_FILTER_MODE_BILINEAR)
+            ov_decode_line(s, src_addr1, 1);
+
+        uint8_t *dst_row = dst_base + (size_t)scr_y * dst_pitch;
+        uint32_t src_x   = 0;  /* 20.12 fixed-point horizontal position */
+
+        for (int x = 0; x < ov_w; x++) {
+            int scr_x   = ov_x0 + x;
+            int src_xi  = h_scale ? (int)(src_x >> 20) : x;
+
+            /* Clamp src index to decoded buffer size */
+            if (src_xi < 0) src_xi = 0;
+            if (src_xi >= 4096) src_xi = 4095;
+
+            uint32_t pixel;
+            if (filter == VIDPROCCFG_FILTER_MODE_BILINEAR) {
+                /* Vertical bilinear: blend buf[0][src_xi] and buf[1][src_xi] */
+                uint32_t s0 = s->ov.buf[0][src_xi];
+                uint32_t s1 = s->ov.buf[1][src_xi];
+                unsigned int inv = 0x10000u - y_coeff;
+                int r = (int)((((s0 >> 16) & 0xff) * inv +
+                               ((s1 >> 16) & 0xff) * y_coeff) >> 16);
+                int g = (int)((((s0 >>  8) & 0xff) * inv +
+                               ((s1 >>  8) & 0xff) * y_coeff) >> 16);
+                int b = (int)((( s0        & 0xff) * inv +
+                               ( s1        & 0xff) * y_coeff) >> 16);
+                pixel = (uint32_t)((r << 16) | (g << 8) | b);
+            } else {
+                /* Point / dither: nearest-neighbour */
+                pixel = s->ov.buf[0][src_xi];
+            }
+
+            /* Chroma-key test */
+            if (!ov_chroma_key(s, scr_x, scr_y - ov_y0))
+                goto next_pixel;
+
+            /* Write pixel to console surface */
+            if (dst_bpp == 4) {
+                ((uint32_t *)dst_row)[scr_x] = 0xff000000u | pixel;
+            } else if (dst_bpp == 3) {
+                dst_row[scr_x * 3 + 0] =  pixel        & 0xff;
+                dst_row[scr_x * 3 + 1] = (pixel >>  8) & 0xff;
+                dst_row[scr_x * 3 + 2] = (pixel >> 16) & 0xff;
+            }
+
+next_pixel:
+            if (h_scale) src_x += s->ov.vidOverlayDudx;
+        }
+
+        /* Advance source Y accumulator */
+        if (v_scale)
+            s->ov.src_y += (int32_t)s->ov.vidOverlayDvdy;
+        else
+            s->ov.src_y += (1 << 20);  /* 1.0 in 20.12 = advance one source line */
     }
 }

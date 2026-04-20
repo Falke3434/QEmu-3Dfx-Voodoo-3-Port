@@ -95,7 +95,13 @@
  * [x] VGA IRQ (vblank_irq_pending, pci_irq_assert/deassert wired)
  *       Assert on vblank if CRTC[0x11] bit4=1 + bit5=0 + pciInit0 bit18=1
  *       Deassert on 0x3da read or CRTC[0x11] bit4 cleared
- * [ ] Video overlay (YUV422/RGB565 overlay decode — banshee_overlay_draw)
+ * [x] Video overlay (YUV422/RGB565/UYVY422 overlay — banshee_overlay_draw port)
+ *       Register decode (StartCoords/EndCoords/Dudx/Dvdy/SrcWidth)
+ *       YUYV422 and UYVY422 YCbCr→RGB (ITU-R BT.601 coefficients)
+ *       RGB565 (linear and tiled) with optional CLUT LUT
+ *       H-scale (Dudx step) and V-scale (Dvdy step), point filter
+ *       Bilinear Y-interpolation between two decoded lines
+ *       Chroma-key compositing (vidChromaKeyMin/Max, all desktop bpp)
  * [ ] NCC in rasterizer path (ncc_lookup populated by voodoo3_update_ncc;
  *       texture.c uses it for TEX_Y4I2Q2/TEX_A8Y4I2Q2 — render.c comment
  *       "table zeroed" is outdated, wiring is complete via tex_ptr)
@@ -253,8 +259,24 @@ static void voodoo3_ddc_update(Voodoo3State *s, uint32_t newval)
                     fprintf(stderr,
                             "voodoo3 DDC: addr=0x%02x R/W=%d -> ACK\n",
                             i2c->addr, (int)(raw & 1));
-                    i2c->state   = I2C_SEND_ACK;
                     i2c->sda_out = 0;  /* ACK */
+                    if (raw & 1) {
+                        /*
+                         * READ address (R/W=1): repeated START + 0xA1.
+                         * Skip the register-offset phase (I2C_RECV_REG) and
+                         * go directly to I2C_SEND_ACK2 which will load
+                         * edid[data_idx] and begin streaming EDID bytes.
+                         * data_idx was either set by a preceding RECV_REG
+                         * write or is 0 by default (start of EDID block).
+                         * This matches the WinXP 3dfxvs DDC protocol:
+                         *   START + 0xA0 [+ optional 0x00] +
+                         *   repeated-START + 0xA1 + read 128 bytes.
+                         */
+                        i2c->state = I2C_SEND_ACK2;
+                    } else {
+                        /* WRITE address (R/W=0): receive register offset */
+                        i2c->state = I2C_SEND_ACK;
+                    }
                 } else {
                     fprintf(stderr,
                             "voodoo3 DDC: addr=0x%02x not us -> NAK\n",
@@ -443,11 +465,19 @@ done:
 #define BLT2D_STATUS_IDLE  0x00000000u   /* engine idle, FIFO empty */
 #define BLT2D_SRCBASE      0x080
 
-/* VIDPROCCFG bits */
-#define VIDPROCCFG_VIDPROC_ENABLE   (1u << 0)
-#define VIDPROCCFG_HWCURSOR_ENA     (1u << 27)
-#define VIDPROCCFG_DESKTOP_PIX_FMT(v) (((v) >> 18) & 7u)
-#define VIDPROCCFG_DESKTOP_TILE     (1u << 24)
+/* VIDPROCCFG / OVERLAY_FMT / VID_STRIDE defines → see voodoo3_int.h */
+
+/* vidOverlay register field masks */
+#define OVERLAY_START_X_MASK         (0xfffu)
+#define OVERLAY_START_Y_SHIFT        12
+#define OVERLAY_START_Y_MASK         (0xfffu << OVERLAY_START_Y_SHIFT)
+#define OVERLAY_END_X_MASK           (0xfffu)
+#define OVERLAY_END_Y_SHIFT          12
+#define OVERLAY_END_Y_MASK           (0xfffu << OVERLAY_END_Y_SHIFT)
+#define OVERLAY_SRC_WIDTH_SHIFT      19
+#define OVERLAY_SRC_WIDTH_MASK       (0x1fffu << OVERLAY_SRC_WIDTH_SHIFT)
+#define VID_DUDX_MASK                0xffffffu
+#define VID_DVDY_MASK                0xffffffu
 #define MISCINIT0_Y_SWAP_SHIFT      18
 #define MISCINIT0_Y_SWAP_MASK       (0xfffu << MISCINIT0_Y_SWAP_SHIFT)
 
@@ -755,6 +785,11 @@ void voodoo3_queue_triangle(Voodoo3State *s, voodoo3_params_t *p)
      *   if (lodbias & 0x20) lodbias |= ~0x3f;  // sign-extend 6-bit
      */
     for (int _t = 0; _t < 2; _t++) {
+        /* Snapshot tex_params from device state into triangle params */
+        p->tex_params[_t] = s->params.tex_params[_t];
+        p->tex_params[_t].tLOD = p->tmu[_t].tLOD;
+
+        /* Decode lodbias: 6-bit signed from tLOD[17:12] */
         int lb = (int)((p->tmu[_t].tLOD >> 12) & 0x3f);
         if (lb & 0x20) lb |= ~0x3f;
         p->tmu[_t].lodbias = lb;
@@ -767,7 +802,9 @@ void voodoo3_queue_triangle(Voodoo3State *s, voodoo3_params_t *p)
      */
     if (p->fbzColorPath & (1u << 27)) {   /* FBZCP_TEXTURE_ENABLED */
         voodoo3_use_texture(s, p, 0);
-        voodoo3_use_texture(s, p, 1);
+        /* TMU1 only when not in passthrough mode (86Box dual_tmus check) */
+        if ((p->tmu[0].textureMode & 0x00643000u) != 0x00241000u)
+            voodoo3_use_texture(s, p, 1);
     }
 
     uint32_t idx = s->param_wr & (PARAM_BUF_SIZE - 1);
@@ -1183,6 +1220,8 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         s->cursor_ena      = !!(val & VIDPROCCFG_HWCURSOR_ENA);
         s->pix_format      = (int)VIDPROCCFG_DESKTOP_PIX_FMT(val);
         s->desktop_tiled   = !!(val & VIDPROCCFG_DESKTOP_TILE);
+        s->ov.pix_fmt = (int)VIDPROCCFG_OVERLAY_PIX_FMT(val);
+        s->ov.ena     = !!(val & VIDPROCCFG_OVERLAY_ENABLE);
         /*
          * VGA-Fallback for x86/Linux guests:
          * Standard x86 VGA BIOSes and Linux framebuffer drivers may leave
@@ -1283,12 +1322,55 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
     case Video_vidInError:        s->regs[Video_vidInError >> 2] = val; break;
     case Video_vidInXStart:       s->regs[Video_vidInXStart >> 2] = val; break;
     case Video_vidOverlayStartCoords:
+        /*
+         * 86Box banshee_ext_outl() Video_vidOverlayStartCoords:
+         *   voodoo->overlay.vidOverlayStartCoords = val;
+         *   voodoo->overlay.start_x = val & OVERLAY_START_X_MASK;
+         *   voodoo->overlay.start_y = (val & OVERLAY_START_Y_MASK) >> OVERLAY_START_Y_SHIFT;
+         *   voodoo->overlay.size_x  = end_x - start_x;
+         *   voodoo->overlay.size_y  = end_y - start_y;
+         */
+        s->ov.vidOverlayStartCoords = val;
+        s->ov.start_x = (int)(val & OVERLAY_START_X_MASK);
+        s->ov.start_y = (int)((val & OVERLAY_START_Y_MASK) >> OVERLAY_START_Y_SHIFT);
+        s->ov.size_x  = s->ov.end_x - s->ov.start_x;
+        s->ov.size_y  = s->ov.end_y - s->ov.start_y;
+        s->regs[Video_vidOverlayStartCoords >> 2] = val;
+        break;
     case Video_vidOverlayEndScreenCoords:
+        /*
+         * 86Box: end_x = val & END_X_MASK; end_y = (val >> 12) & 0xfff;
+         *   size_x = (end_x - start_x) + 1; size_y = (end_y - start_y) + 1;
+         */
+        s->ov.vidOverlayEndScreenCoords = val;
+        s->ov.end_x  = (int)(val & OVERLAY_END_X_MASK);
+        s->ov.end_y  = (int)((val & OVERLAY_END_Y_MASK) >> OVERLAY_END_Y_SHIFT);
+        s->ov.size_x = (s->ov.end_x - s->ov.start_x) + 1;
+        s->ov.size_y = (s->ov.end_y - s->ov.start_y) + 1;
+        s->regs[Video_vidOverlayEndScreenCoords >> 2] = val;
+        break;
     case Video_vidOverlayDudx:
+        /* 86Box: voodoo->overlay.vidOverlayDudx = val & VID_DUDX_MASK */
+        s->ov.vidOverlayDudx = val & VID_DUDX_MASK;
+        s->regs[Video_vidOverlayDudx >> 2] = val;
+        break;
     case Video_vidOverlayDudxOffsetSrcWidth:
+        /*
+         * 86Box: overlay_bytes = (val & OVERLAY_SRC_WIDTH_MASK) >> OVERLAY_SRC_WIDTH_SHIFT;
+         * overlay_bytes = source row width in bytes
+         */
+        s->ov.vidOverlayDudxOffsetSrcWidth = val;
+        s->ov.overlay_bytes = (int)((val & OVERLAY_SRC_WIDTH_MASK) >> OVERLAY_SRC_WIDTH_SHIFT);
+        s->regs[Video_vidOverlayDudxOffsetSrcWidth >> 2] = val;
+        break;
     case Video_vidOverlayDvdy:
+        /* 86Box: voodoo->overlay.vidOverlayDvdy = val & VID_DVDY_MASK */
+        s->ov.vidOverlayDvdy = val & VID_DVDY_MASK;
+        s->regs[Video_vidOverlayDvdy >> 2] = val;
+        break;
     case Video_vidOverlayDvdyOffset:
-        s->regs[(addr & 0xff) >> 2] = val;
+        s->ov.vidOverlayDvdyOffset = val;
+        s->regs[Video_vidOverlayDvdyOffset >> 2] = val;
         break;
     case Video_vidDesktopStartAddr:
         s->vidDesktopStartAddr = val & 0x00ffffff;
@@ -1449,6 +1531,8 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
             s->cursor_ena    = !!(s->vidProcCfg & VIDPROCCFG_HWCURSOR_ENA);
             s->pix_format    = (int)VIDPROCCFG_DESKTOP_PIX_FMT(s->vidProcCfg);
             s->desktop_tiled = !!(s->vidProcCfg & VIDPROCCFG_DESKTOP_TILE);
+            s->ov.pix_fmt    = (int)VIDPROCCFG_OVERLAY_PIX_FMT(s->vidProcCfg);
+            s->ov.ena        = !!(s->vidProcCfg & VIDPROCCFG_OVERLAY_ENABLE);
             s->params.col_tiled = s->desktop_tiled;
             if (s->display_enabled)
                 memset(s->dirty_line, 1, sizeof(s->dirty_line));
@@ -1568,6 +1652,13 @@ static uint32_t voodoo3_ext_read(Voodoo3State *s, uint32_t addr)
     case Video_hwCurC1:            return s->cur_c1;
     case Video_vidChromaKeyMin:    return s->vidChromaKeyMin;
     case Video_vidChromaKeyMax:    return s->vidChromaKeyMax;
+    /* Overlay register read-back — 86Box banshee_ext_inl() */
+    case Video_vidOverlayStartCoords:        return s->ov.vidOverlayStartCoords;
+    case Video_vidOverlayEndScreenCoords:    return s->ov.vidOverlayEndScreenCoords;
+    case Video_vidOverlayDudx:               return s->ov.vidOverlayDudx;
+    case Video_vidOverlayDudxOffsetSrcWidth: return s->ov.vidOverlayDudxOffsetSrcWidth;
+    case Video_vidOverlayDvdy:               return s->ov.vidOverlayDvdy;
+    case Video_vidOverlayDvdyOffset:         return s->ov.vidOverlayDvdyOffset;
     /*
      * vidSerialParallelPort (0x78): I2C / DDC / serial port status.
      * Bit 3 = SCL, bit 1 = SDA, bit 8 = I2C-ack.
@@ -1689,7 +1780,177 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
     fi_t f;
     f.i = val;
 
+    /*
+     * Extract chip-select BEFORE masking — identical to 86Box
+     * voodoo_reg_writel() line 80: chip = (addr >> 10) & 0xf
+     *   Bit 0 (0x1) = CHIP_FBI
+     *   Bit 1 (0x2) = CHIP_TREX0  (TMU 0)
+     *   Bit 2 (0x4) = CHIP_TREX1  (TMU 1)
+     */
+    int chip = (int)((addr >> 10) & 0x7);
+    if (chip == 0) chip = 0x7; /* broadcast to all chips */
+
     addr &= 0x3fc;
+
+    /*
+     * TMU registers (textureMode, tLOD, texBaseAddr*, nccTable*)
+     * share numeric offsets 0x300+ with the FBI setup registers
+     * (sBeginTriCMD, sDrawTriCMD).  They are distinguished by chip-select:
+     * if TREX0 or TREX1 is set we handle them here and return early.
+     * If only FBI is selected we fall through to the main switch below.
+     */
+    if ((chip & 0x6) && addr >= 0x300u) {
+        /* NCC table0: 0x324..0x34c */
+        if (addr >= 0x324u && addr <= 0x34cu) {
+            int entry = (int)((addr - 0x324u) >> 2);
+            int row = entry / 4; int col = entry % 4;
+            if (chip & 0x2) {
+                if      (row == 0) s->ncc_table[0][0].y[col] = val;
+                else if (row == 1) s->ncc_table[0][0].i[col] = val;
+                else               s->ncc_table[0][0].q[col] = val;
+                s->ncc_dirty[0] = 1;
+            }
+            if (chip & 0x4) {
+                if      (row == 0) s->ncc_table[1][0].y[col] = val;
+                else if (row == 1) s->ncc_table[1][0].i[col] = val;
+                else               s->ncc_table[1][0].q[col] = val;
+                s->ncc_dirty[1] = 1;
+            }
+            return;
+        }
+        /* NCC table1: 0x364..0x38c */
+        if (addr >= 0x364u && addr <= 0x38cu) {
+            int entry = (int)((addr - 0x364u) >> 2);
+            int row = entry / 4; int col = entry % 4;
+            if (chip & 0x2) {
+                if      (row == 0) s->ncc_table[0][1].y[col] = val;
+                else if (row == 1) s->ncc_table[0][1].i[col] = val;
+                else               s->ncc_table[0][1].q[col] = val;
+                s->ncc_dirty[0] = 1;
+            }
+            if (chip & 0x4) {
+                if      (row == 0) s->ncc_table[1][1].y[col] = val;
+                else if (row == 1) s->ncc_table[1][1].i[col] = val;
+                else               s->ncc_table[1][1].q[col] = val;
+                s->ncc_dirty[1] = 1;
+            }
+            return;
+        }
+        switch (addr) {
+        case 0x300u: /* textureMode */
+            if (chip & 0x2) {
+                s->params.tmu[0].textureMode = val;
+                s->params.tmu[0].tformat = (int)((val >> 8) & 0xf);
+                voodoo3_recalc_tex(&s->params.tex_params[0],
+                    s->params.tmu[0].tLOD, val,
+                    s->params.tmu[0].texBaseAddr, s->params.tmu[0].texBaseAddr1,
+                    s->params.tmu[0].texBaseAddr2, s->params.tmu[0].texBaseAddr38,
+                    s->params.tmu[0].tformat);
+            }
+            if (chip & 0x4) {
+                s->params.tmu[1].textureMode = val;
+                s->params.tmu[1].tformat = (int)((val >> 8) & 0xf);
+                voodoo3_recalc_tex(&s->params.tex_params[1],
+                    s->params.tmu[1].tLOD, val,
+                    s->params.tmu[1].texBaseAddr, s->params.tmu[1].texBaseAddr1,
+                    s->params.tmu[1].texBaseAddr2, s->params.tmu[1].texBaseAddr38,
+                    s->params.tmu[1].tformat);
+            }
+            return;
+        case 0x304u: /* tLOD */
+            if (chip & 0x2) {
+                s->params.tmu[0].tLOD = val;
+                voodoo3_recalc_tex(&s->params.tex_params[0],
+                    val, s->params.tmu[0].textureMode,
+                    s->params.tmu[0].texBaseAddr, s->params.tmu[0].texBaseAddr1,
+                    s->params.tmu[0].texBaseAddr2, s->params.tmu[0].texBaseAddr38,
+                    s->params.tmu[0].tformat);
+            }
+            if (chip & 0x4) {
+                s->params.tmu[1].tLOD = val;
+                voodoo3_recalc_tex(&s->params.tex_params[1],
+                    val, s->params.tmu[1].textureMode,
+                    s->params.tmu[1].texBaseAddr, s->params.tmu[1].texBaseAddr1,
+                    s->params.tmu[1].texBaseAddr2, s->params.tmu[1].texBaseAddr38,
+                    s->params.tmu[1].tformat);
+            }
+            return;
+        case 0x30cu: /* texBaseAddr */
+            if (chip & 0x2) {
+                s->params.tmu[0].texBaseAddr = val & 0xfffff0u;
+                voodoo3_recalc_tex(&s->params.tex_params[0],
+                    s->params.tmu[0].tLOD, s->params.tmu[0].textureMode,
+                    val & 0xfffff0u, s->params.tmu[0].texBaseAddr1,
+                    s->params.tmu[0].texBaseAddr2, s->params.tmu[0].texBaseAddr38,
+                    s->params.tmu[0].tformat);
+            }
+            if (chip & 0x4) {
+                s->params.tmu[1].texBaseAddr = val & 0xfffff0u;
+                voodoo3_recalc_tex(&s->params.tex_params[1],
+                    s->params.tmu[1].tLOD, s->params.tmu[1].textureMode,
+                    val & 0xfffff0u, s->params.tmu[1].texBaseAddr1,
+                    s->params.tmu[1].texBaseAddr2, s->params.tmu[1].texBaseAddr38,
+                    s->params.tmu[1].tformat);
+            }
+            return;
+        case 0x310u: /* texBaseAddr1 */
+            if (chip & 0x2) {
+                s->params.tmu[0].texBaseAddr1 = val & 0xfffff0u;
+                voodoo3_recalc_tex(&s->params.tex_params[0],
+                    s->params.tmu[0].tLOD, s->params.tmu[0].textureMode,
+                    s->params.tmu[0].texBaseAddr, val & 0xfffff0u,
+                    s->params.tmu[0].texBaseAddr2, s->params.tmu[0].texBaseAddr38,
+                    s->params.tmu[0].tformat);
+            }
+            if (chip & 0x4) {
+                s->params.tmu[1].texBaseAddr1 = val & 0xfffff0u;
+                voodoo3_recalc_tex(&s->params.tex_params[1],
+                    s->params.tmu[1].tLOD, s->params.tmu[1].textureMode,
+                    s->params.tmu[1].texBaseAddr, val & 0xfffff0u,
+                    s->params.tmu[1].texBaseAddr2, s->params.tmu[1].texBaseAddr38,
+                    s->params.tmu[1].tformat);
+            }
+            return;
+        case 0x314u: /* texBaseAddr2 */
+            if (chip & 0x2) {
+                s->params.tmu[0].texBaseAddr2 = val & 0xfffff0u;
+                voodoo3_recalc_tex(&s->params.tex_params[0],
+                    s->params.tmu[0].tLOD, s->params.tmu[0].textureMode,
+                    s->params.tmu[0].texBaseAddr, s->params.tmu[0].texBaseAddr1,
+                    val & 0xfffff0u, s->params.tmu[0].texBaseAddr38,
+                    s->params.tmu[0].tformat);
+            }
+            if (chip & 0x4) {
+                s->params.tmu[1].texBaseAddr2 = val & 0xfffff0u;
+                voodoo3_recalc_tex(&s->params.tex_params[1],
+                    s->params.tmu[1].tLOD, s->params.tmu[1].textureMode,
+                    s->params.tmu[1].texBaseAddr, s->params.tmu[1].texBaseAddr1,
+                    val & 0xfffff0u, s->params.tmu[1].texBaseAddr38,
+                    s->params.tmu[1].tformat);
+            }
+            return;
+        case 0x318u: /* texBaseAddr38 */
+            if (chip & 0x2) {
+                s->params.tmu[0].texBaseAddr38 = val & 0xfffff0u;
+                voodoo3_recalc_tex(&s->params.tex_params[0],
+                    s->params.tmu[0].tLOD, s->params.tmu[0].textureMode,
+                    s->params.tmu[0].texBaseAddr, s->params.tmu[0].texBaseAddr1,
+                    s->params.tmu[0].texBaseAddr2, val & 0xfffff0u,
+                    s->params.tmu[0].tformat);
+            }
+            if (chip & 0x4) {
+                s->params.tmu[1].texBaseAddr38 = val & 0xfffff0u;
+                voodoo3_recalc_tex(&s->params.tex_params[1],
+                    s->params.tmu[1].tLOD, s->params.tmu[1].textureMode,
+                    s->params.tmu[1].texBaseAddr, s->params.tmu[1].texBaseAddr1,
+                    s->params.tmu[1].texBaseAddr2, val & 0xfffff0u,
+                    s->params.tmu[1].tformat);
+            }
+            return;
+        default:
+            return; /* unknown TMU register — silently ignore */
+        }
+    }
 
     switch (addr) {
 
@@ -3738,6 +3999,60 @@ static void voodoo3_lfb_write(void *opaque, hwaddr addr,
     }
 
     memcpy(s->fb_mem + phys, &data, size);
+
+    /*
+     * CMDFIFO0 LFB-write detection — ported from 86Box banshee_mem_writel().
+     *
+     * When the driver writes into the CMDFIFO ring-buffer area via the LFB
+     * BAR, hardware automatically advances the depth counter and wakes the
+     * FIFO processor.  Without this, the WinXP 3dfxvs driver fills the ring
+     * via LFB writes, then polls cmdfifo_depth waiting for it to drain, but
+     * depth_wr never advances → permanent spin → STOP 0x000000EA.
+     *
+     * 86Box algorithm (banshee_mem_writel, condensed):
+     *   phys == cmdfifo_base && !holecount  → reset amin/amax, depth_wr++
+     *   holecount > 0                        → holecount--;
+     *                                          if 0: depth_wr += (amax-amin)>>2
+     *   phys == amax+4                        → amax=phys; depth_wr++
+     *   else (out-of-order)                  → update amax, set holecount
+     * After any change: wake render/FIFO thread via render_cond.
+     */
+    if (size == 4 &&
+        s->cmdfifo_enabled &&
+        s->cmdfifo_base != s->cmdfifo_end) {
+        uint32_t phys32 = (uint32_t)phys;
+        if (phys32 >= s->cmdfifo_base && phys32 < s->cmdfifo_end) {
+            bool wake = true;
+            if (phys32 == s->cmdfifo_base && !s->cmdfifo_holecount) {
+                s->cmdfifo_amin = s->cmdfifo_base;
+                s->cmdfifo_amax = s->cmdfifo_base;
+                s->cmdfifo_depth_wr++;
+            } else if (s->cmdfifo_holecount) {
+                s->cmdfifo_holecount--;
+                if (!s->cmdfifo_holecount)
+                    s->cmdfifo_depth_wr +=
+                        (s->cmdfifo_amax - s->cmdfifo_amin) >> 2;
+            } else if (phys32 == s->cmdfifo_amax + 4u) {
+                s->cmdfifo_amin = phys32;
+                s->cmdfifo_amax = phys32;
+                s->cmdfifo_depth_wr++;
+            } else {
+                /* Out-of-order write: record range, set hole count */
+                if (phys32 < s->cmdfifo_amin)
+                    s->cmdfifo_amin = s->cmdfifo_base - 4u;
+                s->cmdfifo_amax      = phys32;
+                s->cmdfifo_holecount =
+                    (s->cmdfifo_amax - s->cmdfifo_amin) >> 2;
+                if (s->cmdfifo_holecount)
+                    s->cmdfifo_holecount--;
+            }
+            if (wake) {
+                qemu_mutex_lock(&s->render_lock);
+                qemu_cond_broadcast(&s->render_cond);
+                qemu_mutex_unlock(&s->render_lock);
+            }
+        }
+    }
 }
 
 static const MemoryRegionOps voodoo3_lfb_ops = {
@@ -4749,6 +5064,8 @@ static void voodoo3_reset_state(Voodoo3State *s)
     s->ddc.state   = I2C_IDLE;
     s->ddc.sda_out = 1;
     voodoo3_edid_init(s->ddc_edid);
+    /* Overlay reset */
+    memset(&s->ov, 0, sizeof(s->ov));
     s->swap_pending  = false;
     s->swap_interval = 0;
     s->swap_offset   = 0;

@@ -77,6 +77,41 @@ void voodoo3_queue_triangle(Voodoo3State *s, voodoo3_params_t *p);
 #define PARAM_BUF_SIZE       256
 #define MAX_RENDER_THREADS   4
 
+/* =========================================================================
+ * vidProcCfg register bit definitions
+ * Shared by voodoo3.c and voodoo3_display.c — defined here so both can use
+ * them without the display module needing to include the main voodoo3.c.
+ * Values from 3Dfx Voodoo3/Banshee register specification.
+ * ========================================================================= */
+#define VIDPROCCFG_VIDPROC_ENABLE        (1u <<  0)
+#define VIDPROCCFG_CURSOR_MODE           (1u <<  1)  /* 0=Win AND/XOR, 1=X11 */
+#define VIDPROCCFG_OVERLAY_ENABLE        (1u <<  8)
+#define VIDPROCCFG_OVERLAY_CLUT_BYPASS   (1u << 11)
+#define VIDPROCCFG_OVERLAY_CLUT_SEL      (1u << 13)
+#define VIDPROCCFG_H_SCALE_ENABLE        (1u << 14)
+#define VIDPROCCFG_V_SCALE_ENABLE        (1u << 15)
+#define VIDPROCCFG_FILTER_MODE_MASK      (3u << 16)
+#define VIDPROCCFG_FILTER_MODE_POINT     (0u << 16)
+#define VIDPROCCFG_FILTER_MODE_DITHER4X4 (1u << 16)
+#define VIDPROCCFG_FILTER_MODE_DITHER2X2 (2u << 16)
+#define VIDPROCCFG_FILTER_MODE_BILINEAR  (3u << 16)
+#define VIDPROCCFG_DESKTOP_PIX_FMT(v)   (((v) >> 18) & 7u)
+#define VIDPROCCFG_OVERLAY_PIX_FMT(v)   (((v) >> 21) & 7u)
+#define VIDPROCCFG_DESKTOP_TILE          (1u << 24)
+#define VIDPROCCFG_OVERLAY_TILE          (1u << 25)
+#define VIDPROCCFG_HWCURSOR_ENA          (1u << 27)
+
+/* Overlay pixel format values (from VIDPROCCFG_OVERLAY_PIX_FMT field) */
+#define OVERLAY_FMT_565         1
+#define OVERLAY_FMT_YUYV422     5
+#define OVERLAY_FMT_UYVY422     6
+#define OVERLAY_FMT_565_DITHER  7
+
+/* vidDesktopOverlayStride register field masks */
+#define VID_STRIDE_DESKTOP_MASK   0x00007fffu          /* bits[14:0]  */
+#define VID_STRIDE_OVERLAY_SHIFT  16
+#define VID_STRIDE_OVERLAY_MASK   (0x7fffu << VID_STRIDE_OVERLAY_SHIFT)
+
 typedef struct voodoo3_tmu_params_t {
     int64_t  startS, startT, startW;
     int64_t  dSdX, dTdX, dWdX;
@@ -352,6 +387,36 @@ struct Voodoo3State {
     uint32_t hwCurPatAddr, hwCurLoc, hwCurC0, hwCurC1;
     uint32_t intrCtrl;
     uint32_t command_2d, srcBaseAddr_2d;
+
+    /*
+     * Video overlay state — ported from 86Box voodoo_t.overlay and
+     * banshee_t.overlay_pix_fmt / overlay_buffer.
+     *
+     * Source: banshee_overlay_draw() in vid_voodoo_banshee.c,
+     *         voodoo_t.overlay in vid_voodoo_common.h.
+     */
+    struct {
+        /* Raw register storage */
+        uint32_t vidOverlayStartCoords;
+        uint32_t vidOverlayEndScreenCoords;
+        uint32_t vidOverlayDudx;               /* X step, 20.12 fixed-point */
+        uint32_t vidOverlayDudxOffsetSrcWidth;
+        uint32_t vidOverlayDvdy;               /* Y step, 20.12 fixed-point */
+        uint32_t vidOverlayDvdyOffset;
+        /* Decoded geometry */
+        int      start_x, start_y;             /* screen top-left */
+        int      end_x,   end_y;               /* screen bottom-right */
+        int      size_x,  size_y;              /* display size (pixels) */
+        int      overlay_bytes;               /* source row width in bytes */
+        /* Vertical sub-pixel accumulator (20.12 fixed-point source Y) */
+        int32_t  src_y;
+        /* Pixel format: OVERLAY_FMT_565 / YUYV422 / UYVY422 */
+        int      pix_fmt;
+        /* Enable flag (vidProcCfg bit 8) */
+        bool     ena;
+        /* Two-line decode buffers for bilinear filtering (86Box overlay_buffer[2][4096]) */
+        uint32_t buf[2][4096];
+    } ov;
 
     /*
      * VGA register state — ported from 86Box svga_t fields used by

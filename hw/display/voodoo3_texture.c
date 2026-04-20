@@ -213,10 +213,30 @@ void voodoo3_recalc_tex(voodoo3_tex_params_t *tp, uint32_t tLOD,
 }
 
 /* =========================================================================
+ * texture_offset[] — mip-chain word offsets in the decoded cache.
+ * Matches 86Box vid_voodoo_texture.h texture_offset[LOD_MAX + 3].
+ * data[texture_offset[lod]] is the first word for LOD level lod.
+ * ========================================================================= */
+static const uint32_t texture_offset[V3_LOD_MAX + 3] = {
+    0,
+    256 * 256,
+    256 * 256 + 128 * 128,
+    256 * 256 + 128 * 128 + 64 * 64,
+    256 * 256 + 128 * 128 + 64 * 64 + 32 * 32,
+    256 * 256 + 128 * 128 + 64 * 64 + 32 * 32 + 16 * 16,
+    256 * 256 + 128 * 128 + 64 * 64 + 32 * 32 + 16 * 16 + 8 * 8,
+    256 * 256 + 128 * 128 + 64 * 64 + 32 * 32 + 16 * 16 + 8 * 8 + 4 * 4,
+    256 * 256 + 128 * 128 + 64 * 64 + 32 * 32 + 16 * 16 + 8 * 8 + 4 * 4 + 2 * 2,
+    256 * 256 + 128 * 128 + 64 * 64 + 32 * 32 + 16 * 16 + 8 * 8 + 4 * 4 + 2 * 2 + 1,
+    256 * 256 + 128 * 128 + 64 * 64 + 32 * 32 + 16 * 16 + 8 * 8 + 4 * 4 + 2 * 2 + 1 + 1
+};
+
+/* =========================================================================
  * Decode one texture from SGRAM into the cache
  *
  * Ported from 86Box voodoo_use_texture() — the inner decode loop.
  * Reads raw bytes from tex_mem[] and converts to ABGR32 words in cache[].
+ * Uses texture_offset[lod] for correct mip-chain placement.
  * ========================================================================= */
 static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
                            const voodoo3_tex_params_t *tp, int tmu,
@@ -224,88 +244,58 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
 {
     voodoo3_init_luts();
 
-    uint8_t *tex_mem = (tmu == 0) ? s->tex_mem[0] : s->tex_mem[1];
+    uint8_t *tex_mem  = s->tex_mem[tmu];
     uint32_t tex_mask = s->tex_mask;
     int      tformat  = tp->tformat;
 
-    for (int lod = lod_min; lod <= lod_max && lod <= V3_LOD_MAX; lod++) {
+    lod_min = MIN(lod_min, V3_LOD_MAX);
+    lod_max = MIN(lod_max, V3_LOD_MAX);
+
+    for (int lod = lod_min; lod <= lod_max; lod++) {
+        uint32_t *base     = &entry->data[texture_offset[lod]];
         uint32_t  tex_addr = tp->tex_base[lod] & tex_mask;
         int       w        = tp->tex_w_mask[lod] + 1;
         int       h        = tp->tex_h_mask[lod] + 1;
         int       src_shift= tp->tex_shift[lod];
-        int       dst_shift= 8 - tp->tex_lod[lod];
-        uint32_t *base     = &entry->data[lod == 0 ? 0 : (256 * 256)]; /* simplified offset */
-
-        /* For a proper mip-map offset table, use texture_offset[lod] as in
-         * 86Box. Here we pack sequentially; adjust when wiring to rasterizer. */
-        /* TODO: use per-lod offset table matching 86Box texture_offset[] */
 
         for (int y = 0; y < h; y++) {
-            uint32_t row_addr = tex_addr + (uint32_t)(y << src_shift);
+            uint32_t  row_addr = tex_addr + (uint32_t)(y << src_shift);
+            uint32_t *dst_row  = base + (uint32_t)(y * w);
             for (int x = 0; x < w; x++) {
                 uint32_t out;
                 switch (tformat) {
                 case TEX_RGB332: {
-                    uint8_t d = tex_mem[(row_addr + x) & tex_mask];
+                    uint8_t d = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
                     out = MAKERGBA(rgb332_r[d], rgb332_g[d], rgb332_b[d], 0xff);
                     break; }
                 case TEX_Y4I2Q2: {
-                    /* NCC-compressed YIQ — decode via ncc_lookup table.
-                     * textureMode bit 5 (NCC_SEL) picks table 0 or 1.
-                     * Ported from 86Box voodoo_use_texture() TEX_Y4I2Q2 case. */
-                    uint8_t  d   = tex_mem[(row_addr + x) & tex_mask];
-                    int      sel = (tp->tformat & (1 << 5)) ? 1 : 0; /* NCC_SEL */
+                    uint8_t  d   = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
+                    int      sel = (tp->tLOD & (1u << 5)) ? 1 : 0;
                     uint32_t c   = s->ncc_lookup[tmu][sel][d];
                     out = c;
                     break; }
                 case TEX_A8: {
-                    uint8_t d = tex_mem[(row_addr + x) & tex_mask];
+                    uint8_t d = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
                     out = MAKERGBA(d, d, d, d);
                     break; }
                 case TEX_I8: {
-                    uint8_t d = tex_mem[(row_addr + x) & tex_mask];
+                    uint8_t d = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
                     out = MAKERGBA(d, d, d, 0xff);
                     break; }
                 case TEX_AI8: {
-                    uint8_t d = tex_mem[(row_addr + x) & tex_mask];
-                    uint8_t lo = (d & 0x0f) | ((d & 0x0f) << 4);
-                    uint8_t hi = (d & 0xf0) | ((d & 0xf0) >> 4);
+                    uint8_t d  = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
+                    uint8_t lo = (uint8_t)((d & 0x0f) | ((d & 0x0f) << 4));
+                    uint8_t hi = (uint8_t)((d & 0xf0) | ((d & 0xf0) >> 4));
                     out = MAKERGBA(lo, lo, lo, hi);
                     break; }
-                case TEX_ARGB8332: {
-                    uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + x*2) & tex_mask], 2);
-                    out = MAKERGBA(rgb332_r[d & 0xff], rgb332_g[d & 0xff],
-                                   rgb332_b[d & 0xff], d >> 8);
-                    break; }
-                case TEX_R5G6B5: {
-                    uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + x*2) & tex_mask], 2);
-                    out = MAKERGBA(rgb565_r[d], rgb565_g[d], rgb565_b[d], 0xff);
-                    break; }
-                case TEX_ARGB1555: {
-                    uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + x*2) & tex_mask], 2);
-                    out = MAKERGBA(a1555_r[d], a1555_g[d], a1555_b[d], a1555_a[d]);
-                    break; }
-                case TEX_ARGB4444: {
-                    uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + x*2) & tex_mask], 2);
-                    out = MAKERGBA(a4444_r[d], a4444_g[d], a4444_b[d], a4444_a[d]);
-                    break; }
-                case TEX_A8I8: {
-                    uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + x*2) & tex_mask], 2);
-                    out = MAKERGBA(d & 0xff, d & 0xff, d & 0xff, d >> 8);
-                    break; }
                 case TEX_PAL8: {
-                    uint8_t  idx = tex_mem[(row_addr + x) & tex_mask];
+                    uint8_t  idx = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
                     uint32_t c   = s->tex_palette[tmu][idx];
                     out = MAKERGBA((c >> 16) & 0xff, (c >> 8) & 0xff,
                                     c & 0xff, 0xff);
                     break; }
                 case TEX_APAL8: {
-                    uint8_t  idx = tex_mem[(row_addr + x) & tex_mask];
+                    uint8_t  idx = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
                     uint32_t c   = s->tex_palette[tmu][idx];
                     uint8_t  pr  = (c >> 16) & 0xff;
                     uint8_t  pg  = (c >>  8) & 0xff;
@@ -316,31 +306,53 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
                     uint8_t  a2  = (uint8_t)((pr & 0xfc) | ((pr & 0xc0) >> 6));
                     out = MAKERGBA(r2, g2, b2, a2);
                     break; }
-                case TEX_APAL88: {
+                case TEX_ARGB8332: {
                     uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + x*2) & tex_mask], 2);
-                    uint32_t c  = s->tex_palette[tmu][d & 0xff];
-                    out = MAKERGBA((c >> 16) & 0xff, (c >> 8) & 0xff,
-                                    c & 0xff, d >> 8);
+                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    out = MAKERGBA(rgb332_r[d & 0xff], rgb332_g[d & 0xff],
+                                   rgb332_b[d & 0xff], d >> 8);
                     break; }
                 case TEX_A8Y4I2Q2: {
-                    /* Alpha + NCC-compressed YIQ (16-bit: alpha in high byte)
-                     * Ported from 86Box voodoo_use_texture() TEX_A8Y4I2Q2 case. */
                     uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + x*2) & tex_mask], 2);
-                    int      sel = (tp->tformat & (1 << 5)) ? 1 : 0;
+                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    int      sel = (tp->tLOD & (1u << 5)) ? 1 : 0;
                     uint32_t c   = s->ncc_lookup[tmu][sel][d & 0xff];
                     out = (c & 0x00ffffffu) | ((uint32_t)(d >> 8) << 24);
                     break; }
+                case TEX_R5G6B5: {
+                    uint16_t d;
+                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    out = MAKERGBA(rgb565_r[d], rgb565_g[d], rgb565_b[d], 0xff);
+                    break; }
+                case TEX_ARGB1555: {
+                    uint16_t d;
+                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    out = MAKERGBA(a1555_r[d], a1555_g[d], a1555_b[d], a1555_a[d]);
+                    break; }
+                case TEX_ARGB4444: {
+                    uint16_t d;
+                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    out = MAKERGBA(a4444_r[d], a4444_g[d], a4444_b[d], a4444_a[d]);
+                    break; }
+                case TEX_A8I8: {
+                    uint16_t d;
+                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    out = MAKERGBA(d & 0xff, d & 0xff, d & 0xff, d >> 8);
+                    break; }
+                case TEX_APAL88: {
+                    uint16_t d;
+                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    uint32_t c   = s->tex_palette[tmu][d & 0xff];
+                    out = MAKERGBA((c >> 16) & 0xff, (c >> 8) & 0xff,
+                                    c & 0xff, d >> 8);
+                    break; }
                 default:
-                    out = 0xff808080u; /* unknown — mid-grey */
+                    out = 0xff808080u;
                     break;
                 }
-                /* Store into flat cache array */
-                base[y * w + x] = out;
+                dst_row[x] = out;
             }
         }
-        (void)dst_shift; /* reserved for future mip-chain offset table */
     }
 }
 
@@ -354,42 +366,43 @@ void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu)
 {
     voodoo3_tex_params_t *tp = &p->tex_params[tmu];
 
-    /* Find existing cache entry */
+    int lod_min = (int)((tp->tLOD >> 2)  & 0xf);
+    int lod_max = (int)((tp->tLOD >> 8)  & 0xf);
+    if (lod_min > V3_LOD_MAX) lod_min = V3_LOD_MAX;
+    if (lod_max > V3_LOD_MAX) lod_max = V3_LOD_MAX;
+
+    uint32_t cache_addr = tp->base;
+    uint32_t cache_lod  = tp->tLOD & 0xf00fffu;
+
+    /* Search cache for a valid matching entry */
     for (int c = 0; c < V3_TEX_CACHE_SIZE; c++) {
         v3_tex_cache_entry_t *e = &s->tex_cache[tmu][c];
-        if (e->valid && e->base == tp->base && e->tLOD == (tp->tLOD & 0xf00fff)) {
-            /* Cache hit — wire pointers */
-            int lod_min = (int)((tp->tLOD >> 2)  & 0xf);
-            int lod_max = (int)((tp->tLOD >> 8)  & 0xf);
-            if (lod_min > V3_LOD_MAX) lod_min = V3_LOD_MAX;
-            if (lod_max > V3_LOD_MAX) lod_max = V3_LOD_MAX;
+        if (e->valid && e->base == cache_addr && e->tLOD == cache_lod) {
+            /* Hit — wire per-LOD pointers via texture_offset[], clamped */
             for (int lod = 0; lod <= V3_LOD_MAX; lod++) {
-                int ul = lod < lod_min ? lod_min : (lod > lod_max ? lod_max : lod);
-                p->tex_ptr[tmu][lod] = &e->data[ul * V3_TEX_LEVEL_WORDS];
+                int ul = lod < lod_min ? lod_min
+                       : (lod > lod_max ? lod_max : lod);
+                p->tex_ptr[tmu][lod] = &e->data[texture_offset[ul]];
             }
             return;
         }
     }
 
-    /* Cache miss — evict LRU slot */
-    int slot = (s->tex_lru[tmu]++) & (V3_TEX_CACHE_SIZE - 1);
+    /* Cache miss — evict LRU slot (round-robin, same as 86Box) */
+    int slot = (int)(s->tex_lru[tmu] & (V3_TEX_CACHE_SIZE - 1));
+    s->tex_lru[tmu]++;
     v3_tex_cache_entry_t *e = &s->tex_cache[tmu][slot];
 
     e->valid = true;
-    e->base  = tp->base;
-    e->tLOD  = tp->tLOD & 0xf00fff;
-
-    int lod_min = (int)((tp->tLOD >> 2) & 0xf);
-    int lod_max = (int)((tp->tLOD >> 8) & 0xf);
-    if (lod_min > V3_LOD_MAX) lod_min = V3_LOD_MAX;
-    if (lod_max > V3_LOD_MAX) lod_max = V3_LOD_MAX;
+    e->base  = cache_addr;
+    e->tLOD  = cache_lod;
 
     decode_texture(s, e, tp, tmu, lod_min, lod_max);
 
-    /* Wire rasterizer pointers */
+    /* Wire rasterizer pointers via texture_offset[] */
     for (int lod = 0; lod <= V3_LOD_MAX; lod++) {
         int ul = lod < lod_min ? lod_min : (lod > lod_max ? lod_max : lod);
-        p->tex_ptr[tmu][lod] = &e->data[ul * V3_TEX_LEVEL_WORDS];
+        p->tex_ptr[tmu][lod] = &e->data[texture_offset[ul]];
     }
 }
 

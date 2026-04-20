@@ -41,4 +41,9 @@ void voodoo3_draw_cursor(Voodoo3State *s,
                          uint8_t *dst_base, int dst_bpp, int dst_pitch,
                          int w, int dirty_lo, int dirty_hi);
 
+/* Video overlay compositing — call after desktop blit, before cursor */
+void voodoo3_overlay_draw(Voodoo3State *s,
+                          uint8_t *dst_base, int dst_bpp, int dst_pitch,
+                          int scr_w, int dirty_lo, int dirty_hi);
+
 #endif /* HW_DISPLAY_VOODOO3_DISPLAY_H */
