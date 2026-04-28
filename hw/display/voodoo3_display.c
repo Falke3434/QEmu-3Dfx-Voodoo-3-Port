@@ -5,7 +5,6 @@
  *   vid_voodoo_display.c  — voodoo_update_ncc(), dirty-line display output
  *   vid_voodoo_blitter.c  — voodoo_fastfill()
  *   vid_voodoo_reg.c      — swapbufferCMD logic
- *   vid_voodoo_render.c   — dither tables (derived from vid_voodoo_dither.h)
  *
  * Original author: Sarah Walker <https://pcem-emulator.co.uk/>
  * Copyright (C) 2008-2024 Sarah Walker and 86Box contributors
@@ -18,59 +17,35 @@
 #include "qemu/log.h"
 #include "hw/display/voodoo3_int.h"
 #include "hw/display/voodoo3_display.h"
+#include "hw/display/voodoo3_dither_tables.h"
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
 
-/* =========================================================================
- * 4×4 ordered dither tables for RGB565 output
+/*
+ * Dither tables are now provided by voodoo3_dither_tables.c, which contains
+ * the verbatim hardware-accurate lookup tables from 86Box vid_voodoo_dither.h.
  *
- * Generated from the algorithm in 86Box vid_voodoo_dither.h.
- * For each 8-bit input value, the table gives the 5-bit (R/B) or 6-bit (G)
- * dithered output for each position in a 4×4 pattern.
+ * The previous runtime Bayer-matrix approximation has been removed because
+ * its thresholds differed from real Voodoo hardware, causing visibly wrong
+ * dithered gradients in RGB565 mode (especially in 3D games that rely on
+ * ordered dithering for smooth colour transitions).
  *
- * dither_rb[v][y&3][x&3] → 5-bit output  (divide by 8 before packing)
- * dither_g [v][y&3][x&3] → 6-bit output  (divide by 4 before packing)
- * ========================================================================= */
-
-/* Bayer 4×4 threshold matrix (0-15) */
-static const int bayer4[4][4] = {
-    {  0,  8,  2, 10 },
-    { 12,  4, 14,  6 },
-    {  3, 11,  1,  9 },
-    { 15,  7, 13,  5 },
-};
-
-/* Build dither tables at runtime (avoids 256 KB of static data) */
-static uint8_t v3_dither_rb_tbl[256][4][4];
-static uint8_t v3_dither_g_tbl [256][4][4];
-static bool    dither_tables_ready;
-
+ * Table layout:
+ *   voodoo3_dither_rb[256][4][4]      4×4 forward dither, R and B → 5-bit
+ *   voodoo3_dither_g[256][4][4]       4×4 forward dither, G       → 6-bit
+ *   voodoo3_dither_rb2x2[256][2][2]   2×2 forward dither, R and B → 5-bit
+ *   voodoo3_dither_g2x2[256][2][2]    2×2 forward dither, G       → 6-bit
+ *   voodoo3_dithersub_rb[256][4][4]   4×4 subtraction dither, R/B
+ *   voodoo3_dithersub_g[256][4][4]    4×4 subtraction dither, G
+ *   voodoo3_dithersub_rb2x2[256][2][2] 2×2 subtraction dither, R/B
+ *   voodoo3_dithersub_g2x2[256][2][2]  2×2 subtraction dither, G
+ *
+ * voodoo3_init_dither_tables() is now a no-op kept for API compatibility.
+ */
 void voodoo3_init_dither_tables(void)
 {
-    if (dither_tables_ready) return;
-    dither_tables_ready = true;
-
-    for (int v = 0; v < 256; v++) {
-        for (int y = 0; y < 4; y++) {
-            for (int x = 0; x < 4; x++) {
-                /* R/B: 8-bit → 5-bit with 4×4 Bayer dither
-                 * threshold range 0-7 for 8→5 reduction (lose 3 bits) */
-                int t_rb  = (bayer4[y][x] >> 1); /* 0-7 */
-                int out_rb = (v + t_rb) >> 3;
-                v3_dither_rb_tbl[v][y][x] = (uint8_t)(out_rb > 31 ? 31 : out_rb);
-
-                /* G: 8-bit → 6-bit with 4×4 Bayer dither
-                 * threshold range 0-3 for 8→6 reduction (lose 2 bits) */
-                int t_g  = (bayer4[y][x] >> 2); /* 0-3 */
-                int out_g = (v + t_g) >> 2;
-                v3_dither_g_tbl[v][y][x] = (uint8_t)(out_g > 63 ? 63 : out_g);
-            }
-        }
-    }
+    /* Nothing to do — tables are static const data in voodoo3_dither_tables.c */
 }
-
-const uint8_t (*voodoo3_dither_rb)[4][4] = v3_dither_rb_tbl;
-const uint8_t (*voodoo3_dither_g )[4][4] = v3_dither_g_tbl;
 
 /* =========================================================================
  * NCC (Naïve Colour Compression) table update

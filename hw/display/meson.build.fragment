@@ -5,4 +5,5 @@ system_ss.add(when: 'CONFIG_VOODOO3', if_true: files(
   'voodoo3_texture.c',
   'voodoo3_display.c',
   'voodoo3_setup.c',
+  'voodoo3_dither_tables.c',
 ))

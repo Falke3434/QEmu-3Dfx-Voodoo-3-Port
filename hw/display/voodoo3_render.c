@@ -92,7 +92,8 @@
 #define FBZ_DITHER_2X2          (1 << 14)
 #define FBZ_ALPHA_ENABLE        (1 << 15)
 #define FBZ_Y_ORIGIN            (1 << 17)
-#define FBZ_CHROMAKEY           (1 << 19)
+#define FBZ_CHROMAKEY           (1 << 1)    /* hardware fbzMode bit 1 */
+#define FBZ_DITHER_SUB          (1 << 19)   /* hardware fbzMode bit 19: subtraction dither */
 #define FBZ_PARAM_ADJUST        (1 << 30)   /* reuse bit from fbzColorPath */
 
 /* alphaMode */
@@ -191,9 +192,19 @@ static const uint8_t logtable[256] = {
     0xf4,0xf5,0xf5,0xf6,0xf7,0xf7,0xf8,0xf9,0xfa,0xfa,0xfb,0xfc,0xfd,0xfd,0xfe,0xff
 };
 
-/* Dither tables from voodoo3_display.c runtime init */
-#define dither_rb (voodoo3_dither_rb)
-#define dither_g  (voodoo3_dither_g)
+/*
+ * Hardware-accurate dither tables (voodoo3_dither_tables.c / vid_voodoo_dither.h).
+ * Convenience aliases matching 86Box naming used in the render loop below.
+ */
+#include "hw/display/voodoo3_dither_tables.h"
+#define dither_rb      voodoo3_dither_rb
+#define dither_g       voodoo3_dither_g
+#define dither_rb2x2   voodoo3_dither_rb2x2
+#define dither_g2x2    voodoo3_dither_g2x2
+#define dithersub_rb   voodoo3_dithersub_rb
+#define dithersub_g    voodoo3_dithersub_g
+#define dithersub_rb2x2 voodoo3_dithersub_rb2x2
+#define dithersub_g2x2  voodoo3_dithersub_g2x2
 
 /* fastlog — same algorithm as 86Box */
 static inline int fastlog(uint64_t val)
@@ -546,7 +557,7 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
     bool stipple_patt = !!(fbz & FBZ_STIPPLE_PATT);
     bool dither_en    = !!(fbz & FBZ_DITHER);
     bool dither_2x2   = !!(fbz & FBZ_DITHER_2X2);
-    (void)dither_2x2; /* used only under #if USE_DITHER_TABLES */
+    bool dithersub_en = !!(fbz & FBZ_DITHER_SUB);
     bool y_origin     = !!(fbz & FBZ_Y_ORIGIN);
     bool tex_en       = FBZCP_TEXTURE_ENABLED(fcp);
 
@@ -906,20 +917,39 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
 
                 /* --- Dither & pack to RGB565 --- */
                 if (dither_en) {
-#define USE_DITHER_TABLES 1
-#if USE_DITHER_TABLES
+                    /*
+                     * Use the hardware-accurate lookup tables from
+                     * voodoo3_dither_tables.c (verbatim from 86Box
+                     * vid_voodoo_dither.h, measured from real hardware).
+                     *
+                     * 4×4 mode: index with (screen_y & 3), (x & 3)
+                     * 2×2 mode: index with (screen_y & 1), (x & 1)
+                     *           — uses dedicated 2x2 tables, NOT the 4x4 ones
+                     *
+                     * FBZ_DITHER_SUB (fbzMode bit 19): apply subtraction
+                     * dither to the destination (read-back) colour before
+                     * blending, matching 86Box voodoo_half_triangle() logic.
+                     */
+                    if (dithersub_en) {
+                        if (dither_2x2) {
+                            dest_r = dithersub_rb2x2[dest_r][screen_y & 1][x & 1];
+                            dest_g = dithersub_g2x2 [dest_g][screen_y & 1][x & 1];
+                            dest_b = dithersub_rb2x2[dest_b][screen_y & 1][x & 1];
+                        } else {
+                            dest_r = dithersub_rb[dest_r][screen_y & 3][x & 3];
+                            dest_g = dithersub_g [dest_g][screen_y & 3][x & 3];
+                            dest_b = dithersub_rb[dest_b][screen_y & 3][x & 3];
+                        }
+                    }
                     if (dither_2x2) {
-                        src_r = dither_rb[src_r][screen_y & 1][x & 1];
-                        src_g = dither_g [src_g][screen_y & 1][x & 1];
-                        src_b = dither_rb[src_b][screen_y & 1][x & 1];
+                        src_r = dither_rb2x2[src_r][screen_y & 1][x & 1];
+                        src_g = dither_g2x2 [src_g][screen_y & 1][x & 1];
+                        src_b = dither_rb2x2[src_b][screen_y & 1][x & 1];
                     } else {
                         src_r = dither_rb[src_r][screen_y & 3][x & 3];
                         src_g = dither_g [src_g][screen_y & 3][x & 3];
                         src_b = dither_rb[src_b][screen_y & 3][x & 3];
                     }
-#else
-                    src_r >>= 3; src_g >>= 2; src_b >>= 3;
-#endif
                 } else {
                     src_r >>= 3; src_g >>= 2; src_b >>= 3;
                 }
