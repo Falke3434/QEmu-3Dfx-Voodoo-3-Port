@@ -102,9 +102,10 @@
  *       H-scale (Dudx step) and V-scale (Dvdy step), point filter
  *       Bilinear Y-interpolation between two decoded lines
  *       Chroma-key compositing (vidChromaKeyMin/Max, all desktop bpp)
- * [ ] NCC in rasterizer path (ncc_lookup populated by voodoo3_update_ncc;
- *       texture.c uses it for TEX_Y4I2Q2/TEX_A8Y4I2Q2 — render.c comment
- *       "table zeroed" is outdated, wiring is complete via tex_ptr)
+ * [x] NCC in rasterizer path (ncc_lookup populated by voodoo3_update_ncc;
+ *       tex_params stores textureMode so decode_texture() uses the correct
+ *       NCC table-select bit (textureMode[5] = TEXTUREMODE_NCC_SEL, not tLOD[5]).
+ *       Cache invalidated via ncc_gen[tmu] counter on every nccTable write.)
  * [ ] JIT recompiler (x86-64/ARM64) — not applicable for QEMU device model
  * [ ] SLI multi-GPU — not applicable (single-GPU emulation only)
  * -------------------------------------------------------------------------
@@ -354,6 +355,128 @@ done:
     i2c->scl_last = scl;
     i2c->sda_last = sda;
 }
+
+/*
+ * voodoo3_i2c_update — secondary I²C bus engine (vidSerial bits 23-27).
+ *
+ * The Banshee/V3 exposes TWO independent I²C buses via vidSerialParallelPort
+ * (86Box vid_voodoo_banshee.c banshee_ext_outl(), lines 960-961):
+ *
+ *   DDC bus (EDID read):   EN=bit18  SCL_W=bit19  SDA_W=bit20  SCL_R=bit21  SDA_R=bit22
+ *   I2C bus (secondary):   EN=bit23  SCL_W=bit24  SDA_W=bit25  SCL_R=bit26  SDA_R=bit27
+ *
+ * AmigaOS 3dfxVoodoo.chip / Tequila DDC probe sequence:
+ *   1. Probe DDC bus (EN=bit18): addr 0x50 ACK, addr 0x51 NAK → monitor detected
+ *   2. Switch to I2C bus (EN=bit23): attempt EDID read at addr 0x50
+ *
+ * In 86Box, banshee->i2c (the secondary bus) has nothing attached — SDA floats
+ * high (open-drain pull-up → NAK).  We serve the SAME EDID on both buses so
+ * AmigaOS gets EDID data regardless of which bus it uses for the actual read.
+ *
+ * State machine is identical to voodoo3_ddc_update(); only the bit positions differ.
+ */
+static void voodoo3_i2c_update(Voodoo3State *s, uint32_t newval)
+{
+    Voodoo3I2C *i2c = &s->ddc;
+    uint8_t    *edid = s->ddc_edid;
+
+    if (!(newval & (1u << 23))) {   /* I2C_EN = bit 23 */
+        i2c->sda_out = 1;
+        return;
+    }
+
+    int scl      = !!(newval & (1u << 24));  /* I2C_SCK_W */
+    int sda      = !!(newval & (1u << 25));  /* I2C_SDA_W */
+    int scl_prev = i2c->scl_last;
+    int sda_prev = i2c->sda_last;
+
+    /* START: SDA falls while SCL high */
+    if (scl && scl_prev && !sda && sda_prev) {
+        i2c->state     = I2C_RECV_ADDR;
+        i2c->bit_count = 0;
+        i2c->shift_reg = 0;
+        i2c->sda_out   = 1;
+        goto i2c_done;
+    }
+    /* STOP: SDA rises while SCL high */
+    if (scl && scl_prev && sda && !sda_prev) {
+        i2c->state   = I2C_IDLE;
+        i2c->sda_out = 1;
+        goto i2c_done;
+    }
+    /* Sample on rising SCL edge */
+    if (scl && !scl_prev) {
+        switch (i2c->state) {
+        case I2C_RECV_ADDR:
+            i2c->shift_reg = (i2c->shift_reg << 1) | sda;
+            if (++i2c->bit_count == 8) {
+                uint8_t raw   = i2c->shift_reg;
+                i2c->addr     = raw >> 1;
+                i2c->bit_count = 0;
+                i2c->shift_reg = 0;
+                if (i2c->addr == 0x50) {
+                    i2c->sda_out = 0;  /* ACK */
+                    i2c->state   = (raw & 1) ? I2C_SEND_ACK2 : I2C_SEND_ACK;
+                } else {
+                    i2c->state   = I2C_IDLE;
+                    i2c->sda_out = 1;  /* NAK — nothing at this address */
+                }
+            }
+            break;
+        case I2C_SEND_ACK:
+            i2c->sda_out   = 1;
+            i2c->state     = I2C_RECV_REG;
+            i2c->bit_count = 0;
+            i2c->shift_reg = 0;
+            break;
+        case I2C_RECV_REG:
+            i2c->shift_reg = (i2c->shift_reg << 1) | sda;
+            if (++i2c->bit_count == 8) {
+                i2c->data_idx  = i2c->shift_reg & 0x7F;
+                i2c->bit_count = 0;
+                i2c->shift_reg = 0;
+                i2c->state     = I2C_SEND_ACK2;
+                i2c->sda_out   = 0;  /* ACK */
+            }
+            break;
+        case I2C_SEND_ACK2:
+            i2c->sda_out   = 1;
+            i2c->state     = I2C_SEND_DATA;
+            i2c->bit_count = 0;
+            i2c->shift_reg = edid[i2c->data_idx];
+            break;
+        case I2C_SEND_DATA:
+            i2c->sda_out   = (i2c->shift_reg >> 7) & 1;
+            i2c->shift_reg <<= 1;
+            if (++i2c->bit_count == 8) {
+                i2c->bit_count = 0;
+                i2c->data_idx  = (i2c->data_idx + 1) & 0x7F;
+                i2c->state     = I2C_WAIT_ACK;
+            }
+            break;
+        case I2C_WAIT_ACK:
+            if (!sda) {
+                /* Master ACK → send next byte */
+                i2c->shift_reg = edid[i2c->data_idx];
+                i2c->state     = I2C_SEND_DATA;
+                i2c->sda_out   = (i2c->shift_reg >> 7) & 1;
+                i2c->shift_reg <<= 1;
+                i2c->bit_count = 1;
+            } else {
+                /* Master NAK → done */
+                i2c->state   = I2C_IDLE;
+                i2c->sda_out = 1;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+i2c_done:
+    i2c->scl_last = scl;
+    i2c->sda_last = sda;
+}
+
 
 /* =========================================================================
  * PCI identity
@@ -1199,9 +1322,9 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         s->dac_rgb_buf[2] = (uint8_t)(val & 0xff);
         if (s->dacAddr < VOODOO3_CLUT_SIZE) {
             s->pallook[s->dacAddr] =
-                ((uint32_t)s->dac_rgb_buf[0] << 16) |  /* R */
-                ((uint32_t)s->dac_rgb_buf[1] <<  8) |  /* G */
-                 (uint32_t)s->dac_rgb_buf[2];          /* B */
+                ((uint32_t)s->dac_rgb_buf[2] << 16) |  /* R (byte 2) */
+                ((uint32_t)s->dac_rgb_buf[1] <<  8) |  /* G (byte 1) */
+                 (uint32_t)s->dac_rgb_buf[0];          /* B (byte 0) */
         }
         s->dacAddr        = (s->dacAddr + 1) & 0xff;
         s->dac_write_addr = (uint8_t)s->dacAddr;
@@ -1299,7 +1422,8 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
     case Video_hwCurC1: s->cur_c1 = val; break;
     case Video_vidSerialParallelPort:
         s->vidSerialParallelPort = val;
-        voodoo3_ddc_update(s, val);  /* run I2C/DDC bit-bang engine */
+        voodoo3_ddc_update(s, val);   /* DDC channel: bits 18-22 */
+        voodoo3_i2c_update(s, val);   /* I2C channel: bits 23-27 */
         break;
     case Video_vidChromaKeyMin: s->vidChromaKeyMin = val; break;
     case Video_vidChromaKeyMax: s->vidChromaKeyMax = val; break;
@@ -1809,12 +1933,14 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
                 else if (row == 1) s->ncc_table[0][0].i[col] = val;
                 else               s->ncc_table[0][0].q[col] = val;
                 s->ncc_dirty[0] = 1;
+                s->ncc_gen[0]++;
             }
             if (chip & 0x4) {
                 if      (row == 0) s->ncc_table[1][0].y[col] = val;
                 else if (row == 1) s->ncc_table[1][0].i[col] = val;
                 else               s->ncc_table[1][0].q[col] = val;
                 s->ncc_dirty[1] = 1;
+                s->ncc_gen[1]++;
             }
             return;
         }
@@ -1827,12 +1953,14 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
                 else if (row == 1) s->ncc_table[0][1].i[col] = val;
                 else               s->ncc_table[0][1].q[col] = val;
                 s->ncc_dirty[0] = 1;
+                s->ncc_gen[0]++;
             }
             if (chip & 0x4) {
                 if      (row == 0) s->ncc_table[1][1].y[col] = val;
                 else if (row == 1) s->ncc_table[1][1].i[col] = val;
                 else               s->ncc_table[1][1].q[col] = val;
                 s->ncc_dirty[1] = 1;
+                s->ncc_gen[1]++;
             }
             return;
         }
@@ -4204,9 +4332,9 @@ static void voodoo3_vga_out(Voodoo3State *s, uint16_t addr, uint8_t val)
             s->dac_rgb_idx = 0;
             if (s->dacAddr < VOODOO3_CLUT_SIZE) {
                 s->pallook[s->dacAddr] =
-                    ((uint32_t)s->dac_rgb_buf[0] << 16) |  /* R */
-                    ((uint32_t)s->dac_rgb_buf[1] <<  8) |  /* G */
-                     (uint32_t)s->dac_rgb_buf[2];          /* B */
+                    ((uint32_t)s->dac_rgb_buf[2] << 16) |  /* R (byte 2) */
+                    ((uint32_t)s->dac_rgb_buf[1] <<  8) |  /* G (byte 1) */
+                     (uint32_t)s->dac_rgb_buf[0];          /* B (byte 0) */
             }
             s->dacAddr = (s->dacAddr + 1) & 0xff;
             s->dac_write_addr = (uint8_t)s->dacAddr;
@@ -5047,6 +5175,7 @@ static void voodoo3_reset_state(Voodoo3State *s)
     s->cull_pingpong   = 0;
     s->sSetupMode      = 0;
     s->ncc_dirty[0] = s->ncc_dirty[1] = 0;
+    s->ncc_gen[0]   = s->ncc_gen[1]   = 0;
     memset(s->ncc_table,  0, sizeof(s->ncc_table));
     memset(s->ncc_lookup, 0, sizeof(s->ncc_lookup));
 
@@ -5400,6 +5529,7 @@ static const VMStateDescription vmstate_voodoo3 = {
         VMSTATE_UINT32(blt.clip0Min,       Voodoo3State),
         VMSTATE_UINT32(blt.clip0Max,       Voodoo3State),
         VMSTATE_VARRAY_UINT32(fb_mem, Voodoo3State, fb_size, 1, vmstate_info_uint8, uint8_t),
+        VMSTATE_UINT32_ARRAY(ncc_gen, Voodoo3State, 2),
         VMSTATE_END_OF_LIST()
     },
 };

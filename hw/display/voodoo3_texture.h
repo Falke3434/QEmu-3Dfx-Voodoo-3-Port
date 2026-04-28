@@ -45,6 +45,7 @@ typedef struct {
     int      tex_lod   [V3_LOD_MAX + 2];   /* mip index                          */
     uint32_t base;                          /* texBaseAddr[tmu]                   */
     uint32_t tLOD;                          /* tLOD register snapshot             */
+    uint32_t textureMode;                   /* textureMode register snapshot      */
     int      tformat;                       /* TEX_* constant                     */
     int      width;                         /* LOD-0 width                        */
 } voodoo3_tex_params_t;
@@ -60,6 +61,7 @@ typedef struct {
     bool     valid;
     uint32_t base;     /* texBaseAddr used when decoded */
     uint32_t tLOD;     /* tLOD & 0xf00fff              */
+    uint32_t ncc_gen;  /* s->ncc_gen[tmu] at decode time — NCC-table change detection */
     uint32_t data[V3_DATA_WORDS_TOTAL]; /* flat decoded texel array */
 } v3_tex_cache_entry_t;
 

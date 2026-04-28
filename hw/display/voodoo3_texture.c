@@ -206,10 +206,11 @@ void voodoo3_recalc_tex(voodoo3_tex_params_t *tp, uint32_t tLOD,
         }
     }
 
-    tp->tformat = tformat;
-    tp->tLOD    = tLOD;
-    tp->base    = texBaseAddr;
-    tp->width   = widths[0];
+    tp->tformat      = tformat;
+    tp->tLOD         = tLOD;
+    tp->textureMode  = textureMode;
+    tp->base         = texBaseAddr;
+    tp->width        = widths[0];
 }
 
 /* =========================================================================
@@ -270,7 +271,7 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
                     break; }
                 case TEX_Y4I2Q2: {
                     uint8_t  d   = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
-                    int      sel = (tp->tLOD & (1u << 5)) ? 1 : 0;
+                    int      sel = (tp->textureMode & TEXTUREMODE_NCC_SEL) ? 1 : 0;
                     uint32_t c   = s->ncc_lookup[tmu][sel][d];
                     out = c;
                     break; }
@@ -315,7 +316,7 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
                 case TEX_A8Y4I2Q2: {
                     uint16_t d;
                     memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
-                    int      sel = (tp->tLOD & (1u << 5)) ? 1 : 0;
+                    int      sel = (tp->textureMode & TEXTUREMODE_NCC_SEL) ? 1 : 0;
                     uint32_t c   = s->ncc_lookup[tmu][sel][d & 0xff];
                     out = (c & 0x00ffffffu) | ((uint32_t)(d >> 8) << 24);
                     break; }
@@ -374,10 +375,22 @@ void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu)
     uint32_t cache_addr = tp->base;
     uint32_t cache_lod  = tp->tLOD & 0xf00fffu;
 
+    /*
+     * For NCC-format textures (TEX_Y4I2Q2, TEX_A8Y4I2Q2) the decoded pixel
+     * data depends on the nccTable registers, not just the raw SGRAM bytes.
+     * We track the current generation counter so that any nccTable write
+     * (which bumps ncc_gen[tmu]) forces a cache miss and re-decode.
+     * For non-NCC formats ncc_gen is always 0 in the cache entry (stored as
+     * 0) and s->ncc_gen is ignored, so there is no overhead.
+     */
+    bool is_ncc = (tp->tformat == TEX_Y4I2Q2 || tp->tformat == TEX_A8Y4I2Q2);
+    uint32_t cur_ncc_gen = is_ncc ? s->ncc_gen[tmu] : 0u;
+
     /* Search cache for a valid matching entry */
     for (int c = 0; c < V3_TEX_CACHE_SIZE; c++) {
         v3_tex_cache_entry_t *e = &s->tex_cache[tmu][c];
-        if (e->valid && e->base == cache_addr && e->tLOD == cache_lod) {
+        if (e->valid && e->base == cache_addr && e->tLOD == cache_lod
+                && e->ncc_gen == cur_ncc_gen) {
             /* Hit — wire per-LOD pointers via texture_offset[], clamped */
             for (int lod = 0; lod <= V3_LOD_MAX; lod++) {
                 int ul = lod < lod_min ? lod_min
@@ -393,9 +406,10 @@ void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu)
     s->tex_lru[tmu]++;
     v3_tex_cache_entry_t *e = &s->tex_cache[tmu][slot];
 
-    e->valid = true;
-    e->base  = cache_addr;
-    e->tLOD  = cache_lod;
+    e->valid   = true;
+    e->base    = cache_addr;
+    e->tLOD    = cache_lod;
+    e->ncc_gen = cur_ncc_gen;
 
     decode_texture(s, e, tp, tmu, lod_min, lod_max);
 

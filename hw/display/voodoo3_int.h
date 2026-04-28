@@ -506,6 +506,8 @@ struct Voodoo3State {
 
     /* NCC dirty flags */
     int             ncc_dirty[2];
+    uint32_t        ncc_gen[2];   /* incremented on each nccTable write; used to
+                                   * invalidate cached NCC textures in the tex cache */
 
     /* Blitter state */
     voodoo3_blt_t   blt;

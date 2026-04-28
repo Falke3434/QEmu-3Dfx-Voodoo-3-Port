@@ -33,10 +33,9 @@
  *  - Dual-TMU colour blend (voodoo_tmu_fetch_and_blend)
  *
  * NOT yet ported (stubs only):
- *  - Texture cache (tex[] pointers filled with NULL — add voodoo3_texture.c)
+ *  - Texture cache (tex[] pointers filled by voodoo3_use_texture)
  *  - x86-64 / ARM64 JIT recompiler path (NO_CODEGEN forced)
  *  - SLI (single-GPU only)
- *  - NCC palette lookup (voodoo_update_ncc call retained, table zeroed)
  * -------------------------------------------------------------------------
  */
 
