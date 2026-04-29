@@ -187,6 +187,21 @@ typedef struct voodoo3_params_t {
      */
     voodoo3_tex_params_t tex_params[2];     /* per-TMU LOD geometry     */
     uint32_t            *tex_ptr[2][V3_LOD_MAX + 1]; /* decoded cache ptrs */
+
+    /*
+     * Detail-texture parameters — decoded from the tDetail register (0x308).
+     * Ported from 86Box voodoo_params_t: detail_max[], detail_bias[], detail_scale[].
+     *
+     * detail_max[tmu]   = tDetail[7:0]   — clamp ceiling (0..255)
+     * detail_bias[tmu]  = tDetail[13:8]  — LOD subtrahend (0..63)
+     * detail_scale[tmu] = tDetail[16:14] — left-shift amount (0..7)
+     *
+     * Used in TC_MSELECT_DETAIL / TCA_MSELECT_DETAIL colour-path cases:
+     *   factor = clamp((detail_bias - lod) << detail_scale, 0, detail_max)
+     */
+    int detail_max[2];
+    int detail_bias[2];
+    int detail_scale[2];
 } voodoo3_params_t;
 
 /* =========================================================================
@@ -387,6 +402,31 @@ struct Voodoo3State {
     uint32_t hwCurPatAddr, hwCurLoc, hwCurC0, hwCurC1;
     uint32_t intrCtrl;
     uint32_t command_2d, srcBaseAddr_2d;
+
+    /*
+     * Screen-filter (scrfilter) state — ported from 86Box voodoo_t.scrfilter*
+     * and voodoo_generate_vb_filters() in vid_voodoo_banshee.c.
+     *
+     * scrfilter_enabled : true when Video_maxRgbDelta > 0.
+     * scrfilter_threshold : raw 24-bit RGB delta value (R<<16|G<<8|B).
+     * scrfilter_threshold_old : previous value; table regenerated on change.
+     *
+     * vb_filter_v1_rb/g  : 4×1 / 2×2 filter LUT (256×256, per-channel).
+     * vb_filter_bx_rb/g  : box pre-filter LUT    (256×256, per-channel).
+     * purpleline         : per-channel scanline tint (256 entries × 3 ch).
+     *
+     * These are only allocated/populated when scrfilter_enabled is true.
+     * All four 256×256 tables are ~256 KB total; kept as flat arrays for
+     * direct indexing identical to 86Box's static arrays.
+     */
+    bool     scrfilter_enabled;
+    uint32_t scrfilter_threshold;
+    uint32_t scrfilter_threshold_old;
+    uint8_t  vb_filter_v1_rb[256][256];
+    uint8_t  vb_filter_v1_g [256][256];
+    uint8_t  vb_filter_bx_rb[256][256];
+    uint8_t  vb_filter_bx_g [256][256];
+    uint16_t purpleline[256][3];
 
     /*
      * Video overlay state — ported from 86Box voodoo_t.overlay and

@@ -115,7 +115,15 @@
 /* textureMode */
 #define TEXMODE_PERSP_CORR  (1 << 0)
 #define TEXMODE_BILINEAR    (1 << 1)
-#define TEXMODE_TRILINEAR   (1 << 2)
+/*
+ * TEXMODE_TRILINEAR — enables trilinear mipmap blending.
+ * 86Box: TEXTUREMODE_TRILINEAR = (1 << 30) in vid_voodoo_regs.h.
+ * The original port had this wrong as (1 << 2); corrected here.
+ * When set and lod is odd, the blend-direction flag (cc_rev_blend /
+ * cca_rev_blend) is inverted for the multiplier step — see 86Box
+ * voodoo_render.c lines 445 and 544.
+ */
+#define TEXMODE_TRILINEAR   (1u << 30)
 #define TEXMODE_LOCAL_MASK  0x0c
 #define TEXMODE_LOCAL       0x0c
 #define TEXMODE_PASSTHROUGH 0x00
@@ -124,19 +132,41 @@
 #define TEXMODE_TMIRROR_S   (1 << 17)
 #define TEXMODE_TMIRROR_T   (1 << 18)
 
-/* CC selectors */
+/* CC selectors (fbzColorPath bits [12:10]) — from 86Box TC_MSELECT_* enum */
 #define CC_MSELECT_ZERO    0
 #define CC_MSELECT_CLOCAL  1
 #define CC_MSELECT_AOTHER  2
 #define CC_MSELECT_ALOCAL  3
-#define CC_MSELECT_TEX     4
-#define CC_MSELECT_TEXRGB  5
+/*
+ * CC_MSELECT_DETAIL (4) and CC_MSELECT_LOD_FRAC (5):
+ * Added from 86Box TC_MSELECT_DETAIL / TC_MSELECT_LOD_FRAC.
+ * The original port had CC_MSELECT_TEX=4 and CC_MSELECT_TEXRGB=5 at these
+ * positions, which is wrong — Glide/hardware has no "tex-alpha" mselect in
+ * the CC path at value 4; that slot is detail texture.
+ * CC_MSELECT_TEX / CC_MSELECT_TEXRGB are kept as aliases for code paths
+ * that were already using the wrong names so they still compile, but the
+ * active switch cases use the correct names.
+ */
+#define CC_MSELECT_DETAIL    4
+#define CC_MSELECT_LOD_FRAC  5
+/* Legacy aliases (wrong encoding but kept so existing callers compile) */
+#define CC_MSELECT_TEX     CC_MSELECT_DETAIL
+#define CC_MSELECT_TEXRGB  CC_MSELECT_LOD_FRAC
 
-#define CCA_MSELECT_ZERO   0
-#define CCA_MSELECT_ALOCAL 1
-#define CCA_MSELECT_AOTHER 2
-#define CCA_MSELECT_ALOCAL2 3
-#define CCA_MSELECT_TEX    4
+/* CCA selectors (fbzColorPath bits [21:19]) — from 86Box TCA_MSELECT_* enum */
+#define CCA_MSELECT_ZERO     0
+#define CCA_MSELECT_ALOCAL   1
+#define CCA_MSELECT_AOTHER   2
+#define CCA_MSELECT_ALOCAL2  3
+/*
+ * CCA_MSELECT_DETAIL (4) and CCA_MSELECT_LOD_FRAC (5):
+ * Added from 86Box TCA_MSELECT_DETAIL / TCA_MSELECT_LOD_FRAC.
+ * The original port had CCA_MSELECT_TEX=4, which is wrong.
+ */
+#define CCA_MSELECT_DETAIL    4
+#define CCA_MSELECT_LOD_FRAC  5
+/* Legacy alias */
+#define CCA_MSELECT_TEX  CCA_MSELECT_DETAIL
 
 /* CC_ADD */
 #define CC_ADD_ZERO   0
@@ -845,26 +875,105 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
 
                 /* Multiplier select */
                 int msel_r, msel_g, msel_b, msel_a;
-                switch (cc_mselect) {
-                case CC_MSELECT_ZERO:    msel_r = msel_g = msel_b = 0;          break;
-                case CC_MSELECT_CLOCAL:  msel_r = clocal_r; msel_g = clocal_g; msel_b = clocal_b; break;
-                case CC_MSELECT_AOTHER:  msel_r = msel_g = msel_b = aother;     break;
-                case CC_MSELECT_ALOCAL:  msel_r = msel_g = msel_b = alocal;     break;
-                case CC_MSELECT_TEX:     msel_r = msel_g = msel_b = st->tex_a[0]; break;
-                case CC_MSELECT_TEXRGB:  msel_r = st->tex_r[0]; msel_g = st->tex_g[0]; msel_b = st->tex_b[0]; break;
-                default:                 msel_r = msel_g = msel_b = 0;          break;
-                }
-                switch (cca_mselect) {
-                case CCA_MSELECT_ZERO:    msel_a = 0;           break;
-                case CCA_MSELECT_ALOCAL:
-                case CCA_MSELECT_ALOCAL2: msel_a = alocal;      break;
-                case CCA_MSELECT_AOTHER:  msel_a = aother;      break;
-                case CCA_MSELECT_TEX:     msel_a = st->tex_a[0]; break;
-                default:                  msel_a = 0;           break;
+
+                /*
+                 * Trilinear mipmap: when TEXMODE_TRILINEAR is set and the
+                 * integer LOD is odd, the blend direction of the multiplier
+                 * is inverted for this TMU0 stage.
+                 * Ported from 86Box voodoo_render.c lines 544–550:
+                 *   if ((textureMode[0] & TEXTUREMODE_TRILINEAR) && (lod & 1))
+                 *       c_reverse = tc_reverse_blend;   // inverted
+                 *   else
+                 *       c_reverse = !tc_reverse_blend;  // normal
+                 * In 86Box "tc_reverse_blend" is the raw fbzColorPath bit, and
+                 * the pixel loop uses c_reverse (not the raw bit) for the XOR.
+                 * We replicate that by computing eff_cc_rev_blend here.
+                 */
+                int eff_cc_rev_blend  = cc_rev_blend;
+                int eff_cca_rev_blend = cca_rev_blend;
+                if (tex_en &&
+                    (p->tmu[0].textureMode & TEXMODE_TRILINEAR) &&
+                    (st->lod & 1)) {
+                    eff_cc_rev_blend  = !eff_cc_rev_blend;
+                    eff_cca_rev_blend = !eff_cca_rev_blend;
                 }
 
-                if (!cc_rev_blend)  { msel_r ^= 0xff; msel_g ^= 0xff; msel_b ^= 0xff; }
-                if (!cca_rev_blend) { msel_a ^= 0xff; }
+                switch (cc_mselect) {
+                case CC_MSELECT_ZERO:
+                    msel_r = msel_g = msel_b = 0;
+                    break;
+                case CC_MSELECT_CLOCAL:
+                    msel_r = clocal_r; msel_g = clocal_g; msel_b = clocal_b;
+                    break;
+                case CC_MSELECT_AOTHER:
+                    msel_r = msel_g = msel_b = aother;
+                    break;
+                case CC_MSELECT_ALOCAL:
+                    msel_r = msel_g = msel_b = alocal;
+                    break;
+                case CC_MSELECT_DETAIL: {
+                    /*
+                     * Detail-texture blend factor.
+                     * Ported from 86Box TC_MSELECT_DETAIL case
+                     * (voodoo_render.c lines 473–477):
+                     *   factor = (detail_bias[tmu] - lod) << detail_scale[tmu]
+                     *   factor = clamp(factor, 0, detail_max[tmu])
+                     * lod here is the integer LOD after the >>8 shift in
+                     * v3_tmu_fetch (st->lod is already the integer part).
+                     */
+                    int f = (p->detail_bias[0] - st->lod) << p->detail_scale[0];
+                    if (f < 0)                   f = 0;
+                    if (f > p->detail_max[0])    f = p->detail_max[0];
+                    msel_r = msel_g = msel_b = f;
+                    break;
+                }
+                case CC_MSELECT_LOD_FRAC:
+                    /*
+                     * LOD fractional part as blend factor.
+                     * Ported from 86Box TC_MSELECT_LOD_FRAC case
+                     * (voodoo_render.c line 479):
+                     *   factor = lod_frac[tmu]
+                     */
+                    msel_r = msel_g = msel_b = st->lod_frac[0];
+                    break;
+                default:
+                    msel_r = msel_g = msel_b = 0;
+                    break;
+                }
+                switch (cca_mselect) {
+                case CCA_MSELECT_ZERO:
+                    msel_a = 0;
+                    break;
+                case CCA_MSELECT_ALOCAL:
+                case CCA_MSELECT_ALOCAL2:
+                    msel_a = alocal;
+                    break;
+                case CCA_MSELECT_AOTHER:
+                    msel_a = aother;
+                    break;
+                case CCA_MSELECT_DETAIL: {
+                    /*
+                     * Detail-texture alpha blend factor.
+                     * Ported from 86Box TCA_MSELECT_DETAIL case
+                     * (voodoo_render.c lines 522–525).
+                     */
+                    int f = (p->detail_bias[0] - st->lod) << p->detail_scale[0];
+                    if (f < 0)                   f = 0;
+                    if (f > p->detail_max[0])    f = p->detail_max[0];
+                    msel_a = f;
+                    break;
+                }
+                case CCA_MSELECT_LOD_FRAC:
+                    /* Ported from 86Box TCA_MSELECT_LOD_FRAC (line 527). */
+                    msel_a = st->lod_frac[0];
+                    break;
+                default:
+                    msel_a = 0;
+                    break;
+                }
+
+                if (!eff_cc_rev_blend)  { msel_r ^= 0xff; msel_g ^= 0xff; msel_b ^= 0xff; }
+                if (!eff_cca_rev_blend) { msel_a ^= 0xff; }
                 msel_r++; msel_g++; msel_b++; msel_a++;
 
                 src_r = (src_r * msel_r) >> 8;
@@ -1148,3 +1257,339 @@ void voodoo3_triangle(Voodoo3State *s, const voodoo3_params_t *p)
 
     v3_half_triangle(s, p, &st, vertexAy_adj, vertexCy_adj);
 }
+
+/* =========================================================================
+ * voodoo3_fb_writel — LFB pixel-write through the 3D pipeline
+ *
+ * Handles FIFO_WRITEL_FB entries queued by voodoo3_mmio_write() and by
+ * CMDFIFO packet-5 type-2 (direct LFB writes from the Glide driver).
+ *
+ * Ported from 86Box src/video/vid_voodoo_fb.c : voodoo_fb_writel().
+ * Original author: Sarah Walker.
+ *
+ * addr = framebuffer byte address (lower 23 bits of the FIFO command word;
+ *        the FIFO_WRITEL_FB type bits have already been stripped by the caller)
+ * val  = 32-bit pixel value as written by the guest
+ *
+ * The lfbMode register controls the pixel format.  When lfbMode bit 8
+ * (pipeline enable) is set, the full Stipple / Depth / Chroma / Alpha
+ * test + blend path runs; otherwise the pixel is written raw (no tests).
+ * ========================================================================= */
+
+/* LFB write-mask flags (86Box LFB_WRITE_*) */
+#define LFB_WRITE_COLOUR  1
+#define LFB_WRITE_DEPTH   2
+#define LFB_WRITE_BOTH    3
+
+/* 5-6-5 expand helpers (replicates the low bits into the LSBs for full 0..255) */
+#define EXP5(v)  (((v) << 3) | ((v) >> 2))
+#define EXP6(v)  (((v) << 2) | ((v) >> 4))
+
+void voodoo3_fb_writel(Voodoo3State *s, uint32_t addr, uint32_t val)
+{
+    const voodoo3_params_t *p = &s->params;
+    int      x, y;
+    uint32_t write_addr, write_addr_aux;
+    int      col_r[2], col_g[2], col_b[2];
+    uint16_t depth_data[2];
+    int      alpha_data[2];
+    int      write_mask = 0;
+    int      count = 1;
+    int      fb_mask = (int)(s->fb_size - 1);
+
+    /* Default depth / alpha from zaColor (86Box: depth_data = zaColor & 0xffff,
+     * alpha_data = zaColor >> 24) */
+    depth_data[0] = depth_data[1] = (uint16_t)(p->zaColor & 0xffffu);
+    alpha_data[0] = alpha_data[1] = (int)((p->zaColor >> 24) & 0xffu);
+
+    /* -----------------------------------------------------------------------
+     * Decode lfbMode pixel format (bits [3:0]).
+     * Mirrors 86Box voodoo_fb_writel() switch (voodoo->lfbMode & LFB_FORMAT_MASK).
+     * For dual-pixel formats (RGB565 / RGB555 / ARGB1555 / depth-only),
+     * count=2 and addr is a 2-pixel-wide word; single-pixel formats set count=1.
+     * ----------------------------------------------------------------------- */
+    switch (s->lfbMode & 0xfu) {
+
+    case 0: /* RGB565 — two 16-bit pixels packed into val */
+        col_r[0] = EXP5((val      ) >> 11 & 0x1f);
+        col_g[0] = EXP6((val      ) >>  5 & 0x3f);
+        col_b[0] = EXP5((val      )        & 0x1f);
+        col_r[1] = EXP5((val >> 16) >> 11 & 0x1f);
+        col_g[1] = EXP6((val >> 16) >>  5 & 0x3f);
+        col_b[1] = EXP5((val >> 16)        & 0x1f);
+        write_mask = LFB_WRITE_COLOUR; count = 2;
+        break;
+
+    case 1: /* RGB555 — two 16-bit pixels, no alpha */
+        col_r[0] = EXP5((val      ) >> 10 & 0x1f);
+        col_g[0] = EXP5((val      ) >>  5 & 0x1f);
+        col_b[0] = EXP5((val      )        & 0x1f);
+        col_r[1] = EXP5((val >> 16) >> 10 & 0x1f);
+        col_g[1] = EXP5((val >> 16) >>  5 & 0x1f);
+        col_b[1] = EXP5((val >> 16)        & 0x1f);
+        write_mask = LFB_WRITE_COLOUR; count = 2;
+        break;
+
+    case 2: /* ARGB1555 — two 16-bit pixels with 1-bit alpha */
+        col_r[0] = EXP5((val      ) >> 10 & 0x1f);
+        col_g[0] = EXP5((val      ) >>  5 & 0x1f);
+        col_b[0] = EXP5((val      )        & 0x1f);
+        alpha_data[0] = ((val      ) & 0x8000u) ? 0xff : 0x00;
+        col_r[1] = EXP5((val >> 16) >> 10 & 0x1f);
+        col_g[1] = EXP5((val >> 16) >>  5 & 0x1f);
+        col_b[1] = EXP5((val >> 16)        & 0x1f);
+        alpha_data[1] = ((val >> 16) & 0x8000u) ? 0xff : 0x00;
+        write_mask = LFB_WRITE_COLOUR; count = 2;
+        break;
+
+    case 4: /* ARGB8888 — one 32-bit pixel */
+        col_b[0] =  (int)(val        & 0xffu);
+        col_g[0] =  (int)((val >>  8) & 0xffu);
+        col_r[0] =  (int)((val >> 16) & 0xffu);
+        alpha_data[0] = (int)((val >> 24) & 0xffu);
+        write_mask = LFB_WRITE_COLOUR; count = 1;
+        addr >>= 1; /* ARGB8888 uses half the address space (2 bytes/pixel) */
+        break;
+
+    case 5: /* XRGB8888 — one 32-bit pixel, alpha ignored */
+        col_b[0] =  (int)(val        & 0xffu);
+        col_g[0] =  (int)((val >>  8) & 0xffu);
+        col_r[0] =  (int)((val >> 16) & 0xffu);
+        write_mask = LFB_WRITE_COLOUR; count = 1;
+        addr >>= 1;
+        break;
+
+    case 12: /* depth+RGB565 — colour in low 16 bits, depth in high 16 bits */
+        col_r[0] = EXP5((val & 0xffffu) >> 11 & 0x1f);
+        col_g[0] = EXP6((val & 0xffffu) >>  5 & 0x3f);
+        col_b[0] = EXP5((val & 0xffffu)        & 0x1f);
+        depth_data[0] = (uint16_t)(val >> 16);
+        write_mask = LFB_WRITE_BOTH; count = 1;
+        addr >>= 1;
+        break;
+
+    case 13: /* depth+RGB555 */
+        col_r[0] = EXP5((val & 0xffffu) >> 10 & 0x1f);
+        col_g[0] = EXP5((val & 0xffffu) >>  5 & 0x1f);
+        col_b[0] = EXP5((val & 0xffffu)        & 0x1f);
+        depth_data[0] = (uint16_t)(val >> 16);
+        write_mask = LFB_WRITE_BOTH; count = 1;
+        addr >>= 1;
+        break;
+
+    case 14: /* depth+ARGB1555 */
+        col_r[0] = EXP5((val & 0xffffu) >> 10 & 0x1f);
+        col_g[0] = EXP5((val & 0xffffu) >>  5 & 0x1f);
+        col_b[0] = EXP5((val & 0xffffu)        & 0x1f);
+        alpha_data[0] = ((val & 0x8000u)) ? 0xff : 0x00;
+        depth_data[0] = (uint16_t)(val >> 16);
+        write_mask = LFB_WRITE_BOTH; count = 1;
+        addr >>= 1;
+        break;
+
+    case 15: /* depth only — two 16-bit depth values */
+        depth_data[0] = (uint16_t)(val & 0xffffu);
+        depth_data[1] = (uint16_t)(val >> 16);
+        write_mask = LFB_WRITE_DEPTH; count = 2;
+        break;
+
+    default:
+        /* Unknown format — silently ignore (matches 86Box fatal() path
+         * which we replace with a no-op for robustness). */
+        return;
+    }
+
+    /* -----------------------------------------------------------------------
+     * Compute pixel position.
+     * Voodoo / Banshee address encoding (86Box: addr & 0x7fe = x, addr>>11 = y).
+     * addr is a byte address; divide by 2 gives the 16-bit pixel index.
+     * ----------------------------------------------------------------------- */
+    x = (int)(addr & 0x7feu);           /* x byte offset within row (even) */
+    y = (int)((addr >> 11) & 0x3ffu);   /* row index */
+
+    /* Dirty-line tracking (front-buffer writes update the display) */
+    if (p->draw_offset == p->front_offset && y < V3_DIRTY_LINES)
+        s->dirty_line[y] = 1;
+
+    /* Address computation — tiled or linear (86Box col_tiled / aux_tiled) */
+    if (p->col_tiled)
+        write_addr = p->draw_offset
+            + (x & 127u) + ((x >> 7) * 128u * 32u)
+            + (y & 31u) * 128u + (y >> 5) * p->row_width;
+    else
+        write_addr = p->draw_offset + x + (uint32_t)y * p->row_width;
+
+    if (p->aux_tiled)
+        write_addr_aux = p->aux_offset
+            + (x & 127u) + ((x >> 7) * 128u * 32u)
+            + (y & 31u) * 128u + (y >> 5) * p->aux_row_width;
+    else
+        write_addr_aux = p->aux_offset + x + (uint32_t)y * p->aux_row_width;
+
+    /* -----------------------------------------------------------------------
+     * Per-pixel pipeline (lfbMode bit 8 = pipeline-enable).
+     * When set: run full Stipple / Depth / Chroma / Alpha test + blend.
+     * When clear: raw write (no tests).
+     * Ported from 86Box voodoo_fb_writel() if (voodoo->lfbMode & 0x100) branch.
+     * ----------------------------------------------------------------------- */
+    if (s->lfbMode & 0x100u) {
+
+        bool stipple_en   = !!(p->fbzMode & FBZ_STIPPLE);
+        bool stipple_patt = !!(p->fbzMode & FBZ_STIPPLE_PATT);
+        bool depth_en     = !!(p->fbzMode & FBZ_DEPTH_ENABLE);
+        bool chroma_en    = !!(p->fbzMode & FBZ_CHROMAKEY);
+        bool alpha_en     = !!(p->alphaMode & ALPHA_ENABLE);
+        bool blend_en     = !!(p->alphaMode & ALPHA_BLEND_EN);
+        bool fog_en       = !!(p->fogMode & FOG_ENABLE);
+        bool dither_en    = !!(p->fbzMode & FBZ_DITHER);
+        bool dither_2x2   = !!(p->fbzMode & FBZ_DITHER_2X2);
+        bool rgb_wmask    = !!(p->fbzMode & FBZ_RGB_WMASK);
+        bool depth_wmask  = !!(p->fbzMode & FBZ_DEPTH_WMASK);
+        int  depth_op     = (int)((p->fbzMode >> FBZ_DEPTH_OP_SHIFT) & 7);
+
+        /* Stipple rolling state — LFB writes use the shared stipple register.
+         * (86Box uses voodoo->params.stipple directly with <<1 rotate.) */
+        uint32_t stipple_reg = p->stipple;
+
+        for (int c = 0; c < count; c++) {
+            int wr = col_r[c], wg = col_g[c], wb = col_b[c];
+            int wa = alpha_data[c];
+            uint16_t new_depth = depth_data[c];
+
+            /* --- Stipple --- */
+            if (stipple_en) {
+                if (stipple_patt) {
+                    /* Pattern mode: bit index from (y & 3, ~(x/2+c) & 7) */
+                    int idx = ((y & 3) << 3) | (~((x >> 1) + c) & 7);
+                    if (!(p->stipple & (1u << idx)))
+                        goto skip_fb_pixel;
+                } else {
+                    /* Rotating mode: consume one bit per pixel */
+                    stipple_reg = (stipple_reg << 1) | (stipple_reg >> 31);
+                    if (!(stipple_reg & 0x80000000u))
+                        goto skip_fb_pixel;
+                }
+            }
+
+            /* --- Depth test --- */
+            if (depth_en) {
+                uint16_t old_d = *(const uint16_t *)(s->fb_mem +
+                                  ((write_addr_aux) & (uint32_t)fb_mask));
+                uint16_t test_d = (p->fbzMode & FBZ_DEPTH_SOURCE)
+                                  ? (uint16_t)(p->zaColor & 0xffffu)
+                                  : new_depth;
+                if (!depth_test(depth_op, test_d, old_d))
+                    goto skip_fb_pixel;
+            }
+
+            /* --- Chroma key --- */
+            if (chroma_en &&
+                wr == (int)p->chromaKey_r &&
+                wg == (int)p->chromaKey_g &&
+                wb == (int)p->chromaKey_b)
+                goto skip_fb_pixel;
+
+            /* --- Fog (uses new_depth as W proxy, ia=alpha for alpha-fog) --- */
+            if (fog_en) {
+                int32_t z_proxy  = (int32_t)new_depth << 12;
+                int32_t ia_proxy = wa << 12;
+                int64_t w_proxy  = new_depth;
+                apply_fog(&wr, &wg, &wb, z_proxy, ia_proxy, w_proxy, p);
+            }
+
+            /* --- Alpha test --- */
+            if (alpha_en) {
+                int   afunc = (int)ALPHA_FUNC(p->alphaMode);
+                int   aref  = (int)ALPHA_REF(p->alphaMode);
+                bool  pass;
+                switch (afunc) {
+                case 0: pass = false;        break;
+                case 1: pass = wa < aref;    break;
+                case 2: pass = wa == aref;   break;
+                case 3: pass = wa <= aref;   break;
+                case 4: pass = wa > aref;    break;
+                case 5: pass = wa != aref;   break;
+                case 6: pass = wa >= aref;   break;
+                default: pass = true;        break;
+                }
+                if (!pass) goto skip_fb_pixel;
+            }
+
+            /* --- Alpha blend --- */
+            if (blend_en) {
+                /* Read destination pixel for blend */
+                uint16_t dst_raw = *(const uint16_t *)(s->fb_mem +
+                                    ((write_addr) & (uint32_t)fb_mask));
+                uint8_t dest_r = (uint8_t)(((dst_raw >> 11) & 0x1fu) * 255u / 31u);
+                uint8_t dest_g = (uint8_t)(((dst_raw >>  5) & 0x3fu) * 255u / 63u);
+                uint8_t dest_b = (uint8_t)((dst_raw & 0x1fu) * 255u / 31u);
+                alpha_blend(&wr, &wg, &wb, wa, dest_r, dest_g, dest_b, 0xff,
+                            p->alphaMode);
+            }
+
+            /* --- Dither & write colour --- */
+            if (rgb_wmask) {
+                if (write_mask & (LFB_WRITE_COLOUR | LFB_WRITE_BOTH)) {
+                    int pr, pg, pb;
+                    if (dither_en) {
+                        int px = (x >> 1) + c, py = y;
+                        if (dither_2x2) {
+                            pr = dither_rb2x2[wr][py & 1][px & 1];
+                            pg = dither_g2x2 [wg][py & 1][px & 1];
+                            pb = dither_rb2x2[wb][py & 1][px & 1];
+                        } else {
+                            pr = dither_rb[wr][py & 3][px & 3];
+                            pg = dither_g [wg][py & 3][px & 3];
+                            pb = dither_rb[wb][py & 3][px & 3];
+                        }
+                    } else {
+                        pr = wr >> 3; pg = wg >> 2; pb = wb >> 3;
+                    }
+                    uint16_t pix = (uint16_t)((pr << 11) | (pg << 5) | pb);
+                    *(uint16_t *)(s->fb_mem + ((write_addr) & (uint32_t)fb_mask)) = pix;
+                }
+            }
+
+            /* --- Write depth --- */
+            if (depth_wmask) {
+                if (write_mask & (LFB_WRITE_DEPTH | LFB_WRITE_BOTH)) {
+                    *(uint16_t *)(s->fb_mem +
+                        ((write_addr_aux) & (uint32_t)fb_mask)) = new_depth;
+                }
+            }
+
+skip_fb_pixel:
+            write_addr     += 2u;
+            write_addr_aux += 2u;
+        }
+
+    } else {
+        /* -------------------------------------------------------------------
+         * Raw write path: no pipeline tests, no blending.
+         * Ported from 86Box voodoo_fb_writel() else branch.
+         * ------------------------------------------------------------------- */
+        for (int c = 0; c < count; c++) {
+            if (write_mask & (LFB_WRITE_COLOUR | LFB_WRITE_BOTH)) {
+                /* Pack to RGB565 — no dither in raw path */
+                int pr = col_r[c] >> 3;
+                int pg = col_g[c] >> 2;
+                int pb = col_b[c] >> 3;
+                *(uint16_t *)(s->fb_mem +
+                    ((write_addr) & (uint32_t)fb_mask)) =
+                    (uint16_t)((pr << 11) | (pg << 5) | pb);
+            }
+            if (write_mask & (LFB_WRITE_DEPTH | LFB_WRITE_BOTH)) {
+                *(uint16_t *)(s->fb_mem +
+                    ((write_addr_aux) & (uint32_t)fb_mask)) = depth_data[c];
+            }
+            write_addr     += 2u;
+            write_addr_aux += 2u;
+        }
+    }
+}
+
+#undef LFB_WRITE_COLOUR
+#undef LFB_WRITE_DEPTH
+#undef LFB_WRITE_BOTH
+#undef EXP5
+#undef EXP6

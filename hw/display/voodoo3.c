@@ -138,6 +138,133 @@
 #include "migration/vmstate.h"
 
 /* -----------------------------------------------------------------------
+ * Screen-filter (scrfilter) — ported from 86Box
+ * voodoo_generate_vb_filters() in vid_voodoo_banshee.c.
+ *
+ * Two 256×256 lookup tables are generated:
+ *
+ *   vb_filter_bx_rb/g  — box pre-filter: blends two horizontally adjacent
+ *       pixels with a threshold-limited contribution (fcr/fcg cap).
+ *
+ *   vb_filter_v1_rb/g  — 4×1 / 2×2 filter: splits the difference between
+ *       two pixel values by ½, clamped to ±fcr/fcg.
+ *
+ * purpleline[]  — per-scanline tint applied to odd rows (R and B channels
+ *       boosted by +4 LSBs, G unchanged), matching 86Box behaviour.
+ *
+ * Call voodoo3_scrfilter_threshold_check() whenever scrfilter_threshold
+ * changes; it regenerates the tables only when the value differs from
+ * the previous call (scrfilter_threshold_old).
+ *
+ * 86Box reference: voodoo_generate_vb_filters(), voodoo_threshold_check()
+ * ----------------------------------------------------------------------- */
+
+static void
+voodoo3_generate_vb_filters(Voodoo3State *s, int fcr, int fcg)
+{
+    /* Box pre-filter (vb_filter_bx_*): threshold-limited neighbour blend */
+    for (int g = 0; g < 256; g++) {
+        for (int h = 0; h < 256; h++) {
+            float difference = (float)(g - h);
+            float avg        = g;
+            float avgdiff    = avg - h;
+
+            avgdiff = avgdiff * 0.75f;
+            if (avgdiff < 0)  avgdiff *= -1;
+            if (difference < 0) difference *= -1;
+
+            float thiscol  = g;
+            float thiscolg = g;
+
+            if (h > g) {
+                float clr = avgdiff;
+                float clg = avgdiff;
+                if (clr > fcr) clr = fcr;
+                if (clg > fcg) clg = fcg;
+
+                thiscol  = g;
+                thiscolg = g;
+
+                if (thiscol  > g + fcr)        thiscol  = g + fcr;
+                if (thiscolg > g + fcg)         thiscolg = g + fcg;
+                if (thiscol  > g + difference)  thiscol  = g + difference;
+                if (thiscolg > g + difference)  thiscolg = g + difference;
+
+                int ugh = g - h;
+                if (ugh < fcr) thiscol  = h;
+                if (ugh < fcg) thiscolg = h;
+            }
+
+            if (difference > fcr) thiscol  = g;
+            if (difference > fcg) thiscolg = g;
+
+            if (thiscol  < 0)   thiscol  = 0;
+            if (thiscolg < 0)   thiscolg = 0;
+            if (thiscol  > 255) thiscol  = 255;
+            if (thiscolg > 255) thiscolg = 255;
+
+            s->vb_filter_bx_rb[g][h] = (uint8_t)thiscol;
+            s->vb_filter_bx_g [g][h] = (uint8_t)thiscolg;
+        }
+
+        /* purpleline: R and B channels +4, G unchanged */
+        float lined = g + 4;
+        if (lined > 255) lined = 255;
+        s->purpleline[g][0] = (uint16_t)lined; /* R */
+        s->purpleline[g][1] = (uint16_t)g;     /* G */
+        s->purpleline[g][2] = (uint16_t)lined; /* B */
+    }
+
+    /* 4×1 / 2×2 filter (vb_filter_v1_*): split-difference, clamped to fcr/fcg */
+    for (int g = 0; g < 256; g++) {
+        for (int h = 0; h < 256; h++) {
+            float difference = (float)(h - g);
+            float diffg      = difference;
+
+            float thiscol  = g;
+            float thiscolg = g;
+
+            if (difference >  fcr)  difference =  fcr;
+            if (difference < -fcr)  difference = -fcr;
+            if (diffg      >  fcg)  diffg      =  fcg;
+            if (diffg      < -fcg)  diffg      = -fcg;
+
+            thiscol  = g + (difference / 2);
+            thiscolg = g + (diffg      / 2);
+
+            if (thiscol  < 0)   thiscol  = 0;
+            if (thiscol  > 255) thiscol  = 255;
+            if (thiscolg < 0)   thiscolg = 0;
+            if (thiscolg > 255) thiscolg = 255;
+
+            s->vb_filter_v1_rb[g][h] = (uint8_t)thiscol;
+            s->vb_filter_v1_g [g][h] = (uint8_t)thiscolg;
+        }
+    }
+}
+
+/*
+ * voodoo3_scrfilter_threshold_check — regenerate filter tables when the
+ * scrfilter_threshold register changes.  Mirrors 86Box voodoo_threshold_check().
+ */
+static void
+voodoo3_scrfilter_threshold_check(Voodoo3State *s)
+{
+    if (!s->scrfilter_enabled)
+        return;
+
+    if (s->scrfilter_threshold == s->scrfilter_threshold_old)
+        return;
+
+    s->scrfilter_threshold_old = s->scrfilter_threshold;
+
+    int fcr = (s->scrfilter_threshold >> 16) & 0xFF; /* R cap */
+    int fcg = (s->scrfilter_threshold >>  8) & 0xFF; /* G cap (also used for B) */
+
+    voodoo3_generate_vb_filters(s, fcr, fcg);
+}
+
+/* -----------------------------------------------------------------------
  * EDID template — 1024x768 @ 75 Hz, 35 x 20 cm display.
  * Byte [127] checksum is patched at runtime by voodoo3_edid_init().
  * ----------------------------------------------------------------------- */
@@ -1379,7 +1506,20 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         if (s->display_enabled)
             memset(s->dirty_line, 1, sizeof(s->dirty_line));
         break;
-    case Video_maxRgbDelta: /* filter threshold — ignored for now */ break;
+    case Video_maxRgbDelta:
+        /*
+         * Screen-filter threshold register — ported from 86Box banshee_ext_outl()
+         * case Video_maxRgbDelta in vid_voodoo_banshee.c.
+         *
+         * Bits [23:16] = R delta cap (fcr), [15:8] = G cap (fcg), [7:0] = B cap.
+         * Writing 0 disables the filter; any non-zero value enables it and
+         * triggers regeneration of the vb_filter_* lookup tables via
+         * voodoo3_scrfilter_threshold_check().
+         */
+        s->scrfilter_threshold = val;
+        s->scrfilter_enabled   = (val != 0);
+        voodoo3_scrfilter_threshold_check(s);
+        break;
     case Video_hwCurPatAddr:
         s->hwCurPatAddr = val;
         s->cur_pat_addr = val & 0xfffff0u;
@@ -2001,6 +2141,27 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
                     s->params.tmu[1].texBaseAddr, s->params.tmu[1].texBaseAddr1,
                     s->params.tmu[1].texBaseAddr2, s->params.tmu[1].texBaseAddr38,
                     s->params.tmu[1].tformat);
+            }
+            return;
+        case 0x308u: /* tDetail — detail texture blend parameters */
+            /*
+             * Ported from 86Box vid_voodoo_reg.c SST_tDetail handler.
+             * Bits [7:0]   = detail_max   — blend factor ceiling (0..255)
+             * Bits [13:8]  = detail_bias  — LOD subtrahend (0..63)
+             * Bits [16:14] = detail_scale — left-shift for factor (0..7)
+             *
+             * Used by CC_MSELECT_DETAIL / CCA_MSELECT_DETAIL in the
+             * colour-combine path (voodoo3_render.c).
+             */
+            if (chip & 0x2) {
+                s->params.detail_max[0]   = (int)(val & 0xffu);
+                s->params.detail_bias[0]  = (int)((val >> 8) & 0x3fu);
+                s->params.detail_scale[0] = (int)((val >> 14) & 0x7u);
+            }
+            if (chip & 0x4) {
+                s->params.detail_max[1]   = (int)(val & 0xffu);
+                s->params.detail_bias[1]  = (int)((val >> 8) & 0x3fu);
+                s->params.detail_scale[1] = (int)((val >> 14) & 0x7u);
             }
             return;
         case 0x30cu: /* texBaseAddr */
@@ -5048,6 +5209,18 @@ static void *voodoo3_render_thread(void *arg)
                 if (type == FIFO_WRITEL_TEX) {
                     int tmu = (cmd & 0x200000u) ? 1 : 0;
                     voodoo3_tex_download(s, cmd, val, tmu);
+                } else if (type == FIFO_WRITEL_FB) {
+                    /*
+                     * LFB pixel-write routed through the 3D pipeline.
+                     * Produced by lfbMode-writes and CMDFIFO packet-5 type-2.
+                     * Ported from 86Box vid_voodoo_fifo.c FIFO_WRITEL_FB case,
+                     * which calls voodoo_fb_writel().
+                     *
+                     * cmd[22:0] is the framebuffer byte address
+                     * (FIFO_WRITEL_FB already masks the type bits off, leaving
+                     * addr & 0xfffffc in the lower 23 bits of cmd).
+                     */
+                    voodoo3_fb_writel(s, cmd & 0x00ffffffu, val);
                 }
             }
 

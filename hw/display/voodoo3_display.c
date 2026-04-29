@@ -461,6 +461,95 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
     }
 
     if (dirty_lo <= dirty_hi) {
+        /*
+         * Screen-filter (scrfilter) post-process — ported from 86Box
+         * banshee_overlay_draw() VIDPROCCFG_FILTER_MODE_DITHER_4X4 path in
+         * vid_voodoo_banshee.c, and voodoo_filterline_v1() in
+         * vid_voodoo_display.c.
+         *
+         * Applied to the desktop portion of every dirty scanline when
+         * scrfilter_enabled is set (Video_maxRgbDelta != 0).  The filter
+         * works entirely in 24-bit RGB space, so we expand each pixel to
+         * R/G/B before filtering and pack it back afterwards.
+         *
+         * Two passes per scanline:
+         *   1. Odd rows: apply purpleline tint (R/B +4 LSBs via LUT).
+         *   2. All rows: horizontal box/v1 filter using vb_filter_v1_rb/g
+         *      LUTs to blend each pixel with its left neighbour.
+         *
+         * Only 4-byte (RGBA8) and 3-byte (RGB24) destination formats are
+         * filtered; 2-byte (RGB565) is left as-is (acceptable approximation).
+         *
+         * 86Box reference: banshee_overlay_draw() lines ~2843–2895,
+         *                  voodoo_filterline_v1() in vid_voodoo_display.c.
+         */
+        if (s->scrfilter_enabled && dst_bpp >= 3) {
+            /* Scratchpad: two rows of RGB triplets, max 4096 pixels wide */
+            static uint8_t fil [4096 * 3];
+            static uint8_t fil3[4096 * 3];
+
+            for (int y = dirty_lo; y <= dirty_hi; y++) {
+                uint8_t *dst_row = dst_base + (size_t)y * dst_pitch;
+
+                /* Unpack scanline to fil[] in B/G/R order */
+                for (int x = 0; x < w; x++) {
+                    if (dst_bpp == 4) {
+                        uint32_t px;
+                        memcpy(&px, dst_row + x * 4, 4);
+                        fil[x * 3 + 0] =  px        & 0xff; /* B */
+                        fil[x * 3 + 1] = (px >>  8) & 0xff; /* G */
+                        fil[x * 3 + 2] = (px >> 16) & 0xff; /* R */
+                    } else { /* dst_bpp == 3 */
+                        fil[x * 3 + 0] = dst_row[x * 3 + 0]; /* B */
+                        fil[x * 3 + 1] = dst_row[x * 3 + 1]; /* G */
+                        fil[x * 3 + 2] = dst_row[x * 3 + 2]; /* R */
+                    }
+                    fil3[x * 3 + 0] = fil[x * 3 + 0];
+                    fil3[x * 3 + 1] = fil[x * 3 + 1];
+                    fil3[x * 3 + 2] = fil[x * 3 + 2];
+                }
+
+                /* Pass 1: odd-scanline tint via purpleline LUT */
+                if (y & 1) {
+                    for (int x = 0; x < w; x++) {
+                        fil[x * 3 + 0] = (uint8_t)s->purpleline[fil[x * 3 + 0]][2]; /* B→ch2 */
+                        fil[x * 3 + 1] = (uint8_t)s->purpleline[fil[x * 3 + 1]][1]; /* G→ch1 */
+                        fil[x * 3 + 2] = (uint8_t)s->purpleline[fil[x * 3 + 2]][0]; /* R→ch0 */
+                    }
+                }
+
+                /* Pass 2: horizontal neighbour blend with vb_filter_v1_* LUTs.
+                 * fil3 holds the previous (left) pixel; we update fil in place
+                 * using the same two-buffer scheme as 86Box voodoo_filterline_v1().
+                 */
+                for (int x = 1; x < w; x++) {
+                    fil3[x * 3 + 0] = s->vb_filter_v1_rb[fil[x*3+0]][fil3[(x-1)*3+0]];
+                    fil3[x * 3 + 1] = s->vb_filter_v1_g [fil[x*3+1]][fil3[(x-1)*3+1]];
+                    fil3[x * 3 + 2] = s->vb_filter_v1_rb[fil[x*3+2]][fil3[(x-1)*3+2]];
+                }
+                for (int x = 1; x < w; x++) {
+                    fil[x * 3 + 0] = s->vb_filter_v1_rb[fil[x*3+0]][fil3[(x-1)*3+0]];
+                    fil[x * 3 + 1] = s->vb_filter_v1_g [fil[x*3+1]][fil3[(x-1)*3+1]];
+                    fil[x * 3 + 2] = s->vb_filter_v1_rb[fil[x*3+2]][fil3[(x-1)*3+2]];
+                }
+
+                /* Pack fil[] back into dst_row */
+                for (int x = 0; x < w; x++) {
+                    if (dst_bpp == 4) {
+                        uint32_t px = 0xff000000u
+                                    | ((uint32_t)fil[x*3+2] << 16)
+                                    | ((uint32_t)fil[x*3+1] <<  8)
+                                    |  (uint32_t)fil[x*3+0];
+                        memcpy(dst_row + x * 4, &px, 4);
+                    } else {
+                        dst_row[x * 3 + 0] = fil[x * 3 + 0];
+                        dst_row[x * 3 + 1] = fil[x * 3 + 1];
+                        dst_row[x * 3 + 2] = fil[x * 3 + 2];
+                    }
+                }
+            }
+        }
+
         /* Overlay: composite video surface before cursor and screen update */
         voodoo3_overlay_draw(s, dst_base, dst_bpp, dst_pitch,
                              w, dirty_lo, dirty_hi);
@@ -914,17 +1003,74 @@ void voodoo3_overlay_draw(Voodoo3State *s,
 
             uint32_t pixel;
             if (filter == VIDPROCCFG_FILTER_MODE_BILINEAR) {
-                /* Vertical bilinear: blend buf[0][src_xi] and buf[1][src_xi] */
-                uint32_t s0 = s->ov.buf[0][src_xi];
-                uint32_t s1 = s->ov.buf[1][src_xi];
-                unsigned int inv = 0x10000u - y_coeff;
-                int r = (int)((((s0 >> 16) & 0xff) * inv +
-                               ((s1 >> 16) & 0xff) * y_coeff) >> 16);
-                int g = (int)((((s0 >>  8) & 0xff) * inv +
-                               ((s1 >>  8) & 0xff) * y_coeff) >> 16);
-                int b = (int)((( s0        & 0xff) * inv +
-                               ( s1        & 0xff) * y_coeff) >> 16);
-                pixel = (uint32_t)((r << 16) | (g << 8) | b);
+                if (h_scale) {
+                    /*
+                     * Full 2D bilinear — horizontal + vertical interpolation.
+                     * Ported from 86Box banshee_overlay_draw() VIDPROCCFG_FILTER_MODE_BILINEAR
+                     * + VIDPROCCFG_H_SCALE_ENABLE branch in vid_voodoo_banshee.c.
+                     *
+                     * Four samples form a 2×2 neighbourhood:
+                     *   samp0 = buf[0][xi]   — current  line, current  column
+                     *   samp1 = buf[0][xi+1] — current  line, next     column
+                     *   samp2 = buf[1][xi]   — next     line, current  column
+                     *   samp3 = buf[1][xi+1] — next     line, next     column
+                     *
+                     * x_coeff is the sub-pixel horizontal fraction (0..0xffff).
+                     * y_coeff is the sub-pixel vertical   fraction (0..0xffff).
+                     *
+                     * Four bilinear weights (all in 16.16 fixed-point, sum = 1):
+                     *   w0 = (1-x)(1-y),  w1 = x(1-y),  w2 = (1-x)y,  w3 = xy
+                     */
+                    unsigned int x_coeff = (unsigned int)((src_x & 0xfffffu) >> 4);
+                    unsigned int inv_x   = 0x10000u - x_coeff;
+                    unsigned int inv_y   = 0x10000u - y_coeff;
+
+                    unsigned int coeffs[4] = {
+                        (inv_x * inv_y) >> 16,   /* w0: (1-x)(1-y) */
+                        (x_coeff * inv_y) >> 16, /* w1: x(1-y)     */
+                        (inv_x * y_coeff) >> 16, /* w2: (1-x)y     */
+                        (x_coeff * y_coeff) >> 16/* w3: xy         */
+                    };
+
+                    int xi0 = src_xi;
+                    int xi1 = src_xi + 1;
+                    if (xi1 >= 4096) xi1 = 4095;
+
+                    uint32_t samp0 = s->ov.buf[0][xi0];
+                    uint32_t samp1 = s->ov.buf[0][xi1];
+                    uint32_t samp2 = s->ov.buf[1][xi0];
+                    uint32_t samp3 = s->ov.buf[1][xi1];
+
+                    int r = (int)(((samp0 >> 16 & 0xff) * coeffs[0]
+                                 + (samp1 >> 16 & 0xff) * coeffs[1]
+                                 + (samp2 >> 16 & 0xff) * coeffs[2]
+                                 + (samp3 >> 16 & 0xff) * coeffs[3]) >> 16);
+                    int g = (int)(((samp0 >>  8 & 0xff) * coeffs[0]
+                                 + (samp1 >>  8 & 0xff) * coeffs[1]
+                                 + (samp2 >>  8 & 0xff) * coeffs[2]
+                                 + (samp3 >>  8 & 0xff) * coeffs[3]) >> 16);
+                    int b = (int)(((samp0        & 0xff) * coeffs[0]
+                                 + (samp1        & 0xff) * coeffs[1]
+                                 + (samp2        & 0xff) * coeffs[2]
+                                 + (samp3        & 0xff) * coeffs[3]) >> 16);
+                    pixel = (uint32_t)((r << 16) | (g << 8) | b);
+                } else {
+                    /*
+                     * Vertical-only bilinear (no h_scale): blend buf[0][xi]
+                     * and buf[1][xi] using y_coeff.  Matches 86Box non-h_scale
+                     * branch of the same filter mode.
+                     */
+                    uint32_t s0  = s->ov.buf[0][src_xi];
+                    uint32_t s1  = s->ov.buf[1][src_xi];
+                    unsigned int inv = 0x10000u - y_coeff;
+                    int r = (int)((((s0 >> 16) & 0xff) * inv +
+                                   ((s1 >> 16) & 0xff) * y_coeff) >> 16);
+                    int g = (int)((((s0 >>  8) & 0xff) * inv +
+                                   ((s1 >>  8) & 0xff) * y_coeff) >> 16);
+                    int b = (int)((( s0         & 0xff) * inv +
+                                   ( s1         & 0xff) * y_coeff) >> 16);
+                    pixel = (uint32_t)((r << 16) | (g << 8) | b);
+                }
             } else {
                 /* Point / dither: nearest-neighbour */
                 pixel = s->ov.buf[0][src_xi];
