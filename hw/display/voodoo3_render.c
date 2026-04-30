@@ -111,6 +111,8 @@
 #define FOG_Z           (1 << 3)
 #define FOG_ALPHA       (1 << 4)
 #define FOG_CONSTANT    (1 << 5)
+/* FOG_W: both Z and ALPHA bits set — use w>>32 directly (86Box: AFUNC_AOM_COLOR path) */
+#define FOG_W           (FOG_Z | FOG_ALPHA)
 
 /* textureMode */
 #define TEXMODE_PERSP_CORR  (1 << 0)
@@ -459,26 +461,24 @@ static inline bool depth_test(int op, uint16_t new_d, uint16_t old_d)
  * ========================================================================= */
 static inline void alpha_blend(int *r, int *g, int *b, int src_a,
                                 uint8_t dst_r, uint8_t dst_g, uint8_t dst_b,
-                                uint8_t dst_a, uint32_t alphaMode)
+                                uint8_t dst_a, uint32_t alphaMode,
+                                int colbfog_r, int colbfog_g, int colbfog_b)
 {
+    /*
+     * Ported from 86Box ALPHA_BLEND macro (vid_voodoo_render.h).
+     *
+     * Cases 0-5 use a scalar factor (sf_r=sf_g=sf_b).
+     * Cases 6 (AOM_COLOR) and 2 (A_COLOR) need per-channel factors
+     * because the factor is derived from src or dst colour components.
+     * Case 0xf: ASATURATE for src, ACOLORBEFOREFOG for dst.
+     *
+     * Result: src = src*src_factor/256, dst = dst*dst_factor/256, out = src+dst.
+     */
     int src_fn = (int)ALPHA_SRC_FUNC(alphaMode);
     int dst_fn = (int)ALPHA_DST_FUNC(alphaMode);
 
     int sf_r, sf_g, sf_b;
-    int df_r, df_g, df_b;
 
-#define ALPHA_FACTOR(fn, sa, da, c0, c1) \
-    switch (fn) { \
-    case 0:  sf_r = sf_g = sf_b = 0;           break; \
-    case 1:  sf_r = sf_g = sf_b = 0xff;         break; \
-    case 2:  sf_r = sf_g = sf_b = (sa);         break; \
-    case 3:  sf_r = sf_g = sf_b = 0xff - (sa);  break; \
-    case 4:  sf_r = sf_g = sf_b = (da);         break; \
-    case 5:  sf_r = sf_g = sf_b = 0xff - (da);  break; \
-    default: sf_r = sf_g = sf_b = 0xff;         break; \
-    }
-
-    /* Source factor */
     switch (src_fn) {
     case 0:  sf_r = sf_g = sf_b = 0;              break;
     case 1:  sf_r = sf_g = sf_b = 0xff;            break;
@@ -486,10 +486,20 @@ static inline void alpha_blend(int *r, int *g, int *b, int src_a,
     case 3:  sf_r = sf_g = sf_b = 0xff - src_a;    break;
     case 4:  sf_r = sf_g = sf_b = dst_a;           break;
     case 5:  sf_r = sf_g = sf_b = 0xff - dst_a;    break;
-    default: sf_r = sf_g = sf_b = 0xff;            break;
+    case 6:  /* A_COLOR — per-channel: factor = dst_rgb */
+        sf_r = dst_r; sf_g = dst_g; sf_b = dst_b; break;
+    case 7:  /* AOM_COLOR — per-channel: factor = 1 - dst_rgb */
+        sf_r = 0xff - dst_r; sf_g = 0xff - dst_g; sf_b = 0xff - dst_b; break;
+    case 0xf: {
+        /* ASATURATE: factor = min(src_a, 255-dst_a) */
+        int _a = src_a < (0xff - dst_a) ? src_a : (0xff - dst_a);
+        sf_r = sf_g = sf_b = _a; break;
+    }
+    default: sf_r = sf_g = sf_b = 0xff; break;
     }
 
-    /* Destination factor */
+    int df_r, df_g, df_b;
+
     switch (dst_fn) {
     case 0:  df_r = df_g = df_b = 0;              break;
     case 1:  df_r = df_g = df_b = 0xff;            break;
@@ -497,9 +507,14 @@ static inline void alpha_blend(int *r, int *g, int *b, int src_a,
     case 3:  df_r = df_g = df_b = 0xff - src_a;    break;
     case 4:  df_r = df_g = df_b = dst_a;           break;
     case 5:  df_r = df_g = df_b = 0xff - dst_a;    break;
-    default: df_r = df_g = df_b = 0;              break;
+    case 6:  /* A_COLOR — per-channel: factor = src_rgb */
+        df_r = *r; df_g = *g; df_b = *b; break;
+    case 7:  /* AOM_COLOR — per-channel: factor = 1 - src_rgb */
+        df_r = 0xff - *r; df_g = 0xff - *g; df_b = 0xff - *b; break;
+    case 0xf: /* ACOLORBEFOREFOG: factor = pre-fog src colour */
+        df_r = colbfog_r; df_g = colbfog_g; df_b = colbfog_b; break;
+    default: df_r = df_g = df_b = 0; break;
     }
-#undef ALPHA_FACTOR
 
     *r = CLAMP(((*r * (sf_r + 1) + dst_r * (df_r + 1)) >> 8));
     *g = CLAMP(((*g * (sf_g + 1) + dst_g * (df_g + 1)) >> 8));
@@ -514,17 +529,52 @@ static inline void apply_fog(int *r, int *g, int *b,
                               int32_t z, int32_t ia, int64_t w,
                               const voodoo3_params_t *p)
 {
+    /*
+     * Ported from 86Box APPLY_FOG macro (vid_voodoo_render.h).
+     *
+     * FOG_CONSTANT: just add fogColor — no fog factor needed.
+     *
+     * Otherwise: compute fog_r/g/b = (fogColor - src) or 0 for ADD,
+     * then multiply by fog_a and apply as ADD or MULT.
+     * The fog_a++ matches 86Box: factor = 0 → 1/256, factor = 255 → 1.0.
+     *
+     * W-based fog (default, bits Z|ALPHA both 0):
+     *   w_depth is a log2-encoded depth; fog table has 64 entries each with
+     *   a .fog byte and a .dfog slope for sub-entry linear interpolation.
+     *   86Box: fog_a = fogTable[idx].fog
+     *                + (fogTable[idx].dfog * ((w_depth >> 2) & 0xff)) >> 10
+     *
+     * FOG_W (bits 3|4 both set, i.e. FOG_Z|FOG_ALPHA): fog_a from w high byte.
+     *   86Box: fog_a = CLAMP((w >> 32) & 0xff)
+     */
     uint32_t fog_mode = p->fogMode;
-    int fog;
 
     if (fog_mode & FOG_CONSTANT) {
-        fog = 0xff;
-    } else if (fog_mode & FOG_Z) {
-        fog = CLAMP(z >> 20);
-    } else if (fog_mode & FOG_ALPHA) {
-        fog = CLAMP(ia >> 12);
+        *r = CLAMP(*r + p->fogColor.r);
+        *g = CLAMP(*g + p->fogColor.g);
+        *b = CLAMP(*b + p->fogColor.b);
+        return;
+    }
+
+    int fog_r, fog_g, fog_b, fog_a;
+
+    if (!(fog_mode & FOG_ADD)) {
+        fog_r = p->fogColor.r;
+        fog_g = p->fogColor.g;
+        fog_b = p->fogColor.b;
     } else {
-        /* W-based fog — lookup table */
+        fog_r = fog_g = fog_b = 0;
+    }
+
+    if (!(fog_mode & FOG_MULT)) {
+        fog_r -= *r;
+        fog_g -= *g;
+        fog_b -= *b;
+    }
+
+    switch (fog_mode & (FOG_Z | FOG_ALPHA)) {
+    case 0: {
+        /* W-based fog — log-encoded depth + dfog interpolation */
         int w_depth;
         if (w & 0xffff00000000LL)
             w_depth = 0;
@@ -538,25 +588,35 @@ static inline void apply_fog(int *r, int *g, int *b,
         }
         unsigned idx = (unsigned)w_depth >> 10;
         if (idx >= 64) idx = 63;
-        fog = p->fogTable[idx].fog;
+        fog_a = p->fogTable[idx].fog
+              + ((p->fogTable[idx].dfog * ((w_depth >> 2) & 0xff)) >> 10);
+        break;
+    }
+    case FOG_Z:
+        fog_a = (z >> 20) & 0xff;
+        break;
+    case FOG_ALPHA:
+        fog_a = CLAMP(ia >> 12);
+        break;
+    default: /* FOG_Z | FOG_ALPHA = FOG_W */
+        fog_a = CLAMP((int)((w >> 32) & 0xff));
+        break;
     }
 
-    int fog_r = p->fogColor.r;
-    int fog_g = p->fogColor.g;
-    int fog_b = p->fogColor.b;
+    fog_a++;  /* 0→1/256, 255→1.0  (matches 86Box fog_a++) */
 
-    if (fog_mode & FOG_ADD) {
+    fog_r = (fog_r * fog_a) >> 8;
+    fog_g = (fog_g * fog_a) >> 8;
+    fog_b = (fog_b * fog_a) >> 8;
+
+    if (fog_mode & FOG_MULT) {
+        *r = CLAMP(fog_r);
+        *g = CLAMP(fog_g);
+        *b = CLAMP(fog_b);
+    } else {
         *r = CLAMP(*r + fog_r);
         *g = CLAMP(*g + fog_g);
         *b = CLAMP(*b + fog_b);
-    } else if (fog_mode & FOG_MULT) {
-        *r = CLAMP((*r * fog) >> 8);
-        *g = CLAMP((*g * fog) >> 8);
-        *b = CLAMP((*b * fog) >> 8);
-    } else {
-        *r = CLAMP(*r + (((fog_r - *r) * fog) >> 8));
-        *g = CLAMP(*g + (((fog_g - *g) * fog) >> 8));
-        *b = CLAMP(*b + (((fog_b - *b) * fog) >> 8));
     }
 }
 
@@ -997,6 +1057,11 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                 if (cca_invert) { src_a ^= 0xff; }
 
                 /* --- Fog --- */
+                /*
+                 * Capture pre-fog colour for ACOLORBEFOREFOG alpha-blend mode.
+                 * 86Box saves src_r/g/b before APPLY_FOG as colbfog_r/g/b.
+                 */
+                int colbfog_r = src_r, colbfog_g = src_g, colbfog_b = src_b;
                 if (fog_en)
                     apply_fog(&src_r, &src_g, &src_b,
                               st->z, st->ia, st->w, p);
@@ -1022,7 +1087,8 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                 /* --- Alpha blend --- */
                 if (blend_en)
                     alpha_blend(&src_r, &src_g, &src_b, src_a,
-                                dest_r, dest_g, dest_b, dest_a, alm);
+                                dest_r, dest_g, dest_b, dest_a, alm,
+                                colbfog_r, colbfog_g, colbfog_b);
 
                 /* --- Dither & pack to RGB565 --- */
                 if (dither_en) {
@@ -1524,7 +1590,7 @@ void voodoo3_fb_writel(Voodoo3State *s, uint32_t addr, uint32_t val)
                 uint8_t dest_g = (uint8_t)(((dst_raw >>  5) & 0x3fu) * 255u / 63u);
                 uint8_t dest_b = (uint8_t)((dst_raw & 0x1fu) * 255u / 31u);
                 alpha_blend(&wr, &wg, &wb, wa, dest_r, dest_g, dest_b, 0xff,
-                            p->alphaMode);
+                            p->alphaMode, wr, wg, wb);
             }
 
             /* --- Dither & write colour --- */

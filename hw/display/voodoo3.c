@@ -352,14 +352,8 @@ static void voodoo3_ddc_update(Voodoo3State *s, uint32_t newval)
     int scl_prev = i2c->scl_last;
     int sda_prev = i2c->sda_last;
 
-    fprintf(stderr,
-            "voodoo3 DDC write: val=0x%08x EN=%d SCL=%d->%d SDA=%d->%d state=%d\n",
-            newval, 1, scl_prev, scl, sda_prev, sda, i2c->state);
-
     /* START: SDA falls while SCL high */
     if (scl && scl_prev && !sda && sda_prev) {
-        fprintf(stderr, "voodoo3 DDC: START condition (state was %d)\n",
-                i2c->state);
         i2c->state     = I2C_RECV_ADDR;
         i2c->bit_count = 0;
         i2c->shift_reg = 0;
@@ -368,7 +362,6 @@ static void voodoo3_ddc_update(Voodoo3State *s, uint32_t newval)
     }
     /* STOP: SDA rises while SCL high */
     if (scl && scl_prev && sda && !sda_prev) {
-        fprintf(stderr, "voodoo3 DDC: STOP condition\n");
         i2c->state   = I2C_IDLE;
         i2c->sda_out = 1;
         goto done;
@@ -384,9 +377,6 @@ static void voodoo3_ddc_update(Voodoo3State *s, uint32_t newval)
                 i2c->bit_count = 0;
                 i2c->shift_reg = 0;
                 if (i2c->addr == 0x50) {
-                    fprintf(stderr,
-                            "voodoo3 DDC: addr=0x%02x R/W=%d -> ACK\n",
-                            i2c->addr, (int)(raw & 1));
                     i2c->sda_out = 0;  /* ACK */
                     if (raw & 1) {
                         /*
@@ -406,9 +396,6 @@ static void voodoo3_ddc_update(Voodoo3State *s, uint32_t newval)
                         i2c->state = I2C_SEND_ACK;
                     }
                 } else {
-                    fprintf(stderr,
-                            "voodoo3 DDC: addr=0x%02x not us -> NAK\n",
-                            i2c->addr);
                     i2c->state   = I2C_IDLE;
                     i2c->sda_out = 1;  /* NAK */
                 }
@@ -429,10 +416,6 @@ static void voodoo3_ddc_update(Voodoo3State *s, uint32_t newval)
                 i2c->shift_reg = 0;
                 i2c->state     = I2C_SEND_ACK2;
                 i2c->sda_out   = 0;   /* ACK */
-                fprintf(stderr,
-                        "voodoo3 DDC: register offset=0x%02x -> ACK, "
-                        "will send EDID from byte %d\n",
-                        i2c->data_idx, i2c->data_idx);
             }
             break;
         case I2C_SEND_ACK2:
@@ -440,9 +423,6 @@ static void voodoo3_ddc_update(Voodoo3State *s, uint32_t newval)
             i2c->state     = I2C_SEND_DATA;
             i2c->bit_count = 0;
             i2c->shift_reg = edid[i2c->data_idx];
-            fprintf(stderr,
-                    "voodoo3 DDC: sending EDID[%d]=0x%02x\n",
-                    i2c->data_idx, edid[i2c->data_idx]);
             break;
         case I2C_SEND_DATA:
             i2c->sda_out   = (i2c->shift_reg >> 7) & 1;
@@ -461,15 +441,8 @@ static void voodoo3_ddc_update(Voodoo3State *s, uint32_t newval)
                 i2c->sda_out   = (i2c->shift_reg >> 7) & 1;
                 i2c->shift_reg <<= 1;
                 i2c->bit_count = 1;
-                fprintf(stderr,
-                        "voodoo3 DDC: master ACK, sending EDID[%d]=0x%02x\n",
-                        i2c->data_idx, edid[i2c->data_idx]);
             } else {
                 /* NAK: done */
-                fprintf(stderr,
-                        "voodoo3 DDC: master NAK after EDID[%d], "
-                        "transaction complete\n",
-                        i2c->data_idx);
                 i2c->state   = I2C_IDLE;
                 i2c->sda_out = 1;
             }
@@ -1951,13 +1924,22 @@ static uint32_t voodoo3_ext_read(Voodoo3State *s, uint32_t addr)
             /* DDA_R (bit 22) = SDA driven by our DDC state machine */
             if (s->ddc.sda_out)  v |= (1u << 22);
         }
-        fprintf(stderr,
-                "voodoo3 DDC read: state=%d sda_out=%d "
-                "SCL_w=%d SDA_w=%d SCL_r=%d SDA_r=%d ret=0x%08x\n",
-                s->ddc.state, s->ddc.sda_out,
-                !!(v & (1u << 19)), !!(v & (1u << 20)),
-                !!(v & (1u << 21)), !!(v & (1u << 22)),
-                v);
+        /*
+         * Secondary I²C bus readback (bits 26-27).
+         * Ported from 86Box banshee_ext_inl() Video_vidSerialParallelPort:
+         *   if (I2C_EN) { SCK_R = i2c_gpio_get_scl(); SDA_R = i2c_gpio_get_sda(); }
+         *
+         * We share the DDC state machine on this bus (same EDID served on both),
+         * so s->ddc.sda_out is the correct SDA read-back value.
+         * SCK_R is a loopback of SCK_W (bit 24), matching 86Box i2c_gpio_get_scl()
+         * behaviour when the host drives the clock (open-drain, no clock stretching).
+         */
+        if (v & (1u << 23)) {   /* I2C_EN */
+            /* SCK_R (bit 26) = loopback of SCK_W (bit 24) */
+            if (v & (1u << 24)) v |= (1u << 26);
+            /* SDA_R (bit 27) = SDA driven by secondary I²C state machine */
+            if (s->ddc.sda_out)  v |= (1u << 27);
+        }
         return v;
     }
     /* Ext_miscInit2 */
@@ -2684,7 +2666,6 @@ static inline void blt_plot(Voodoo3State *s, int x, int y,
                              uint32_t src, int src_ck_fmt)
 {
     voodoo3_blt_t *blt = &s->blt;
-    uint8_t rop8 = (uint8_t)(blt->command >> 24);
 
     switch (blt->dstFormat & DST_FORMAT_COL_MASK) {
     case DST_FORMAT_COL_8_BPP: {
@@ -2734,7 +2715,6 @@ static inline void blt_plot(Voodoo3State *s, int x, int y,
     }
     default: break;
     }
-    (void)rop8;
 }
 
 /* -------------------------------------------------------------------------
@@ -5226,6 +5206,29 @@ static void *voodoo3_render_thread(void *arg)
 
             /* Process VRAM CMDFIFO0 */
             voodoo3_process_cmdfifo(s);
+
+            /*
+             * CMDFIFO1 (AGP ring buffer) — process if enabled and non-empty.
+             *
+             * 86Box processes both FIFOs in the same fifo thread.  On PCI
+             * (Pegasos2 / AmigaOS4) CMDFIFO1 is never used by the driver, so
+             * this path is exercised only in AGP configurations.  We reuse the
+             * same packet processor with the FIFO1 base/end/rp/depth fields.
+             *
+             * NOTE: cmdfifo_read_dword() currently reads from FIFO0's ring
+             * and increments cmdfifo_depth_rd (FIFO0).  A full FIFO1 implementation
+             * requires either a parallel read helper that uses the _2 fields,
+             * or a refactor to pass the active FIFO context as a pointer.
+             * For now we drain FIFO1 depth so STATUS never reports "not idle"
+             * when FIFO0 is already empty, avoiding a driver spin on Banshee
+             * boards that initialise CMDFIFO1 even in PCI mode.
+             */
+            if (s->cmdfifo_enabled_2 &&
+                s->cmdfifo_depth_rd_2 != s->cmdfifo_depth_wr_2) {
+                /* Drain: mark all written dwords as consumed. */
+                s->cmdfifo_depth_rd_2 = s->cmdfifo_depth_wr_2;
+                s->cmdfifo_rp_2       = s->cmdfifo_base_2;
+            }
         }
 
         /*
@@ -5255,7 +5258,8 @@ static void *voodoo3_render_thread(void *arg)
             if (s->param_rd[i] < s->param_wr) { all_done = false; break; }
         }
         if (all_done && s->fifo_rd == s->fifo_wr
-            && s->cmdfifo_depth_rd >= s->cmdfifo_depth_wr)
+            && s->cmdfifo_depth_rd  >= s->cmdfifo_depth_wr
+            && s->cmdfifo_depth_rd_2 >= s->cmdfifo_depth_wr_2)
             s->voodoo_busy = false;
     }
     qemu_mutex_unlock(&s->render_lock);

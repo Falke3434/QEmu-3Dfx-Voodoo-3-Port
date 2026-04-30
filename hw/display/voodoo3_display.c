@@ -20,6 +20,7 @@
 #include "hw/display/voodoo3_dither_tables.h"
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
+#include "qemu/bswap.h"
 
 /*
  * Dither tables are now provided by voodoo3_dither_tables.c, which contains
@@ -312,7 +313,7 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                 if (dst_bpp == 4) {
                     uint32_t *dst = (uint32_t *)dst_row;
                     for (int x = 0; x < w; x++) {
-                        uint16_t px = src[x];
+                        uint16_t px = bswap16(src[x]);
                         uint32_t r  = ((px >> 11) & 0x1f); r = (r << 3) | (r >> 2);
                         uint32_t g  = ((px >>  5) & 0x3f); g = (g << 2) | (g >> 4);
                         uint32_t b  =  (px        & 0x1f); b = (b << 3) | (b >> 2);
@@ -357,7 +358,11 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
             {
                 const uint32_t *src = (const uint32_t *)src_row;
                 if (dst_bpp == 4) {
-                    memcpy(dst_row, src, (size_t)w * 4);
+					uint32_t *dst = (uint32_t *)dst_row;
+                    for (int x = 0; x < w; x++) {
+                        dst[x] = bswap32(src[x]);
+                    }
+                    memcpy(dst_row, dst, (size_t)w * 4);
                 } else if (dst_bpp == 3) {
                     uint8_t *dst = dst_row;
                     for (int x = 0; x < w; x++) {

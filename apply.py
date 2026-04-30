@@ -57,7 +57,8 @@ print("=== Copying device files ===")
 for f in ["voodoo3.c", "voodoo3_render.c", "voodoo3_texture.c",
           "voodoo3_display.c", "voodoo3_setup.c",
           "voodoo3_render.h", "voodoo3_texture.h",
-          "voodoo3_display.h", "voodoo3_int.h"]:
+          "voodoo3_display.h", "voodoo3_int.h",
+          "voodoo3_dither_tables.c", "voodoo3_dither_tables.h"]:
     cp(f"hw/display/{f}", f"hw/display/{f}")
 
 cp("include/hw/display/voodoo3.h", "include/hw/display/voodoo3.h")
