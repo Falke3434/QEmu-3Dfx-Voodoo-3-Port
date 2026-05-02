@@ -137,6 +137,9 @@
 #include "ui/pixel_ops.h"
 #include "migration/vmstate.h"
 
+/* Forward declaration — defined in the BAR1 section after cmdfifo_ops. */
+static void voodoo3_cmdfifo_reposition(Voodoo3State *s);
+
 /* -----------------------------------------------------------------------
  * Screen-filter (scrfilter) — ported from 86Box
  * voodoo_generate_vb_filters() in vid_voodoo_banshee.c.
@@ -2860,6 +2863,31 @@ static void blt_update_src_stride_full(Voodoo3State *s)
     }
 }
 
+/* Stride mask: bits[12:0] = stride in bytes (non-tiled)
+ * or number of 128-byte tile columns (tiled). */
+#define DST_FORMAT_STRIDE_MASK     0x1fffu
+#define SRC_FORMAT_STRIDE_MASK_BLT 0x1fffu
+
+static void voodoo3_blt_update_dst_stride(Voodoo3State *s)
+{
+    if (s->blt.dstBaseAddr_tiled)
+        s->blt.dst_stride = s->blt.dstStride =
+            (s->blt.dstFormat & DST_FORMAT_STRIDE_MASK) * 128u * 32u;
+    else
+        s->blt.dst_stride = s->blt.dstStride =
+            s->blt.dstFormat & DST_FORMAT_STRIDE_MASK;
+}
+
+static void voodoo3_blt_update_src_stride(Voodoo3State *s)
+{
+    if (s->blt.srcBaseAddr_tiled)
+        s->blt.src_stride = s->blt.srcStride =
+            (s->blt.srcFormat & SRC_FORMAT_STRIDE_MASK_BLT) * 128u * 32u;
+    else
+        s->blt.src_stride = s->blt.srcStride =
+            s->blt.srcFormat & SRC_FORMAT_STRIDE_MASK_BLT;
+}
+
 /* -------------------------------------------------------------------------
  * do_screen_to_screen_line — blit one scan line with full ROP/pattern/clip
  * Ported from 86Box do_screen_to_screen_line()
@@ -3113,6 +3141,79 @@ static void blt_do_rectfill(Voodoo3State *s)
 {
     voodoo3_blt_t *blt  = &s->blt;
     v3_clip_t     *clip = &blt->clip[(blt->command & COMMAND_CLIP_SEL) ? 1 : 0];
+
+    uint8_t  rop8    = (uint8_t)(blt->command >> 24);
+    bool     no_ck   = !(blt->commandExtra &
+                         (CMDEXTRA_SRC_COLORKEY | CMDEXTRA_DST_COLORKEY));
+    bool     no_tp   = !((blt->command & (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO))
+                         == (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO));
+    bool     linear  = !blt->dstBaseAddr_tiled;
+    bool     pos_dir = !(blt->command & (COMMAND_DX | COMMAND_DY));
+    bool     full_clip =
+        (blt->dstX >= clip->x_min &&
+         blt->dstX + blt->dstSizeX <= clip->x_max &&
+         blt->dstY >= clip->y_min &&
+         blt->dstY + blt->dstSizeY <= clip->y_max);
+
+    /*
+     * Fast path: solid colour fill.
+     * ROP=0xF0 (PATCOPY) and ROP=0xCC (SRCCOPY) are both solid fills for
+     * RECTFILL — the Picasso96 Voodoo3 driver always uses 0xCC with colorFore
+     * as the source, which produces the same result as 0xF0.
+     */
+    if ((rop8 == 0xF0 || rop8 == 0xCC) && no_ck && no_tp && linear && pos_dir && full_clip) {
+        int      bpp    = blt->dstBpp;
+        int      bpp_bits = bpp * 8;
+        uint32_t stride = blt->dst_stride;
+        int      w      = blt->dstSizeX;
+        int      h      = blt->dstSizeY;
+        uint32_t color  = blt->colorFore;
+
+        for (int y = 0; y < h; y++) {
+            int abs_y = blt->dstY + y;
+            uint32_t row_off = blt->dstBaseAddr
+                             + (uint32_t)abs_y * stride
+                             + (uint32_t)blt->dstX * bpp;
+            if (row_off + (uint32_t)w * bpp > s->fb_size) break;
+            uint8_t *row = s->fb_mem + row_off;
+
+            switch (bpp_bits) {
+            case 8:
+                memset(row, (uint8_t)color, (size_t)w);
+                break;
+            case 16: {
+                uint16_t c = (uint16_t)color;
+                uint16_t *p = (uint16_t *)row;
+                for (int x = 0; x < w; x++) *p++ = c;
+                break;
+            }
+            case 24: {
+                /* 24bpp: write byte-triplets */
+                uint8_t b0 = (uint8_t) color;
+                uint8_t b1 = (uint8_t)(color >>  8);
+                uint8_t b2 = (uint8_t)(color >> 16);
+                uint8_t *p = row;
+                for (int x = 0; x < w; x++) {
+                    *p++ = b0; *p++ = b1; *p++ = b2;
+                }
+                break;
+            }
+            case 32:
+            default: {
+                uint32_t *p = (uint32_t *)row;
+                for (int x = 0; x < w; x++) *p++ = color;
+                break;
+            }
+            }
+
+            if ((unsigned)abs_y < V3_DIRTY_LINES)
+                s->dirty_line[abs_y] = 1;
+        }
+        blt_end_command(blt);
+        return;
+    }
+
+    /* Slow path: ROP / colorkey / transparent pattern / tiling / clip */
     uint8_t       *pmono = (uint8_t *)blt->colorPattern;
     bool use_pt = ((blt->command & (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO))
                    == (COMMAND_PATTERN_MONO | COMMAND_TRANS_MONO));
@@ -3129,7 +3230,8 @@ static void blt_do_rectfill(Voodoo3State *s)
             for (blt->cur_x = 0; blt->cur_x < blt->dstSizeX; blt->cur_x++) {
                 bool pt = use_pt ? !!(pmask & (1u << (7 - (pat_x & 7)))) : true;
                 if (dst_x >= clip->x_min && dst_x < clip->x_max && pt)
-                    blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, blt->colorFore, BLT_COLORKEY_32);
+                    blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask,
+                             blt->colorFore, BLT_COLORKEY_32);
                 dst_x += (blt->command & COMMAND_DX) ? -1 : 1;
                 pat_x += (blt->command & COMMAND_DX) ? -1 : 1;
             }
@@ -3158,7 +3260,6 @@ static void blt_do_s2s_blt(Voodoo3State *s)
     uint8_t rop8 = (uint8_t)(blt->command >> 24);
     v3_clip_t *clip = &blt->clip[(blt->command & COMMAND_CLIP_SEL) ? 1 : 0];
     bool no_colorkey = !(blt->commandExtra & (CMDEXTRA_SRC_COLORKEY | CMDEXTRA_DST_COLORKEY));
-    bool no_pattern  = !(blt->command & COMMAND_PATTERN_MONO);
     bool same_format = ((blt->srcFormat & SRC_FORMAT_COL_MASK) ==
                         (blt->dstFormat & DST_FORMAT_COL_MASK));
     bool full_clip   = (blt->dstX >= clip->x_min && blt->dstX + blt->dstSizeX <= clip->x_max &&
@@ -3167,7 +3268,13 @@ static void blt_do_s2s_blt(Voodoo3State *s)
     bool x_positive  = !(blt->command & COMMAND_DX);
     bool y_positive  = !(blt->command & COMMAND_DY);
 
-    if (rop8 == 0xCC && no_colorkey && no_pattern && same_format &&
+    /*
+     * Fast path: plain copy (ROP=0xCC = SRCCOPY).
+     * Pattern flags are irrelevant for SRCCOPY — result = src regardless.
+     * The Picasso96 driver always sets COMMAND_PATTERN_MONO even for plain
+     * BltBitMap, which would block this path unnecessarily.
+     */
+    if (rop8 == 0xCC && no_colorkey && same_format &&
         full_clip && no_tiling && x_positive && y_positive) {
 
         int bpp = blt->dstBpp;
@@ -3184,7 +3291,7 @@ static void blt_do_s2s_blt(Voodoo3State *s)
             if (dst_addr + width_bytes > s->fb_size) break;
             memmove(s->fb_mem + dst_addr, s->fb_mem + src_addr, width_bytes);
             int abs_y = blt->dstY + y;
-            if ((uint32_t)abs_y < s->fb_size && abs_y < V3_DIRTY_LINES)
+            if ((unsigned)abs_y < V3_DIRTY_LINES)
                 s->dirty_line[abs_y] = 1;
         }
         blt_end_command(blt);
@@ -3492,6 +3599,15 @@ static void blt_do_launch(Voodoo3State *s)
     blt->old_srcX                = blt->srcX;
     blt->host_data_remainder     = 0;
     blt->host_data_count         = 0;
+
+    /*
+     * Compute all strides here once at launch time instead of eagerly
+     * on every register write. This eliminates 4-5 redundant recomputations
+     * per blit operation and is the primary source of BltBitMap overhead.
+     */
+    voodoo3_blt_update_dst_stride(s);
+    voodoo3_blt_update_src_stride(s);
+    blt_update_src_stride_full(s);
 }
 
 static void voodoo3_blt_execute(Voodoo3State *s)
@@ -3534,6 +3650,9 @@ static void voodoo3_blt_execute(Voodoo3State *s)
         /* H2S: launched by register write — data arrives in launch handler */
         blt->host_data_count = 0;
         blt->cur_y           = 0;
+        /* stride must be ready before first data word arrives */
+        voodoo3_blt_update_dst_stride(s);
+        voodoo3_blt_update_src_stride(s);
         blt_update_src_stride_full(s);
         break;
     case COMMAND_CMD_POLYFILL:
@@ -3544,35 +3663,6 @@ static void voodoo3_blt_execute(Voodoo3State *s)
                       blt->command & COMMAND_CMD_MASK);
         break;
     }
-}
-
-/*
- * Helper: recompute dst_stride from dstBaseAddr tiled flag + dstFormat.
- * Ported from 86Box banshee_blt_write() dstBaseAddr/dstFormat handlers.
- * DST_FORMAT_STRIDE_MASK = bits[12:0] = stride in bytes (non-tiled)
- *                        or number of 128-byte tile columns (tiled).
- */
-#define DST_FORMAT_STRIDE_MASK  0x1fffu   /* bits[12:0] per 86Box DST_FORMAT_STRIDE_MASK */
-#define SRC_FORMAT_STRIDE_MASK_BLT 0x1fffu /* same for src */
-
-static void voodoo3_blt_update_dst_stride(Voodoo3State *s)
-{
-    if (s->blt.dstBaseAddr_tiled)
-        s->blt.dst_stride = s->blt.dstStride =
-            (s->blt.dstFormat & DST_FORMAT_STRIDE_MASK) * 128u * 32u;
-    else
-        s->blt.dst_stride = s->blt.dstStride =
-            s->blt.dstFormat & DST_FORMAT_STRIDE_MASK;
-}
-
-static void voodoo3_blt_update_src_stride(Voodoo3State *s)
-{
-    if (s->blt.srcBaseAddr_tiled)
-        s->blt.src_stride = s->blt.srcStride =
-            (s->blt.srcFormat & SRC_FORMAT_STRIDE_MASK_BLT) * 128u * 32u;
-    else
-        s->blt.src_stride = s->blt.srcStride =
-            s->blt.srcFormat & SRC_FORMAT_STRIDE_MASK_BLT;
 }
 
 static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
@@ -3694,11 +3784,11 @@ static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         blt->dstBaseAddr       = val & 0xffffffu;
         blt->dstBaseAddr_tiled = val & 0x80000000u;
         blt->dstTiled          = !!(val & 0x80000000u);
-        voodoo3_blt_update_dst_stride(s);
+        /* stride recomputed lazily at launch */
         break;
     case 0x14:
         blt->dstFormat = val;
-        voodoo3_blt_update_dst_stride(s);
+        /* stride recomputed lazily at launch */
         break;
     case 0x18: blt->srcColorkeyMin = val & 0xffffffu; break;
     case 0x1c: blt->srcColorkeyMax = val & 0xffffffu; break;
@@ -3722,8 +3812,7 @@ static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         blt->srcBaseAddr       = val & 0xffffffu;
         blt->srcBaseAddr_tiled = val & 0x80000000u;
         blt->srcTiled          = !!(val & 0x80000000u);
-        voodoo3_blt_update_src_stride(s);
-        blt_update_src_stride_full(s);
+        /* stride recomputed lazily at launch */
         break;
     case 0x38: blt->commandExtra = val; break;
     case 0x3c: blt->lineStipple  = val; break;
@@ -3769,7 +3858,6 @@ static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         break;
     case 0x54:
         blt->srcFormat = val;
-        voodoo3_blt_update_src_stride(s);
         switch (val & SRC_FORMAT_COL_MASK) {
         case SRC_FORMAT_COL_1_BPP:  blt->src_bpp =  1; break;
         case SRC_FORMAT_COL_8_BPP:  blt->src_bpp =  8; break;
@@ -3779,19 +3867,19 @@ static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         case SRC_FORMAT_COL_UYVY:   blt->src_bpp = 32; break;
         default:                     blt->src_bpp = 16; break;
         }
-        blt_update_src_stride_full(s);
+        /* stride recomputed lazily at launch */
         break;
     case 0x58:
         blt->srcSize  = val;
         blt->srcSizeX = blt->srcW = (int)(val & 0x1fffu);
         blt->srcSizeY = blt->srcH = (int)((val >> 16) & 0x1fffu);
-        blt_update_src_stride_full(s);
+        /* stride recomputed lazily at launch */
         break;
     case 0x5c:
         blt->srcXY = val;
         blt->srcX  = ((int32_t)(val << 19)) >> 19;
         blt->srcY  = ((int32_t)(val <<  3)) >> 19;
-        blt_update_src_stride_full(s);
+        /* stride recomputed lazily at launch */
         break;
     case 0x60: blt->colorBack = val; break;
     case 0x64: blt->colorFore = val; break;
@@ -3799,7 +3887,7 @@ static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         blt->dstSize  = val;
         blt->dstSizeX = blt->dstW = (int)(val & 0x1fffu);
         blt->dstSizeY = blt->dstH = (int)((val >> 16) & 0x1fffu);
-        blt_update_src_stride_full(s);
+        /* stride recomputed lazily at launch */
         break;
     case 0x6c:
         blt->dstXY = val;
@@ -3993,6 +4081,7 @@ static void voodoo3_cmd_write(Voodoo3State *s, uint32_t local, uint32_t val)
         s->cmdfifo_base = (val & 0xfffu) << 12;
         s->cmdfifo_end  = s->cmdfifo_base +
                           (((s->cmdfifo_size & 0xffu) + 1u) << 12);
+        voodoo3_cmdfifo_reposition(s);
         break;
     case CMDFIFO_SIZE0:
         s->cmdfifo_size    = val;
@@ -4002,6 +4091,7 @@ static void voodoo3_cmd_write(Voodoo3State *s, uint32_t local, uint32_t val)
         if (!s->cmdfifo_enabled)
             s->cmdfifo_in_sub = 0;
         s->cmdfifo_in_agp  = !!(val & 0x200u);
+        voodoo3_cmdfifo_reposition(s);
         break;
     case CMDFIFO_BUMP0:
         /*
@@ -4212,8 +4302,26 @@ static const MemoryRegionOps voodoo3_mmio_ops = {
 };
 
 /* =========================================================================
- * BAR1: Linear Framebuffer (with tiled address decode)
+ * BAR1: Linear Framebuffer — RAM-backed region + dynamic CMDFIFO overlay
+ *
+ * The bulk of BAR1 is a ram_device_ptr region mapped directly onto fb_mem.
+ * Guest writes go straight to host RAM without a MMIO trap per access,
+ * exactly like hw/display/ati.c's linear_aper.
+ *
+ * The CMDFIFO ring window is a small MMIO subregion (cmdfifo_mmio) layered
+ * on top of lfb_ram at the byte offset the driver programs.  It intercepts
+ * writes to advance depth_wr and wake the render thread — the one side-
+ * effect that cannot be expressed as plain RAM access.
+ *
+ * voodoo3_cmdfifo_reposition() tears down the old subregion and re-adds it
+ * whenever the driver changes CMDFIFO_BASE_ADDR0 or CMDFIFO_SIZE0.
  * ========================================================================= */
+
+/*
+ * Tiled → linear address translation for the tiled LFB aperture.
+ * Used in the CMDFIFO overlay read path and by 86Box-ported 3D code that
+ * still calls into fb_mem directly.
+ */
 static hwaddr voodoo3_untile(Voodoo3State *s, hwaddr addr)
 {
     if (s->tile_stride && addr >= s->tile_base) {
@@ -4229,111 +4337,163 @@ static hwaddr voodoo3_untile(Voodoo3State *s, hwaddr addr)
     return addr;
 }
 
-static uint64_t voodoo3_lfb_read(void *opaque, hwaddr addr, unsigned size)
+/*
+ * CMDFIFO overlay read: the subregion addr is already relative to the start
+ * of cmdfifo_mmio (i.e. 0-based within the CMDFIFO window).  We translate
+ * it to a fb_mem offset by adding cmdfifo_base, then apply the tiling
+ * decode in case the driver placed the ring in a tiled region.
+ */
+static uint64_t voodoo3_cmdfifo_read(void *opaque, hwaddr addr, unsigned size)
 {
     Voodoo3State *s = VOODOO3_PCI(opaque);
     uint64_t      val = 0;
-    addr = voodoo3_untile(s, addr);
-    if (addr + size > s->fb_size) return 0xffffffffffffffffULL;
-    memcpy(&val, s->fb_mem + addr, size);
+    hwaddr phys = voodoo3_untile(s, s->cmdfifo_base + addr);
+    if (phys + size > s->fb_size) {
+        return 0xffffffffffffffffULL;
+    }
+    memcpy(&val, s->fb_mem + phys, size);
     return val;
 }
 
-static void voodoo3_lfb_write(void *opaque, hwaddr addr,
-                              uint64_t data, unsigned size)
+/*
+ * CMDFIFO overlay write.
+ *
+ * addr is 0-based within the cmdfifo_mmio subregion.  We convert to a
+ * fb_mem physical offset by adding cmdfifo_base, commit the data so that
+ * cmdfifo_read_dword() can retrieve it via fb_mem, then run the 86Box
+ * depth_wr accounting that wakes the FIFO worker thread.
+ *
+ * cursor_buf is no longer mirrored here: with a RAM-backed lfb_ram the
+ * guest writes go directly to fb_mem.  The Video_hwCurPatAddr and
+ * Video_hwCurLoc register handlers already re-populate cursor_buf from
+ * fb_mem whenever the driver repositions the cursor sprite.  Any
+ * subsequent writes by the driver to the cursor area go straight to
+ * fb_mem and are picked up by the next Video_hwCurLoc write.
+ */
+static void voodoo3_cmdfifo_write(void *opaque, hwaddr addr,
+                                  uint64_t data, unsigned size)
 {
     Voodoo3State *s = VOODOO3_PCI(opaque);
-    hwaddr phys = voodoo3_untile(s, addr);
-    if (phys + size > s->fb_size) return;
-
-    /*
-     * If this write lands in the cursor pattern area, mirror the raw bytes
-     * into cursor_buf[] BEFORE the QEMU endian layer re-orders them.
-     * The cursor bitmap is 1bpp (8 pixels per byte, MSB first); we must
-     * preserve the byte order as the driver intended, not as QEMU stores it
-     * after applying DEVICE_LITTLE_ENDIAN byte-swapping on big-endian buses.
-     *
-     * We capture the bytes from `data` in the order the driver sent them:
-     * for a 4-byte write on PPC, QEMU delivers data[] already swapped back
-     * to LE, so we can simply copy size bytes from &data at offset phys-base.
-     */
-    if (s->cur_pat_addr && size >= 1) {
-        uint32_t base = s->cur_pat_addr;
-        if (phys >= base && phys + size <= base + 1024u) {
-            uint32_t off = (uint32_t)(phys - base);
-
-            for (unsigned i = 0; i < size && off + i < 1024u; i++)
-                s->cursor_buf[off + i] = (uint8_t)(data >> (i * 8));
-        }
+    hwaddr phys = voodoo3_untile(s, s->cmdfifo_base + addr);
+    if (phys + size > s->fb_size) {
+        return;
     }
 
+    /* Commit to fb_mem so the render thread can read it. */
     memcpy(s->fb_mem + phys, &data, size);
 
     /*
-     * CMDFIFO0 LFB-write detection — ported from 86Box banshee_mem_writel().
+     * CMDFIFO0 depth-counter update — ported from 86Box banshee_mem_writel().
      *
-     * When the driver writes into the CMDFIFO ring-buffer area via the LFB
-     * BAR, hardware automatically advances the depth counter and wakes the
-     * FIFO processor.  Without this, the WinXP 3dfxvs driver fills the ring
-     * via LFB writes, then polls cmdfifo_depth waiting for it to drain, but
-     * depth_wr never advances → permanent spin → STOP 0x000000EA.
+     * The driver fills the ring buffer via LFB (now via this MMIO overlay)
+     * and polls cmdfifo_depth waiting for it to drain.  We must advance
+     * depth_wr and wake the FIFO worker to avoid an infinite spin.
      *
-     * 86Box algorithm (banshee_mem_writel, condensed):
+     * Algorithm (condensed from 86Box banshee_mem_writel):
      *   phys == cmdfifo_base && !holecount  → reset amin/amax, depth_wr++
      *   holecount > 0                        → holecount--;
      *                                          if 0: depth_wr += (amax-amin)>>2
      *   phys == amax+4                        → amax=phys; depth_wr++
      *   else (out-of-order)                  → update amax, set holecount
-     * After any change: wake render/FIFO thread via render_cond.
      */
     if (size == 4 &&
         s->cmdfifo_enabled &&
         s->cmdfifo_base != s->cmdfifo_end) {
         uint32_t phys32 = (uint32_t)phys;
         if (phys32 >= s->cmdfifo_base && phys32 < s->cmdfifo_end) {
-            bool wake = true;
             if (phys32 == s->cmdfifo_base && !s->cmdfifo_holecount) {
                 s->cmdfifo_amin = s->cmdfifo_base;
                 s->cmdfifo_amax = s->cmdfifo_base;
                 s->cmdfifo_depth_wr++;
             } else if (s->cmdfifo_holecount) {
                 s->cmdfifo_holecount--;
-                if (!s->cmdfifo_holecount)
+                if (!s->cmdfifo_holecount) {
                     s->cmdfifo_depth_wr +=
                         (s->cmdfifo_amax - s->cmdfifo_amin) >> 2;
+                }
             } else if (phys32 == s->cmdfifo_amax + 4u) {
                 s->cmdfifo_amin = phys32;
                 s->cmdfifo_amax = phys32;
                 s->cmdfifo_depth_wr++;
             } else {
-                /* Out-of-order write: record range, set hole count */
-                if (phys32 < s->cmdfifo_amin)
+                /* Out-of-order write: record range, set hole count. */
+                if (phys32 < s->cmdfifo_amin) {
                     s->cmdfifo_amin = s->cmdfifo_base - 4u;
+                }
                 s->cmdfifo_amax      = phys32;
                 s->cmdfifo_holecount =
                     (s->cmdfifo_amax - s->cmdfifo_amin) >> 2;
-                if (s->cmdfifo_holecount)
+                if (s->cmdfifo_holecount) {
                     s->cmdfifo_holecount--;
+                }
             }
-            if (wake) {
-                qemu_mutex_lock(&s->render_lock);
-                qemu_cond_broadcast(&s->render_cond);
-                qemu_mutex_unlock(&s->render_lock);
-            }
+            qemu_mutex_lock(&s->render_lock);
+            qemu_cond_broadcast(&s->render_cond);
+            qemu_mutex_unlock(&s->render_lock);
         }
     }
 }
 
-static const MemoryRegionOps voodoo3_lfb_ops = {
-    .read  = voodoo3_lfb_read,
-    .write = voodoo3_lfb_write,
+/*
+ * CMDFIFO MMIO overlay ops.
+ *
+ * min/max_access_size = 4: the CMDFIFO ring is always written as 4-byte
+ * dwords.  QEMU will split any larger guest writes before they arrive here.
+ */
+static const MemoryRegionOps voodoo3_cmdfifo_ops = {
+    .read       = voodoo3_cmdfifo_read,
+    .write      = voodoo3_cmdfifo_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    /* Accept 8-byte guest writes (e.g. 64-bit STQ on PPC/x86-64);
-     * the impl limit tells QEMU to split them into two 4-byte calls
-     * before they reach voodoo3_lfb_write(), which only handles <= 4. */
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-    .impl  = { .min_access_size = 1, .max_access_size = 4 },
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl  = { .min_access_size = 4, .max_access_size = 4 },
 };
+
+/*
+ * voodoo3_cmdfifo_reposition — move the CMDFIFO MMIO overlay.
+ *
+ * Called whenever the driver reprograms CMDFIFO_BASE_ADDR0 or
+ * CMDFIFO_SIZE0.  We tear down the old subregion (if any) and re-add it
+ * at the new byte offset within lfb_ram.
+ *
+ * Must be called with s->render_lock NOT held (memory_region functions
+ * acquire the BQL internally on TCG; on KVM the BQL is already held by
+ * the MMIO dispatch path).
+ *
+ * When cmdfifo_base == cmdfifo_end (i.e. size is zero) or the CMDFIFO is
+ * disabled we simply remove the overlay and do not re-add it.
+ */
+static void voodoo3_cmdfifo_reposition(Voodoo3State *s)
+{
+    uint32_t base = s->cmdfifo_base;
+    uint32_t end  = s->cmdfifo_end;
+    uint32_t size = (end > base) ? (end - base) : 0;
+
+    /* Remove the old subregion if it was registered. */
+    if (s->cmdfifo_mmio_active) {
+        memory_region_del_subregion(&s->lfb_ram, &s->cmdfifo_mmio);
+        s->cmdfifo_mmio_active = false;
+    }
+
+    /* Only re-add when the ring has a non-zero size and fits in fb_mem. */
+    if (size == 0 || (uint64_t)base + size > s->fb_size) {
+        return;
+    }
+
+    /*
+     * Resize the cmdfifo_mmio region to match the new ring size.
+     * memory_region_set_size() is the supported way to resize an
+     * already-initialised region before it is mapped.
+     */
+    memory_region_set_size(&s->cmdfifo_mmio, size);
+
+    /*
+     * Add it back at the new offset with priority 1 so it shadows
+     * the underlying RAM pages for the ring-buffer window only.
+     */
+    memory_region_add_subregion_overlap(&s->lfb_ram, base,
+                                        &s->cmdfifo_mmio, 1);
+    s->cmdfifo_mmio_active = true;
+}
 
 /* =========================================================================
  * BAR2: Legacy I/O — VGA port proxy
@@ -5536,11 +5696,24 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
         PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_32,
         &s->mmio);
 
-    memory_region_init_io(&s->lfb, OBJECT(s), &voodoo3_lfb_ops, s,
-                          "voodoo3-lfb", VOODOO3_LFB_SIZE);
+    memory_region_init_ram_device_ptr(&s->lfb_ram, OBJECT(s),
+                                      "voodoo3-lfb",
+                                      VOODOO3_LFB_SIZE,
+                                      s->fb_mem);
     pci_register_bar(pci_dev, 1,
         PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_32 |
-        PCI_BASE_ADDRESS_MEM_PREFETCH, &s->lfb);
+        PCI_BASE_ADDRESS_MEM_PREFETCH, &s->lfb_ram);
+
+    /*
+     * CMDFIFO overlay: initialise with a placeholder size of 4096 bytes
+     * (one page — the minimum programmable CMDFIFO size).  The region is
+     * NOT added as a subregion yet; voodoo3_cmdfifo_reposition() does that
+     * when the driver programs CMDFIFO_BASE_ADDR0 / CMDFIFO_SIZE0.
+     */
+    memory_region_init_io(&s->cmdfifo_mmio, OBJECT(s),
+                          &voodoo3_cmdfifo_ops, s,
+                          "voodoo3-cmdfifo", 4096);
+    s->cmdfifo_mmio_active = false;
 
     memory_region_init_io(&s->io, OBJECT(s), &voodoo3_io_ops, s,
                           "voodoo3-io", VOODOO3_IO_SIZE);

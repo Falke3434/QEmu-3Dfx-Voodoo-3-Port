@@ -347,7 +347,24 @@ struct Voodoo3State {
     VGACommonState vga;
 
     /* BARs */
-    MemoryRegion mmio, lfb, io;
+    MemoryRegion mmio, io;
+    /*
+     * BAR1: Linear Framebuffer — RAM-backed device region.
+     *
+     * lfb_ram is mapped directly onto fb_mem via
+     * memory_region_init_ram_device_ptr().  Guest reads/writes land in
+     * fb_mem without a MMIO trap per access (same pattern as ATI
+     * linear_aper in hw/display/ati.c).
+     *
+     * cmdfifo_mmio is a small MMIO subregion overlaid on lfb_ram at
+     * whatever byte-offset the driver programmed into CMDFIFO_BASE_ADDR0.
+     * It is repositioned at runtime via voodoo3_cmdfifo_reposition()
+     * whenever the driver changes the ring-buffer location or size.
+     * Priority 1 ensures it shadows the underlying RAM for those pages.
+     */
+    MemoryRegion lfb_ram;          /* RAM-backed, no trap — whole BAR1    */
+    MemoryRegion cmdfifo_mmio;     /* MMIO overlay for CMDFIFO ring window */
+    bool         cmdfifo_mmio_active; /* true when subregion is added      */
 
     /* Native Voodoo3 display console (index 1, used after driver init) */
     QemuConsole  *con;
