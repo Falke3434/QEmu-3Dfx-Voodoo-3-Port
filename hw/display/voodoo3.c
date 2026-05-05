@@ -136,6 +136,7 @@
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
 #include "migration/vmstate.h"
+#include "hw/i2c/i2c.h"
 
 /* Forward declaration — defined in the BAR1 section after cmdfifo_ops. */
 static void voodoo3_cmdfifo_reposition(Voodoo3State *s);
@@ -268,316 +269,80 @@ voodoo3_scrfilter_threshold_check(Voodoo3State *s)
 }
 
 /* -----------------------------------------------------------------------
- * EDID template — 1024x768 @ 75 Hz, 35 x 20 cm display.
- * Byte [127] checksum is patched at runtime by voodoo3_edid_init().
- * ----------------------------------------------------------------------- */
-static const uint8_t voodoo3_edid_template[128] = {
-    0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,  /* header */
-    0x26,0xC7,0x01,0x00,0x00,0x00,0x00,0x00,  /* mfr VDO, product 1 */
-    0x01,0x09,0x01,0x03,                       /* week 1, year 1999, EDID 1.3 */
-    0x80,0x23,0x14,0x78,                       /* digital, 35cm, 20cm, gamma 2.2 */
-    0xEA,0xBC,0xA8,0xA4,0x59,0x4A,0x9C,0x25,
-    0x14,0x50,0x54,0x21,0x08,0x00,            /* established timings */
-    0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,  /* standard timings: none */
-    0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
-    /* DTD1: 1024x768 @ 75 Hz, pixel clock 78.75 MHz */
-    0xBE,0x1E,0x00,0x40,0x31,0x00,0x08,0x01,
-    0x16,0x10,0x60,0x31,0x00,0x7C,0x2A,0x00,
-    0x00,0x00,
-    /* Monitor range limits */
-    0x00,0x00,0x00,0xFD,0x00,
-    0x37,0x4B,0x1E,0x50,0x11,0x00,0x0A,0x20,
-    0x20,0x20,0x20,0x20,0x20,
-    /* Monitor name: VOODOO3 */
-    0x00,0x00,0x00,0xFC,0x00,
-    'V','O','O','D','O','O','3',0x0A,
-    0x20,0x20,0x20,0x20,0x20,
-    /* Serial number */
-    0x00,0x00,0x00,0xFF,0x00,
-    '3','D','F','X','0','0','0','1',
-    0x0A,0x20,0x20,0x20,0x20,
-    0x00,
-    0x00   /* checksum — patched by voodoo3_edid_init() */
-};
-
-static void voodoo3_edid_init(uint8_t *edid)
-{
-    memcpy(edid, voodoo3_edid_template, 128);
-    uint8_t sum = 0;
-    for (int i = 0; i < 127; i++) sum += edid[i];
-    edid[127] = (uint8_t)(0x100u - sum);
-}
-
-/* -----------------------------------------------------------------------
- * voodoo3_ddc_update — I2C bit-bang engine for DDC/EDID.
- * Called on every write to vidSerialParallelPort (0x78).
+ * DDC / I2C — QEMU-native bitbang_i2c bridge.
  *
- * Bit mapping (Voodoo3 datasheet):
- *   Bit 3 (0x008) = SCL driven by host
- *   Bit 1 (0x002) = SDA driven by host
- *   Bit 8 (0x100) = SDA input (device -> host, we drive this)
- *   Bit 2 (0x004) = SCL loopback
+ * The Voodoo3/Banshee exposes two I²C buses via vidSerialParallelPort:
  *
- * I2C START:  SDA falls while SCL high
- * I2C STOP:   SDA rises  while SCL high
- * Data bit:   sampled on rising SCL edge
+ *   DDC bus (EDID):  EN=bit18  SCL_W=bit19  SDA_W=bit20
+ *                              SCL_R=bit21  SDA_R=bit22
+ *   I2C bus (aux):   EN=bit23  SCL_W=bit24  SDA_W=bit25
+ *                              SCL_R=bit26  SDA_R=bit27
+ *
+ * We wire both buses to the same I2CDDC slave (addr 0x50) so that
+ * drivers which probe either bus receive valid EDID data.  This mirrors
+ * how ATI (hw/display/ati.c) bridges its GPIO register bits to the
+ * QEMU bitbang_i2c layer.
+ *
+ * Bit semantics (Banshee datasheet + 86Box banshee_ext_outl):
+ *   When EN=0 the bus is idle; both lines float high (open-drain pull-up).
+ *   When EN=1: SCL = SCL_W,  SDA = SDA_W  (host drives the bus).
+ *   Read-back:  SCL_R = loopback of SCL_W,  SDA_R = slave SDA output.
+ *
+ * Unlike ATI, Voodoo3 has a single EN bit for both SCL and SDA per bus
+ * rather than per-line output-enable bits.  We pass SCL=1/SDA=1 when
+ * EN=0 to emulate the open-drain idle state.
  * ----------------------------------------------------------------------- */
-static void voodoo3_ddc_update(Voodoo3State *s, uint32_t newval)
-{
-    Voodoo3I2C *i2c = &s->ddc;
-    uint8_t    *edid = s->ddc_edid;
-
-    /*
-     * DDC channel enable check (bit 18).
-     * 86Box: i2c_gpio_set() is only called when DDC_EN is set.
-     * Without this gate the state machine runs on every write
-     * including ones with all-zero bit fields → SCL=0 SDA=0 → false STARTs.
-     */
-    if (!(newval & (1u << 18))) {   /* VIDSERIAL_DDC_EN = bit 18 */
-        i2c->sda_out = 1;
-        return;
-    }
-
-    /*
-     * Extract SCL and SDA from the correct bit positions.
-     * 86Box banshee_ext_outl() Video_vidSerialParallelPort:
-     *   i2c_gpio_set(ddc, !!(val & VIDSERIAL_DDC_DCK_W),
-     *                     !!(val & VIDSERIAL_DDC_DDA_W))
-     *
-     *   VIDSERIAL_DDC_DCK_W = (1 << 19)  — SCL driven by host
-     *   VIDSERIAL_DDC_DDA_W = (1 << 20)  — SDA driven by host
-     *
-     * Previous code used bits 3 and 1 which are in the parallel-port
-     * sub-field and never toggled by any DDC driver.
-     */
-    int scl      = !!(newval & (1u << 19));  /* DDC_DCK_W */
-    int sda      = !!(newval & (1u << 20));  /* DDC_DDA_W */
-    int scl_prev = i2c->scl_last;
-    int sda_prev = i2c->sda_last;
-
-    /* START: SDA falls while SCL high */
-    if (scl && scl_prev && !sda && sda_prev) {
-        i2c->state     = I2C_RECV_ADDR;
-        i2c->bit_count = 0;
-        i2c->shift_reg = 0;
-        i2c->sda_out   = 1;
-        goto done;
-    }
-    /* STOP: SDA rises while SCL high */
-    if (scl && scl_prev && sda && !sda_prev) {
-        i2c->state   = I2C_IDLE;
-        i2c->sda_out = 1;
-        goto done;
-    }
-    /* Sample data on rising SCL edge */
-    if (scl && !scl_prev) {
-        switch (i2c->state) {
-        case I2C_RECV_ADDR:
-            i2c->shift_reg = (i2c->shift_reg << 1) | sda;
-            if (++i2c->bit_count == 8) {
-                uint8_t raw    = i2c->shift_reg;
-                i2c->addr      = raw >> 1;
-                i2c->bit_count = 0;
-                i2c->shift_reg = 0;
-                if (i2c->addr == 0x50) {
-                    i2c->sda_out = 0;  /* ACK */
-                    if (raw & 1) {
-                        /*
-                         * READ address (R/W=1): repeated START + 0xA1.
-                         * Skip the register-offset phase (I2C_RECV_REG) and
-                         * go directly to I2C_SEND_ACK2 which will load
-                         * edid[data_idx] and begin streaming EDID bytes.
-                         * data_idx was either set by a preceding RECV_REG
-                         * write or is 0 by default (start of EDID block).
-                         * This matches the WinXP 3dfxvs DDC protocol:
-                         *   START + 0xA0 [+ optional 0x00] +
-                         *   repeated-START + 0xA1 + read 128 bytes.
-                         */
-                        i2c->state = I2C_SEND_ACK2;
-                    } else {
-                        /* WRITE address (R/W=0): receive register offset */
-                        i2c->state = I2C_SEND_ACK;
-                    }
-                } else {
-                    i2c->state   = I2C_IDLE;
-                    i2c->sda_out = 1;  /* NAK */
-                }
-            }
-            break;
-        case I2C_SEND_ACK:
-            i2c->sda_out   = 1;
-            i2c->state     = I2C_RECV_REG;
-            i2c->bit_count = 0;
-            i2c->shift_reg = 0;
-            break;
-        case I2C_RECV_REG:
-            i2c->shift_reg = (i2c->shift_reg << 1) | sda;
-            if (++i2c->bit_count == 8) {
-                i2c->reg       = i2c->shift_reg;
-                i2c->data_idx  = i2c->reg & 0x7F;
-                i2c->bit_count = 0;
-                i2c->shift_reg = 0;
-                i2c->state     = I2C_SEND_ACK2;
-                i2c->sda_out   = 0;   /* ACK */
-            }
-            break;
-        case I2C_SEND_ACK2:
-            i2c->sda_out   = 1;
-            i2c->state     = I2C_SEND_DATA;
-            i2c->bit_count = 0;
-            i2c->shift_reg = edid[i2c->data_idx];
-            break;
-        case I2C_SEND_DATA:
-            i2c->sda_out   = (i2c->shift_reg >> 7) & 1;
-            i2c->shift_reg <<= 1;
-            if (++i2c->bit_count == 8) {
-                i2c->bit_count = 0;
-                i2c->data_idx  = (i2c->data_idx + 1) & 0x7F;
-                i2c->state     = I2C_WAIT_ACK;
-            }
-            break;
-        case I2C_WAIT_ACK:
-            if (!sda) {
-                /* ACK: send next byte */
-                i2c->shift_reg = edid[i2c->data_idx];
-                i2c->state     = I2C_SEND_DATA;
-                i2c->sda_out   = (i2c->shift_reg >> 7) & 1;
-                i2c->shift_reg <<= 1;
-                i2c->bit_count = 1;
-            } else {
-                /* NAK: done */
-                i2c->state   = I2C_IDLE;
-                i2c->sda_out = 1;
-            }
-            break;
-        default:
-            break;
-        }
-    }
-done:
-    i2c->scl_last = scl;
-    i2c->sda_last = sda;
-}
 
 /*
- * voodoo3_i2c_update — secondary I²C bus engine (vidSerial bits 23-27).
+ * voodoo3_vidserial_update — bridge one vidSerialParallelPort bus to
+ * QEMU's bitbang_i2c layer and write the read-back bits back into *reg.
  *
- * The Banshee/V3 exposes TWO independent I²C buses via vidSerialParallelPort
- * (86Box vid_voodoo_banshee.c banshee_ext_outl(), lines 960-961):
- *
- *   DDC bus (EDID read):   EN=bit18  SCL_W=bit19  SDA_W=bit20  SCL_R=bit21  SDA_R=bit22
- *   I2C bus (secondary):   EN=bit23  SCL_W=bit24  SDA_W=bit25  SCL_R=bit26  SDA_R=bit27
- *
- * AmigaOS 3dfxVoodoo.chip / Tequila DDC probe sequence:
- *   1. Probe DDC bus (EN=bit18): addr 0x50 ACK, addr 0x51 NAK → monitor detected
- *   2. Switch to I2C bus (EN=bit23): attempt EDID read at addr 0x50
- *
- * In 86Box, banshee->i2c (the secondary bus) has nothing attached — SDA floats
- * high (open-drain pull-up → NAK).  We serve the SAME EDID on both buses so
- * AmigaOS gets EDID data regardless of which bus it uses for the actual read.
- *
- * State machine is identical to voodoo3_ddc_update(); only the bit positions differ.
+ * @reg     pointer to s->vidSerialParallelPort (modified in place)
+ * @bbi2c   the bitbang_i2c_interface for this bus
+ * @en_bit  bit index of the bus-enable flag  (18 for DDC, 23 for I2C)
+ * @sclw    bit index of SCL write            (19 / 24)
+ * @sdaw    bit index of SDA write            (20 / 25)
+ * @sclr    bit index of SCL read-back        (21 / 26)
+ * @sdar    bit index of SDA read-back        (22 / 27)
  */
-static void voodoo3_i2c_update(Voodoo3State *s, uint32_t newval)
+static void voodoo3_vidserial_update(uint32_t *reg,
+                                     bitbang_i2c_interface *bbi2c,
+                                     int en_bit,
+                                     int sclw, int sdaw,
+                                     int sclr, int sdar)
 {
-    Voodoo3I2C *i2c = &s->ddc;
-    uint8_t    *edid = s->ddc_edid;
+    uint32_t v = *reg;
 
-    if (!(newval & (1u << 23))) {   /* I2C_EN = bit 23 */
-        i2c->sda_out = 1;
-        return;
+    /* Clear the read-back bits — we will rebuild them below */
+    v &= ~((1u << sclr) | (1u << sdar));
+
+    if (!(v & (1u << en_bit))) {
+        /*
+         * Bus disabled: release both lines (open-drain pull-up → 1,1).
+         * This idles the state machine and prevents false START detection
+         * when the driver has not yet asserted EN.
+         */
+        bitbang_i2c_set(bbi2c, BITBANG_I2C_SCL, 1);
+        bitbang_i2c_set(bbi2c, BITBANG_I2C_SDA, 1);
+        /* SCL_R and SDA_R both high when bus is idle */
+        v |= (1u << sclr) | (1u << sdar);
+    } else {
+        bool scl = !!(v & (1u << sclw));
+        bool sda;
+
+        /* Drive SCL first so the state machine sees the correct clock edge */
+        bitbang_i2c_set(bbi2c, BITBANG_I2C_SCL, scl);
+        /* Drive SDA; bitbang_i2c_set returns the slave's SDA output */
+        sda = bitbang_i2c_set(bbi2c, BITBANG_I2C_SDA,
+                              !!(v & (1u << sdaw)));
+
+        /* SCL_R = loopback of SCL_W (no clock stretching) */
+        if (scl) v |= (1u << sclr);
+        /* SDA_R = slave SDA output (EDID data or ACK/NAK) */
+        if (sda) v |= (1u << sdar);
     }
 
-    int scl      = !!(newval & (1u << 24));  /* I2C_SCK_W */
-    int sda      = !!(newval & (1u << 25));  /* I2C_SDA_W */
-    int scl_prev = i2c->scl_last;
-    int sda_prev = i2c->sda_last;
-
-    /* START: SDA falls while SCL high */
-    if (scl && scl_prev && !sda && sda_prev) {
-        i2c->state     = I2C_RECV_ADDR;
-        i2c->bit_count = 0;
-        i2c->shift_reg = 0;
-        i2c->sda_out   = 1;
-        goto i2c_done;
-    }
-    /* STOP: SDA rises while SCL high */
-    if (scl && scl_prev && sda && !sda_prev) {
-        i2c->state   = I2C_IDLE;
-        i2c->sda_out = 1;
-        goto i2c_done;
-    }
-    /* Sample on rising SCL edge */
-    if (scl && !scl_prev) {
-        switch (i2c->state) {
-        case I2C_RECV_ADDR:
-            i2c->shift_reg = (i2c->shift_reg << 1) | sda;
-            if (++i2c->bit_count == 8) {
-                uint8_t raw   = i2c->shift_reg;
-                i2c->addr     = raw >> 1;
-                i2c->bit_count = 0;
-                i2c->shift_reg = 0;
-                if (i2c->addr == 0x50) {
-                    i2c->sda_out = 0;  /* ACK */
-                    i2c->state   = (raw & 1) ? I2C_SEND_ACK2 : I2C_SEND_ACK;
-                } else {
-                    i2c->state   = I2C_IDLE;
-                    i2c->sda_out = 1;  /* NAK — nothing at this address */
-                }
-            }
-            break;
-        case I2C_SEND_ACK:
-            i2c->sda_out   = 1;
-            i2c->state     = I2C_RECV_REG;
-            i2c->bit_count = 0;
-            i2c->shift_reg = 0;
-            break;
-        case I2C_RECV_REG:
-            i2c->shift_reg = (i2c->shift_reg << 1) | sda;
-            if (++i2c->bit_count == 8) {
-                i2c->data_idx  = i2c->shift_reg & 0x7F;
-                i2c->bit_count = 0;
-                i2c->shift_reg = 0;
-                i2c->state     = I2C_SEND_ACK2;
-                i2c->sda_out   = 0;  /* ACK */
-            }
-            break;
-        case I2C_SEND_ACK2:
-            i2c->sda_out   = 1;
-            i2c->state     = I2C_SEND_DATA;
-            i2c->bit_count = 0;
-            i2c->shift_reg = edid[i2c->data_idx];
-            break;
-        case I2C_SEND_DATA:
-            i2c->sda_out   = (i2c->shift_reg >> 7) & 1;
-            i2c->shift_reg <<= 1;
-            if (++i2c->bit_count == 8) {
-                i2c->bit_count = 0;
-                i2c->data_idx  = (i2c->data_idx + 1) & 0x7F;
-                i2c->state     = I2C_WAIT_ACK;
-            }
-            break;
-        case I2C_WAIT_ACK:
-            if (!sda) {
-                /* Master ACK → send next byte */
-                i2c->shift_reg = edid[i2c->data_idx];
-                i2c->state     = I2C_SEND_DATA;
-                i2c->sda_out   = (i2c->shift_reg >> 7) & 1;
-                i2c->shift_reg <<= 1;
-                i2c->bit_count = 1;
-            } else {
-                /* Master NAK → done */
-                i2c->state   = I2C_IDLE;
-                i2c->sda_out = 1;
-            }
-            break;
-        default:
-            break;
-        }
-    }
-i2c_done:
-    i2c->scl_last = scl;
-    i2c->sda_last = sda;
+    *reg = v;
 }
 
 
@@ -1193,14 +958,6 @@ static void voodoo3_pll_update_vblank(Voodoo3State *s)
         timer_mod(s->vblank_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + period_ns);
     }
-
-    qemu_log_mask(LOG_UNIMP,
-        "voodoo3: PLL recalc: pllCtrl0=0x%08x clk_sel=%u "
-        "pixel_clock=%.3f MHz htotal=%d vtotal=%d period=%" PRId64 " ns "
-        "(%.2f Hz)\n",
-        s->pllCtrl0, (s->misc_out >> 2) & 3u,
-        freq / 1e6, htotal, vtotal, period_ns,
-        period_ns > 0 ? 1e9 / (double)period_ns : 0.0);
 }
 
 /* =========================================================================
@@ -1538,8 +1295,17 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
     case Video_hwCurC1: s->cur_c1 = val; break;
     case Video_vidSerialParallelPort:
         s->vidSerialParallelPort = val;
-        voodoo3_ddc_update(s, val);   /* DDC channel: bits 18-22 */
-        voodoo3_i2c_update(s, val);   /* I2C channel: bits 23-27 */
+        /*
+         * Bridge the two I²C buses to QEMU's bitbang_i2c layer.
+         * Each call may modify s->vidSerialParallelPort in place to
+         * update the SCL_R / SDA_R read-back bits.
+         */
+        voodoo3_vidserial_update(&s->vidSerialParallelPort,
+                                 &s->bbi2c_ddc,
+                                 18, 19, 20, 21, 22); /* DDC bus */
+        voodoo3_vidserial_update(&s->vidSerialParallelPort,
+                                 &s->bbi2c_i2c,
+                                 23, 24, 25, 26, 27); /* I2C bus */
         break;
     case Video_vidChromaKeyMin: s->vidChromaKeyMin = val; break;
     case Video_vidChromaKeyMax: s->vidChromaKeyMax = val; break;
@@ -1917,34 +1683,15 @@ static uint32_t voodoo3_ext_read(Voodoo3State *s, uint32_t addr)
      * Previous code used bit 8 for SDA and bit 2 for SCL — both wrong.
      * The Amiga driver reads back bits 21 and 22 to get SCL/SDA state.
      */
-    case Video_vidSerialParallelPort: {
-        uint32_t v = s->vidSerialParallelPort;
-        /* Clear all read-back bits */
-        v &= ~((1u << 21) | (1u << 22) | (1u << 26) | (1u << 27));
-        if (v & (1u << 18)) {   /* DDC_EN */
-            /* DCK_R (bit 21) = loopback of DCK_W (bit 19) */
-            if (v & (1u << 19)) v |= (1u << 21);
-            /* DDA_R (bit 22) = SDA driven by our DDC state machine */
-            if (s->ddc.sda_out)  v |= (1u << 22);
-        }
+    case Video_vidSerialParallelPort:
         /*
-         * Secondary I²C bus readback (bits 26-27).
-         * Ported from 86Box banshee_ext_inl() Video_vidSerialParallelPort:
-         *   if (I2C_EN) { SCK_R = i2c_gpio_get_scl(); SDA_R = i2c_gpio_get_sda(); }
-         *
-         * We share the DDC state machine on this bus (same EDID served on both),
-         * so s->ddc.sda_out is the correct SDA read-back value.
-         * SCK_R is a loopback of SCK_W (bit 24), matching 86Box i2c_gpio_get_scl()
-         * behaviour when the host drives the clock (open-drain, no clock stretching).
+         * The SCL_R / SDA_R read-back bits (21-22 and 26-27) are kept
+         * up-to-date by voodoo3_vidserial_update() on every write, so
+         * we can return the stored register value directly.
+         * This is the same approach used by ATI (ati.c ati_i2c() which
+         * writes the result bits back into the GPIO register on write).
          */
-        if (v & (1u << 23)) {   /* I2C_EN */
-            /* SCK_R (bit 26) = loopback of SCK_W (bit 24) */
-            if (v & (1u << 24)) v |= (1u << 26);
-            /* SDA_R (bit 27) = SDA driven by secondary I²C state machine */
-            if (s->ddc.sda_out)  v |= (1u << 27);
-        }
-        return v;
-    }
+        return s->vidSerialParallelPort;
     /* Ext_miscInit2 */
     case Ext_miscInit2:
         return s->regs[Ext_miscInit2 >> 2];
@@ -5554,11 +5301,11 @@ static void voodoo3_reset_state(Voodoo3State *s)
      * and confuses the START/STOP edge detectors on the first write.
      */
     s->vidSerialParallelPort = (1u << 19) | (1u << 20);  /* DCK_W | DDA_W both high */
-    /* DDC/I2C reset */
-    memset(&s->ddc, 0, sizeof(s->ddc));
-    s->ddc.state   = I2C_IDLE;
-    s->ddc.sda_out = 1;
-    voodoo3_edid_init(s->ddc_edid);
+    /* DDC/I2C buses idle with SCL=1 SDA=1 (open-drain pull-up state) */
+    voodoo3_vidserial_update(&s->vidSerialParallelPort, &s->bbi2c_ddc,
+                             18, 19, 20, 21, 22);
+    voodoo3_vidserial_update(&s->vidSerialParallelPort, &s->bbi2c_i2c,
+                             23, 24, 25, 26, 27);
     /* Overlay reset */
     memset(&s->ov, 0, sizeof(s->ov));
     s->swap_pending  = false;
@@ -5591,9 +5338,6 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
 
     /* PCI IDs */
     pci_set_word(cfg + PCI_VENDOR_ID, PCI_VENDOR_ID_3DFX);
-    qemu_log_mask(LOG_UNIMP,
-        "voodoo3: selected model=%d (is_agp=%d)\n",
-        s->model, s->is_agp);
 
     /* -----------------------------------------------------------------------
      * Device ID
@@ -5603,9 +5347,6 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
     switch (s->model) {
     case VOODOO3_MODEL_BANSHEE:
         pci_set_word(cfg + PCI_DEVICE_ID, PCI_DEVICE_ID_3DFX_BANSHEE);
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: DEVICE_ID = BANSHEE (0x%04x)\n",
-            PCI_DEVICE_ID_3DFX_BANSHEE);
         break;
     case VOODOO3_MODEL_V3_1000:
     case VOODOO3_MODEL_V3_2000:
@@ -5613,9 +5354,6 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
     case VOODOO3_MODEL_V3_3500TV:
     default:
         pci_set_word(cfg + PCI_DEVICE_ID, PCI_DEVICE_ID_3DFX_VOODOO3);
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: DEVICE_ID = VOODOO3 (0x%04x)\n",
-            PCI_DEVICE_ID_3DFX_VOODOO3);
         break;
     }
 
@@ -5633,41 +5371,36 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
     switch (s->model) {
     case VOODOO3_MODEL_BANSHEE:
         pci_set_word(cfg + PCI_SUBSYSTEM_ID, 0x0003);
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: SUBSYSTEM_ID = BANSHEE (0x0003)\n");
         break;
     case VOODOO3_MODEL_V3_1000:
         /* V3-1000 was PCI-only; no AGP variant exists */
         pci_set_word(cfg + PCI_SUBSYSTEM_ID, 0x0052);
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: SUBSYSTEM_ID = V3_1000 PCI (0x0052)\n");
         break;
     case VOODOO3_MODEL_V3_2000:
     {
         uint16_t subid = s->is_agp ? 0x0038u : 0x0030u;
         pci_set_word(cfg + PCI_SUBSYSTEM_ID, subid);
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: SUBSYSTEM_ID = V3_2000 (%s) = 0x%04x\n",
-            s->is_agp ? "AGP" : "PCI", subid);
         break;
     }
     case VOODOO3_MODEL_V3_3500TV:
         /* V3-3500TV was AGP-only; always use AGP subsystem ID */
         pci_set_word(cfg + PCI_SUBSYSTEM_ID, 0x0060);
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: SUBSYSTEM_ID = V3_3500 AGP (0x0060)\n");
         break;
     case VOODOO3_MODEL_V3_3000:
     default:
     {
         uint16_t subid = s->is_agp ? 0x003Cu : 0x003Au;
         pci_set_word(cfg + PCI_SUBSYSTEM_ID, subid);
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: SUBSYSTEM_ID = V3_3000 (%s) = 0x%04x\n",
-            s->is_agp ? "AGP" : "PCI", subid);
         break;
     }
     }
+
+    /* Log final PCI identity once at realize time */
+    qemu_log_mask(LOG_UNIMP,
+        "voodoo3: realize model=%d is_agp=%d device_id=0x%04x subsystem_id=0x%04x\n",
+        s->model, s->is_agp,
+        pci_get_word(cfg + PCI_DEVICE_ID),
+        pci_get_word(cfg + PCI_SUBSYSTEM_ID));
 
     cfg[PCI_LATENCY_TIMER] = 0x40;
 
@@ -5722,6 +5455,37 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
     s->con = graphic_console_init(DEVICE(pci_dev), 0, &voodoo3_gfx_ops, s);
     qemu_console_resize(s->con, 640, 480);
 
+    /* -----------------------------------------------------------------------
+     * DDC / EDID — initialise two bitbang I²C buses sharing one I2CDDC slave.
+     * Follows the same pattern as hw/display/ati.c:
+     *   i2cbus = i2c_init_bus(...)
+     *   bitbang_i2c_init(&s->bbi2c, i2cbus)
+     *   i2c_slave_set_address(I2C_SLAVE(&s->i2cddc), 0x50)
+     *   qdev_realize(DEVICE(&s->i2cddc), BUS(i2cbus), &error_abort)
+     *
+     * Both DDC bus (bits 18-22) and secondary I²C bus (bits 23-27) are
+     * wired to the same EDID slave so any driver that probes either bus
+     * receives valid monitor data.
+     * ----------------------------------------------------------------------- */
+    {
+        I2CBus *ddc_bus = i2c_init_bus(DEVICE(pci_dev), "voodoo3.ddc");
+        I2CBus *i2c_bus = i2c_init_bus(DEVICE(pci_dev), "voodoo3.i2c");
+        bitbang_i2c_init(&s->bbi2c_ddc, ddc_bus);
+        bitbang_i2c_init(&s->bbi2c_i2c, i2c_bus);
+        /* Attach the EDID slave (address 0x50) to the DDC bus */
+        i2c_slave_set_address(I2C_SLAVE(&s->i2cddc), 0x50);
+        qdev_realize(DEVICE(&s->i2cddc), BUS(ddc_bus), &error_abort);
+        /* Attach a second EDID slave to the secondary I²C bus.
+         * Copy the edid_info so both buses advertise the same monitor data.
+         * (DEFINE_EDID_PROPERTIES only populates s->i2cddc.edid_info.) */
+        {
+            I2CDDCState *slave2 = I2CDDC(qdev_new(TYPE_I2CDDC));
+            slave2->edid_info = s->i2cddc.edid_info;
+            i2c_slave_set_address(I2C_SLAVE(slave2), 0x50);
+            qdev_realize(DEVICE(slave2), BUS(i2c_bus), &error_abort);
+        }
+    }
+
     s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, voodoo3_vblank_cb, s);
     timer_mod(s->vblank_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -5764,36 +5528,24 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
     switch (s->model) {
     case VOODOO3_MODEL_BANSHEE:
         s->pllCtrl0 = 0x2907;   /* ~125 MHz */
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: model BANSHEE -> pllCtrl0=0x%04x (~125 MHz)\n",
-            s->pllCtrl0);
         break;
     case VOODOO3_MODEL_V3_1000:
         s->pllCtrl0 = 0x2d07;   /* ~143 MHz */
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: model V3_1000 -> pllCtrl0=0x%04x (~143 MHz)\n",
-            s->pllCtrl0);
         break;
     case VOODOO3_MODEL_V3_2000:
         s->pllCtrl0 = 0x2d07;   /* ~143 MHz */
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: model V3_2000 -> pllCtrl0=0x%04x (~143 MHz)\n",
-            s->pllCtrl0);
         break;
     case VOODOO3_MODEL_V3_3500TV:
         s->pllCtrl0 = 0x3507;   /* ~183 MHz */
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: model V3_3500 -> pllCtrl0=0x%04x (~183 MHz)\n",
-            s->pllCtrl0);
         break;
     case VOODOO3_MODEL_V3_3000:
     default:
         s->pllCtrl0 = 0x3207;   /* ~166 MHz */
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: model V3_3000 -> pllCtrl0=0x%04x (~166 MHz)\n",
-            s->pllCtrl0);
         break;
     }
+    qemu_log_mask(LOG_UNIMP,
+        "voodoo3: power-on pllCtrl0=0x%04x (model=%d)\n",
+        s->pllCtrl0, s->model);
 }
 
 /* =========================================================================
@@ -5893,6 +5645,7 @@ static const Property voodoo3_properties[] = {
     DEFINE_PROP_BOOL("bilinear",   Voodoo3State, bilinear,            true),
     DEFINE_PROP_BOOL("dac-filter", Voodoo3State, dac_filter,          false),
     DEFINE_PROP_UINT32("render-threads", Voodoo3State, render_threads_count, 2),
+    DEFINE_EDID_PROPERTIES(Voodoo3State, i2cddc.edid_info),
 };
 
 static void voodoo3_class_init(ObjectClass *klass, const void *data)
@@ -5915,10 +5668,23 @@ static void voodoo3_class_init(ObjectClass *klass, const void *data)
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
 
+static void voodoo3_instance_init(Object *obj)
+{
+    Voodoo3State *s = VOODOO3_PCI(obj);
+
+    /*
+     * Initialise the I2CDDC child object so that DEFINE_EDID_PROPERTIES
+     * fields are accessible before realize() runs.  The child is realised
+     * (attached to its I²C bus) inside voodoo3_pci_realize().
+     */
+    object_initialize_child(obj, "i2cddc", &s->i2cddc, TYPE_I2CDDC);
+}
+
 static const TypeInfo voodoo3_info = {
     .name          = TYPE_VOODOO3_PCI,
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(Voodoo3State),
+    .instance_init = voodoo3_instance_init,
     .class_init    = voodoo3_class_init,
     .interfaces    = (InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },

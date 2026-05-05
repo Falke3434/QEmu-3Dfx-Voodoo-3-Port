@@ -406,6 +406,20 @@ void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu)
     s->tex_lru[tmu]++;
     v3_tex_cache_entry_t *e = &s->tex_cache[tmu][slot];
 
+    /* Warn if the base address looks uninitialized (driver hasn't uploaded texture yet) */
+    if (cache_addr == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+            "voodoo3: use_texture tmu=%d: base=0 — texture not uploaded yet "
+            "(tLOD=0x%08x tformat=%u); rendering may produce garbage\n",
+            tmu, tp->tLOD, tp->tformat);
+    } else {
+        qemu_log_mask(LOG_UNIMP,
+            "voodoo3: tex cache miss tmu=%d slot=%d base=0x%08x "
+            "tLOD=0x%06x tformat=%u lod_min=%d lod_max=%d ncc=%d\n",
+            tmu, slot, cache_addr, cache_lod, tp->tformat,
+            lod_min, lod_max, is_ncc);
+    }
+
     e->valid   = true;
     e->base    = cache_addr;
     e->tLOD    = cache_lod;

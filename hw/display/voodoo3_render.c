@@ -337,6 +337,13 @@ static inline void tex_read(v3_state_t *st, int s, int t,
     /* tex_ptr is set by voodoo3_use_texture() before triangle is queued */
     const uint32_t *texdata = st->tex[tmu][st->lod];
     if (!texdata) {
+        /* NULL texture pointer — voodoo3_use_texture() was not called or the
+         * texture cache entry was evicted.  Return a mid-grey sentinel so
+         * missing textures are visible without a crash. */
+        qemu_log_mask(LOG_GUEST_ERROR,
+            "voodoo3: tex_read: NULL tex ptr tmu=%d lod=%d — "
+            "texture not loaded, returning grey sentinel\n",
+            tmu, st->lod);
         st->tex_r[tmu] = st->tex_g[tmu] = st->tex_b[tmu] = 0x80;
         st->tex_a[tmu] = 0xff;
         return;
@@ -673,6 +680,70 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
     int cca_rev_blend   = (int)FBZCP_CCA_REVERSE_BLEND(fcp);
     int cca_add         = (int)FBZCP_CCA_ADD(fcp);
     int cca_invert      = (int)FBZCP_CCA_INVERT_OUT(fcp);
+
+    /* -----------------------------------------------------------------------
+     * Debug: verify dither table, render path, and texture pointers.
+     * These fire once per triangle (not per pixel) so overhead is minimal.
+     * ----------------------------------------------------------------------- */
+#ifdef DEBUG_VOODOO3_RENDER
+    /* Dither table sanity: when dither is enabled the tables must be inited */
+    if (dither_en) {
+        /* voodoo3_dither_rb[0][0][0] should never be zero after table init */
+        if (voodoo3_dither_rb[127][3][3] == 0 && voodoo3_dither_rb[1][0][0] == 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                "voodoo3: WARNING dither enabled but dither table looks uninitialised "
+                "(fbzMode=0x%08x dither_2x2=%d dithersub=%d)\n",
+                fbz, dither_2x2, dithersub_en);
+        } else {
+            qemu_log_mask(LOG_UNIMP,
+                "voodoo3: render dither active: fbzMode=0x%08x "
+                "dither_2x2=%d dithersub=%d\n",
+                fbz, dither_2x2, dithersub_en);
+        }
+    }
+
+    /* Render path: log whether texturing is active */
+    qemu_log_mask(LOG_UNIMP,
+        "voodoo3: render tri#%u tex_en=%d dither_en=%d depth_en=%d "
+        "blend_en=%d fog_en=%d alpha_en=%d\n",
+        s->tri_count, tex_en, dither_en, depth_en,
+        blend_en, fog_en, alpha_en);
+
+    /* Texture pointer validation: if tex_en is set, TMU0 pointers must exist */
+    if (tex_en) {
+        bool tmu0_ok = false, tmu1_ok = false;
+        for (int _l = 0; _l <= V3_LOD_MAX; _l++) {
+            if (st->tex[0][_l]) { tmu0_ok = true; break; }
+        }
+        if (!tmu0_ok) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                "voodoo3: tex_en=1 but TMU0 tex pointers all NULL "
+                "(tri#%u textureMode0=0x%08x) — expect black/garbage\n",
+                s->tri_count, p->tmu[0].textureMode);
+        }
+        /* Check TMU1 only when dual-TMU blend is active (passthrough mode off) */
+        if ((p->tmu[0].textureMode & 0x00643000u) != 0x00241000u) {
+            for (int _l = 0; _l <= V3_LOD_MAX; _l++) {
+                if (st->tex[1][_l]) { tmu1_ok = true; break; }
+            }
+            if (!tmu1_ok) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                    "voodoo3: dual-TMU active but TMU1 tex pointers all NULL "
+                    "(tri#%u textureMode1=0x%08x)\n",
+                    s->tri_count, p->tmu[1].textureMode);
+            }
+        }
+    } else if (!tex_en) {
+        /* Sanity: if FBZCP_TEXTURE_ENABLED is clear, CC path must not reference
+         * texture (cc_localselect values 0/1 are safe; value 2 = texture) */
+        if (_rgb_sel == 2) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                "voodoo3: tex_en=0 but fbzColorPath CC_RGBSELECT=2 (texture) "
+                "(fbzColorPath=0x%08x) — output will be undefined\n",
+                fcp);
+        }
+    }
+#endif /* DEBUG_VOODOO3_RENDER */
 
     /* Apply top clip */
     if (clip_en && ystart < p->clipLowY) {

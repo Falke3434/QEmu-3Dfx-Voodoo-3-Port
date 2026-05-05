@@ -12,31 +12,11 @@
 #define HW_DISPLAY_VOODOO3_INT_H
 
 /* -----------------------------------------------------------------------
- * I2C / DDC bit-bang state machine
- * vidSerialParallelPort GPIO: bit3=SCL-out, bit1=SDA-out, bit8=SDA-in
- * We act as DDC EEPROM slave at I2C address 0x50.
+ * I2C / DDC — uses QEMU-native bitbang_i2c + I2CDDC infrastructure,
+ * identical approach to hw/display/ati.c.
  * ----------------------------------------------------------------------- */
-typedef enum {
-    I2C_IDLE = 0,
-    I2C_RECV_ADDR,
-    I2C_SEND_ACK,
-    I2C_RECV_REG,
-    I2C_SEND_ACK2,
-    I2C_SEND_DATA,
-    I2C_WAIT_ACK,
-} Voodoo3I2CState;
-
-typedef struct {
-    Voodoo3I2CState state;
-    uint8_t  shift_reg;
-    int      bit_count;
-    uint8_t  addr;
-    uint8_t  reg;
-    int      data_idx;
-    int      scl_last;
-    int      sda_last;
-    uint8_t  sda_out;
-} Voodoo3I2C;
+#include "hw/i2c/bitbang_i2c.h"
+#include "hw/display/i2c-ddc.h"
 
 /* Maximum LOD level */
 #ifndef V3_LOD_MAX
@@ -698,9 +678,10 @@ struct Voodoo3State {
      *   banshee_recalctimings() and used by svga_recalctimings() to derive   *
      *   the scanline/frame timings.  We skip the scanline granularity and    *
      *   go straight to the full-frame period.                                */
-    /* I2C/DDC state + EDID */
-    Voodoo3I2C           ddc;
-    uint8_t              ddc_edid[128];
+    /* I2C/DDC — QEMU-native bitbang I2C + EDID slave (same as ATI) */
+    bitbang_i2c_interface bbi2c_ddc;   /* DDC bus  (vidSerial bits 18-22) */
+    bitbang_i2c_interface bbi2c_i2c;   /* I2C bus  (vidSerial bits 23-27) */
+    I2CDDCState           i2cddc;
 
     double               pixel_clock_hz;    /* Hz, 0 = use VBLANK_HZ default */
     int64_t              vblank_period_ns;  /* ns per frame, 0 = use default  */
