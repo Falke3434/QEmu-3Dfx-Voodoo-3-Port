@@ -3016,28 +3016,54 @@ static void blt_do_s2s_blt(Voodoo3State *s)
     bool y_positive  = !(blt->command & COMMAND_DY);
 
     /*
-     * Fast path: plain copy (ROP=0xCC = SRCCOPY).
+     * Fast path: plain copy (ROP=0xCC = SRCCOPY), all 4 direction combinations.
      * Pattern flags are irrelevant for SRCCOPY — result = src regardless.
      * The Picasso96 driver always sets COMMAND_PATTERN_MONO even for plain
      * BltBitMap, which would block this path unnecessarily.
+     *
+     * Direction semantics (Picasso96 / Banshee datasheet):
+     *   DX=0 DY=0: srcXY/dstXY = top-left.  Iterate top-to-bottom.
+     *   DX=1 DY=1: srcXY/dstXY = bottom-right. Iterate bottom-to-top.
+     *              This is the OverlappedBlitRect case (scroll down / window drag).
+     *   DX=0 DY=1 or DX=1 DY=0: mixed — handled correctly below.
+     *
+     * memmove() is used per-row so X-overlap within a row is always safe.
+     * Y-overlap is handled by the iteration order (top-to-bottom when dst
+     * is above src, bottom-to-top when dst is below src).
      */
     if (rop8 == 0xCC && no_colorkey && same_format &&
-        full_clip && no_tiling && x_positive && y_positive) {
+        full_clip && no_tiling) {
 
-        int bpp = blt->dstBpp;
-        uint32_t src_stride = blt->src_stride_dest;
-        uint32_t dst_stride = blt->dst_stride;
-        uint32_t width_bytes = (uint32_t)blt->dstSizeX * bpp;
+        int      bpp         = blt->dstBpp;
+        uint32_t src_stride  = blt->src_stride_dest;
+        uint32_t dst_stride  = blt->dst_stride;
+        int      w           = blt->dstSizeX;
+        int      h           = blt->dstSizeY;
+        uint32_t width_bytes = (uint32_t)w * bpp;
 
-        for (int y = 0; y < blt->dstSizeY; y++) {
-            uint32_t src_addr = blt->srcBaseAddr + (uint32_t)(blt->srcY + y) * src_stride
-                              + (uint32_t)blt->srcX * bpp;
-            uint32_t dst_addr = blt->dstBaseAddr + (uint32_t)(blt->dstY + y) * dst_stride
-                              + (uint32_t)blt->dstX * bpp;
+        /*
+         * When DX=1/DY=1 the coordinates point at the bottom-right corner.
+         * Normalise to top-left so address arithmetic is uniform.
+         */
+        int src_x0 = x_positive ? blt->srcX : blt->srcX - (w - 1);
+        int src_y0 = y_positive ? blt->srcY : blt->srcY - (h - 1);
+        int dst_x0 = x_positive ? blt->dstX : blt->dstX - (w - 1);
+        int dst_y0 = y_positive ? blt->dstY : blt->dstY - (h - 1);
+
+        for (int y = 0; y < h; y++) {
+            /* When destination is below source, iterate bottom-to-top to
+             * avoid overwriting source lines before they are copied. */
+            int row = y_positive ? y : (h - 1 - y);
+            uint32_t src_addr = blt->srcBaseAddr
+                              + (uint32_t)(src_y0 + row) * src_stride
+                              + (uint32_t)src_x0 * bpp;
+            uint32_t dst_addr = blt->dstBaseAddr
+                              + (uint32_t)(dst_y0 + row) * dst_stride
+                              + (uint32_t)dst_x0 * bpp;
             if (src_addr + width_bytes > s->fb_size) break;
             if (dst_addr + width_bytes > s->fb_size) break;
             memmove(s->fb_mem + dst_addr, s->fb_mem + src_addr, width_bytes);
-            int abs_y = blt->dstY + y;
+            int abs_y = dst_y0 + row;
             if ((unsigned)abs_y < V3_DIRTY_LINES)
                 s->dirty_line[abs_y] = 1;
         }
