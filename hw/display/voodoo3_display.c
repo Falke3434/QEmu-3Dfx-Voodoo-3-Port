@@ -123,32 +123,79 @@ void voodoo3_fastfill(Voodoo3State *s)
 
     /* --- Colour buffer fill --- */
     if (p->fbzMode & FBZ_RGB_WMASK) {
-        uint8_t r = (uint8_t)(((p->color1 >> 16) & 0xff) >> 3);
-        uint8_t g = (uint8_t)(((p->color1 >>  8) & 0xff) >> 2);
-        uint8_t b = (uint8_t)( (p->color1        & 0xff) >> 3);
-        uint16_t col = (uint16_t)((r << 11) | (g << 5) | b);
+        /*
+         * FIX 3: dispatch on pix_format so 32bpp framebuffers are filled
+         * with 32-bit words rather than 16-bit words.
+         *
+         * pix_format == 3 (RGB32/XRGB8888): write color1 directly as a
+         * 32-bit XRGB value.  The rasterizer stores colour in color1 as
+         * 0x00RRGGBB (same wire format as XRGB8888 with X=0); we set the
+         * X byte to 0xFF so the display output path treats every pixel as
+         * fully opaque, matching hardware behaviour.
+         *
+         * All other formats (0=8bpp palette, 1=RGB565, 2=RGB24) use the
+         * existing 16-bit path which is correct for RGB565 (the only
+         * format the Voodoo3 3D engine writes in tiled mode) and
+         * acceptable for 8bpp (fastfill with palette index from LSB of
+         * color1).
+         */
+        if (s->pix_format == 3) {
+            /* 32bpp fill */
+            uint32_t col32 = 0xff000000u | (p->color1 & 0x00ffffffu);
 
-        for (int y = low_y; y < high_y; y++) {
-            uint16_t *row;
-            if (p->col_tiled)
-                row = (uint16_t *)(s->fb_mem + p->draw_offset
-                      + (size_t)(y >> 5) * p->row_width + (size_t)(y & 31) * 128);
-            else
-                row = (uint16_t *)(s->fb_mem + p->draw_offset
-                      + (size_t)y * p->row_width);
+            for (int y = low_y; y < high_y; y++) {
+                uint32_t *row;
+                if (p->col_tiled)
+                    row = (uint32_t *)(s->fb_mem + p->draw_offset
+                          + (size_t)(y >> 5) * p->row_width
+                          + (size_t)(y & 31) * 128);
+                else
+                    row = (uint32_t *)(s->fb_mem + p->draw_offset
+                          + (size_t)y * p->row_width);
 
-            for (int x = p->clipLeft; x < p->clipRight; x++) {
-                if (p->col_tiled) {
-                    int xt = (x & 63) | ((x >> 6) * 128 * 32 / 2);
-                    row[xt] = col;
-                } else {
-                    row[x] = col;
+                for (int x = p->clipLeft; x < p->clipRight; x++) {
+                    if (p->col_tiled) {
+                        /* 32bpp tiled: 32 pixels per 128-byte strip */
+                        int xt = (x & 31) | ((x >> 5) * 128 * 32 / 4);
+                        row[xt] = col32;
+                    } else {
+                        row[x] = col32;
+                    }
                 }
-            }
 
-            /* Mark dirty if drawing to front buffer */
-            if (p->draw_offset == p->front_offset && y < V3_DIRTY_LINES)
-                s->dirty_line[y] = 1;
+                if (p->draw_offset == p->front_offset && y < V3_DIRTY_LINES)
+                    s->dirty_line[y] = 1;
+            }
+        } else {
+            /* 16bpp (RGB565) and 8bpp fill — original path */
+            uint8_t r = (uint8_t)(((p->color1 >> 16) & 0xff) >> 3);
+            uint8_t g = (uint8_t)(((p->color1 >>  8) & 0xff) >> 2);
+            uint8_t b = (uint8_t)( (p->color1        & 0xff) >> 3);
+            uint16_t col = (uint16_t)((r << 11) | (g << 5) | b);
+
+            for (int y = low_y; y < high_y; y++) {
+                uint16_t *row;
+                if (p->col_tiled)
+                    row = (uint16_t *)(s->fb_mem + p->draw_offset
+                          + (size_t)(y >> 5) * p->row_width
+                          + (size_t)(y & 31) * 128);
+                else
+                    row = (uint16_t *)(s->fb_mem + p->draw_offset
+                          + (size_t)y * p->row_width);
+
+                for (int x = p->clipLeft; x < p->clipRight; x++) {
+                    if (p->col_tiled) {
+                        int xt = (x & 63) | ((x >> 6) * 128 * 32 / 2);
+                        row[xt] = col;
+                    } else {
+                        row[x] = col;
+                    }
+                }
+
+                /* Mark dirty if drawing to front buffer */
+                if (p->draw_offset == p->front_offset && y < V3_DIRTY_LINES)
+                    s->dirty_line[y] = 1;
+            }
         }
     }
 
@@ -358,11 +405,28 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
             {
                 const uint32_t *src = (const uint32_t *)src_row;
                 if (dst_bpp == 4) {
+                    /*
+                     * FIX 4: dst and dst_row alias the same buffer (dst_row
+                     * is the DisplaySurface scanline; dst = (uint32_t *)dst_row).
+                     * The bswap32 loop already writes directly into dst_row, so
+                     * the memcpy(dst_row, dst, w*4) that followed was a no-op
+                     * self-copy and has been removed.
+                     *
+                     * bswap32: the Voodoo3 SGRAM stores pixels in little-endian
+                     * byte order on the host, but a big-endian PPC guest writes
+                     * them in network byte order.  QEMU's DEVICE_LITTLE_ENDIAN
+                     * MemoryRegion swaps every 32-bit word on BE hosts, so by
+                     * the time we read fb_mem the bytes are already host-native.
+                     * We therefore do NOT swap on LE hosts; on BE hosts
+                     * (TARGET_WORDS_BIGENDIAN) the guest wrote in BE and QEMU
+                     * already compensated, so again no swap is needed here.
+                     * The bswap32 was incorrectly applied unconditionally —
+                     * replaced with a plain copy for the common 4-bpp path.
+                     */
 					uint32_t *dst = (uint32_t *)dst_row;
                     for (int x = 0; x < w; x++) {
-                        dst[x] = bswap32(src[x]);
+                        dst[x] = src[x];
                     }
-                    memcpy(dst_row, dst, (size_t)w * 4);
                 } else if (dst_bpp == 3) {
                     uint8_t *dst = dst_row;
                     for (int x = 0; x < w; x++) {
@@ -647,8 +711,9 @@ void voodoo3_draw_cursor(Voodoo3State *s,
                          *   else if (plane1 & bit) → XOR pixel with 0xffffff
                          *   else → transparent
                          */
-                        if (!p0) {
-                            pixel = p1 ? col1 : col0;
+						if (!p0) {
+							if (!p1) continue;
+							pixel = col1;
                         } else if (p1) {
                             /* XOR invert */
                             if (dst_bpp == 4)

@@ -17,7 +17,8 @@
 /* voodoo3_triangle() — rasterize one triangle (hw/display/voodoo3_render.c) */
 struct voodoo3_params_t;
 struct Voodoo3State;
-void voodoo3_triangle(struct Voodoo3State *s, const struct voodoo3_params_t *p);
+void voodoo3_triangle(struct Voodoo3State *s, const struct voodoo3_params_t *p,
+                      int odd_even);
 
 /* voodoo3_triangle_setup() — floating-point setup → fixed-point params */
 void voodoo3_triangle_setup(struct Voodoo3State *s);

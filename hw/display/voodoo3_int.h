@@ -154,6 +154,11 @@ typedef struct voodoo3_params_t {
     uint32_t draw_offset, front_offset, aux_offset;
     uint32_t row_width, aux_row_width;
     int      col_tiled, aux_tiled;
+    /* Raw register values for colBufferStride / auxBufferStride readback.
+     * row_width / aux_row_width are transformed (tiled * 128 * 32) and
+     * cannot be reconstructed, so we keep the original write value here.
+     * FIX: voodoo3diag Module 22 -- colBufferStride readback was 0. */
+    uint32_t col_stride_raw, aux_stride_raw;
 
     /* Stats */
     uint32_t fbiPixelsIn, fbiChromaFail, fbiZFuncFail;
@@ -556,6 +561,25 @@ struct Voodoo3State {
     uint32_t        fbiAFuncFail, fbiPixelsOut;
     bool            voodoo_busy;
 
+    /*
+     * FIX 11: VMState shadow for params.fogTable[64].
+     *
+     * params.fogTable is declared as `struct { uint8_t fog, dfog; }[64]`
+     * — an array of anonymous structs.  VMSTATE_ macros cannot address
+     * fields inside anonymous struct array elements.  We therefore mirror
+     * the table as a flat 128-byte array (interleaved: fog0,dfog0,...,
+     * fog63,dfog63 — identical byte layout to the C struct on all
+     * platforms since {uint8_t,uint8_t} has no padding).
+     *
+     * voodoo3_pre_save_3dstate()  copies params.fogTable → fog_table_save.
+     * voodoo3_post_load_3dstate() copies fog_table_save → params.fogTable.
+     *
+     * The verts[4] setup-vertex array is similarly mirrored as a flat
+     * float array for the same reason (struct-of-floats without padding).
+     */
+    uint8_t  fog_table_save[128];   /* packed fogTable shadow (pre_save / post_load) */
+    uint32_t verts_save[4 * 14];    /* packed verts[4] shadow: 14 floats per vertex (stored as uint32 bitwise) */
+
     /* --- FIFO command ring ----------------------------------------------- */
 #define V3_FIFO_SIZE 65536          /* entries, must be power of 2 */
     uint32_t  fifo_cmd[V3_FIFO_SIZE];
@@ -575,6 +599,18 @@ struct Voodoo3State {
     QemuCond     fifo_cond;         /* wakes FIFO worker */
     bool         render_stop;
     uint32_t     render_threads_count;
+    /*
+     * odd_even_mask — band-parallel scanline assignment (86Box style).
+     *
+     * Value = render_threads_count - 1.  Each render thread T renders only
+     * scanlines where (screen_y & odd_even_mask) == T:
+     *   1 thread:  mask=0 → all scanlines (no filtering)
+     *   2 threads: mask=1 → thread 0 = even lines, thread 1 = odd lines
+     *   4 threads: mask=3 → thread T = every 4th line starting at T
+     *
+     * Ported from 86Box voodoo->odd_even_mask (vid_voodoo_common.h line 398).
+     */
+    uint32_t     odd_even_mask;
 
     /* Device variant */
     uint32_t model;

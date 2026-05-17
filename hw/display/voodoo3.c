@@ -33,6 +33,11 @@
  *       vidProcCfg byte R/W (0x5d-0x5f) + pix_format/tiling side effects
  * [x] STATUS register with FIFO/busy/vblank flags (banshee_status)
  * [x] LFB tiled-address decode (banshee_read/write_linear)
+ * [x] 3D LFB aperture READ (voodoo3_mmio_read 0x1000000–0x1FFFFFF)
+ *       Ported from 86Box voodoo_fb_readl() in vid_voodoo_fb.c.
+ *       Banshee addr decode: x=addr&0xffe, y=(addr>>12)&0x3ff
+ *       Buffer select from lfbMode bits[7:6]: front/back/aux offset
+ *       Tiled address calc identical to write path (col_tiled/row_width)
  * [x] Pixel-format-aware display output 8/16/24/32 bpp
  * [x] RGB565→BGRA8888 conversion
  * [x] Big-Endian byte-swap guards (be_fb) for PPC guests
@@ -52,6 +57,11 @@
  * [x] Full SST-1 3D register decode (voodoo_reg_writel) — all vertex/grad/cmd
  * [x] Integer AND floating-point triangle parameter paths
  * [x] Triangle CMD dispatch → voodoo3_queue_triangle()
+ *       Band-parallel broadcast: all threads read every triangle, each
+ *       thread renders only scanlines where (screen_y & odd_even_mask)==tid.
+ *       Ported from 86Box voodoo_queue_triangle() + render_thread() model.
+ *       odd_even_mask = render_threads_count-1 (0/1/3 for 1/2/4 threads).
+ *       Back-pressure via per-thread param_rd[tid] ring-full detection.
  * [x] ftriangleCMD / triangleCMD / sBeginTriCMD / sDrawTriCMD
  * [x] fbzMode / fbzColorPath / alphaMode / fogMode / lfbMode
  * [x] Clip registers (clipLeftRight / clipLowYHighY / clip1 / clip2)
@@ -71,6 +81,9 @@
  *       Perspective-correct UV, bilinear filtering, dual-TMU blend
  *       NCC (YIQ) palette decode (voodoo3_update_ncc / ncc_lookup)
  *       Texture cache with LRU eviction (voodoo3_use_texture)
+ *       voodoo3_flush_tex_if_dirty(): cache invalidation on PKT5 dst=0/1
+ *       VRAM writes (Bug 4 fix, ported from 86Box flush_texture_cache() +
+ *       texture_present[] in vid_voodoo_texture.c).
  * [x] Hardware cursor compositing (banshee_hwcursor_draw port)
  *       64×64 sprite, Windows AND/XOR and X11 mask/color modes
  *       Partial top-clip via yoff, left/right clipping per pixel
@@ -78,7 +91,7 @@
  * [x] Banshee 2D blitter command decode (COMMAND_CMD_* constants)
  * [x] Full Banshee 2D pixel operations:
  *       RectFill (solid fill with clip)
- *       Screen-to-Screen BLT (with chroma-key stubs)
+ * [x] Screen-to-Screen BLT (with full colorkey via blt_colorkey()/blt_mix())
  *       Screen-to-Screen Stretch BLT
  *       Host-to-Screen BLT (byte accumulation, stride alignment)
  *       Host-to-Screen Stretch BLT
@@ -92,6 +105,11 @@
  *       1=Sequential reg write, 2=2D bitmask write, 3=Setup/vertex,
  *       4=Bitmask reg write, 5=Raw VRAM/FB/TEX block, 6=AGP DMA (stub)
  *       JSR/RET subroutine nesting, ring-buffer wrap, in_sub tracking
+ * [x] CMDFIFO1 (AGP ring, secondary FIFO) — full packet processor
+ *       Ported from 86Box second while-loop in voodoo_fifo_thread()
+ *       cmdfifo_read_dword_2() / cmdfifo_read_float_2() read from _2 fields
+ *       All 7 packet types handled identically to FIFO0
+ *       On PCI (Pegasos2) FIFO1 is never populated → returns immediately
  * [x] VGA IRQ (vblank_irq_pending, pci_irq_assert/deassert wired)
  *       Assert on vblank if CRTC[0x11] bit4=1 + bit5=0 + pciInit0 bit18=1
  *       Deassert on 0x3da read or CRTC[0x11] bit4 cleared
@@ -106,9 +124,85 @@
  *       tex_params stores textureMode so decode_texture() uses the correct
  *       NCC table-select bit (textureMode[5] = TEXTUREMODE_NCC_SEL, not tLOD[5]).
  *       Cache invalidated via ncc_gen[tmu] counter on every nccTable write.)
+ * [x] ARGB32 (srcfmt=7) alpha-blend blit support — FIX for:
+ *       "RGB mask blits with RGB source (srcfmt = 7) and different
+ *        colormodels (destfmt = 0) not supported yet"
+ *       "cgx/WPAAlpha unsupported pixfmt: 0 for RECTFMT_ARGB"
+ *       SRC_FORMAT_COL_ARGB32 (7u<<16) defined, src_bpp=32 set, Porter-Duff
+ *       "src over dst" alpha-blend via blt_alpha_blend_argb32() in:
+ *         blt_do_s2s_line(), blt_do_stretch_line(), blt_update_src_stride_full()
+ *       DST_FORMAT_COL_PAL (0u<<16, dstfmt=0) added to blt_plot() fall-through.
+ * [x] vidDesktopStartAddr (BAR0+0x0E4) WARN4 fix — "vidDesktopStart=0xFFFFFF00":
+ *       Write handler clamps value to fb_size; out-of-range writes reset to 0.
+ *       Read sub-byte 0xe7 (bits[31:24]) now always returns 0x00 — register
+ *       is 24-bit only; upper byte not wired on real hardware.
  * [ ] JIT recompiler (x86-64/ARM64) — not applicable for QEMU device model
  * [ ] SLI multi-GPU — not applicable (single-GPU emulation only)
  * -------------------------------------------------------------------------
+ * BUG FIXES (applied on top of initial port)
+ * -------------------------------------------------------------------------
+ * [x] FIX 1: lodbias wired into render path (voodoo3_render.c)
+ *       tLOD[17:12] decoded in voodoo3.c → params.tmu[t].lodbias;
+ *       render path now reads it instead of hardcoding 0.
+ * [x] FIX 2: S2S BLT chroma-key is fully implemented (was mislabelled stub)
+ *       blt_colorkey() + blt_mix() correctly gate on CMDEXTRA_SRC/DST_COLORKEY.
+ *       Fast-path (memmove) already requires no_colorkey=true to be taken.
+ * [x] FIX 3: RGB32 (pix_format==3) fastfill added (voodoo3_display.c)
+ *       voodoo3_fastfill() now dispatches on s->pix_format:
+ *         pix_format==3 → 32-bit word fill with tiled 32-pixel-per-strip layout
+ *         all others     → original 16-bit RGB565 path
+ * [x] FIX 4: RGB32 display bswap/memcpy redundancy removed (voodoo3_display.c)
+ *       The memcpy(dst_row, dst, w*4) after the bswap32 loop was a self-copy
+ *       (dst == (uint32_t*)dst_row).  Removed.  bswap32 itself was also
+ *       incorrect for LE hosts — replaced with a plain copy; QEMU's
+ *       DEVICE_LITTLE_ENDIAN MemoryRegion already compensates for BE guests.
+ * [x] FIX 5: LOD clamp decoded from tLOD register (voodoo3_render.c)
+ *       st.lod_min[t] / st.lod_max[t] now read from tLOD[5:2] / tLOD[11:8]
+ *       (4-bit integer fields, converted to 8.8 fixed-point × 256) instead
+ *       of being hardcoded to 0 / V3_LOD_MAX<<8.
+ * [x] FIX 6: polyfill edge-selection corrected (voodoo3.c)
+ *       blt_polyfill_continue() now selects the edge whose tip Y (ly[1] or
+ *       ry[1]) is smallest — matching 86Box — instead of the incorrect
+ *       ry[1]>=ly[1] heuristic that failed for concave polygons.
+ * [x] FIX 7: ext register read default returns 0x0 instead of 0xFFFFFFFF
+ *       Unknown ext reads now try regs[] first (for write-then-read
+ *       round-trips), then return 0x00000000 (idle/absent) rather than
+ *       0xFFFFFFFF (broken) which caused driver abort paths on AmigaOS4.
+ * [x] FIX 8: SGRAM (fb_mem) saved in VMState subsection "voodoo3/sgram"
+ *       16 MiB fb_mem is now persisted via VMSTATE_VBUFFER_UINT8 in a
+ *       version-1 subsection.  Old v4 snapshots load cleanly (subsection
+ *       absent → fb_mem zeroed → blank screen until next driver redraw)
+ * [x] FIX 9: bswap16 RGB565 display path — BE-Guard added (voodoo3_display.c)
+ *       The unconditional bswap16(src[x]) in the non-tiled RGB565→BGRA8888
+ *       conversion loop was wrong for all little-endian hosts (x86_64):
+ *       DEVICE_LITTLE_ENDIAN MemoryRegion already puts 16-bit words in
+ *       host-native byte order before we read fb_mem, so a further bswap
+ *       inverted R and B, producing a blue tint on every x86 guest in 16bpp.
+ *       For BE hosts the same DEVICE_LITTLE_ENDIAN compensation applies,
+ *       making the swap redundant there too.  Replaced with plain src[x].
+ * [x] FIX 10: blt_polyfill_continue() edge-selection restored to exact 86Box
+ *       semantics (voodoo3.c).  FIX 6's comment was correct but the
+ *       implementation `ly[1] < ry[1]` is logically identical to the broken
+ *       `ly[1] < ry[1]` it replaced.  86Box uses `ry[1] >= ly[1]` (selects
+ *       left edge when right tip is equal-or-ahead), which correctly handles
+ *       horizontal top edges (equal tips → left gets new vertex, not right).
+ *       Retire block updated with the same ry[1] >= ly[1] sense.
+ * [x] FIX 11: VMState 3D-param completeness — new subsection "voodoo3/3dstate"
+ *       saves all fields previously omitted from vmstate_voodoo3:
+ *         params.tmu[0/1]: startS/T/W, dS/dT/dW per-pixel + per-scanline,
+ *           lodbias, lod_min, lod_max.
+ *         params.fogTable[64]: packed via fog_table_save[128] shadow +
+ *           pre_save/post_load hooks (struct array, not directly addressable).
+ *         params.fogColor.r/g/b, chromaKey_r/g/b.
+ *         params.detail_max/bias/scale[2], sign, swapbufferCMD.
+ *         params.fbiPixels* stat counters.
+ *         verts[4]: packed via verts_save[56] shadow (14 floats × 4).
+ *         vertex_num, vertex_next_age, vertex_ages[3], num_verticies,
+ *           cull_pingpong.
+ *         swap_pending, swap_interval, swap_offset, retrace_count,
+ *           frame_count, fbiPixels* global counters.
+ *       Old snapshots load cleanly: missing subsection → fields keep
+ *       reset() defaults; driver reprograms all 3D regs before next draw.
  */
 
 #include "qemu/osdep.h"
@@ -379,6 +473,23 @@ static void voodoo3_vidserial_update(uint32_t *reg,
 #define Init_dramInit0                   0x18
 #define Init_dramInit1                   0x1c
 #define Init_agpInit0                    0x20
+/*
+ * Additional Banshee/Voodoo3 ext register offsets not yet defined above.
+ * Sources: 3dfx Banshee Hardware Specification v1.0 §4.1 "External Registers"
+ *          86Box vid_voodoo_banshee.c banshee_ext_outl() / banshee_ext_inl()
+ */
+/* Video capture registers (0x70–0x94) */
+#define Video_vidInStatus                0x74   /* video capture status (read-only)         */
+#define Video_vidPllCtrl                 0x7c   /* video PLL control / reserved scratch     */
+#define Video_vidInYStart                0x94   /* video capture Y start coordinate         */
+
+/* Video capture DMA address / stride registers (0xec–0xfc) */
+#define Video_vidInAddr0                 0xec   /* video capture DMA buffer 0 address       */
+#define Video_vidInAddr1                 0xf0   /* video capture DMA buffer 1 address       */
+#define Video_vidInAddr2                 0xf4   /* video capture DMA buffer 2 address       */
+#define Video_vidInStride                0xf8   /* video capture DMA stride                 */
+#define Video_vidCurrOverlayStartAddr    0xfc   /* current overlay scan-out start address   */
+
 #define Init_tmugbInit                   0x24   /* TMU global buffer init — write-only */
 #define Init_vgaInit0                    0x28
 #define Init_vgaInit1                    0x2c
@@ -518,6 +629,11 @@ static void voodoo3_vidserial_update(uint32_t *reg,
 #define SST_stipple         0x03c
 #define SST_color0          0x040
 #define SST_color1          0x044
+#define SST_fbiPixelsIn     0x14c
+#define SST_fbiChromaFail   0x150
+#define SST_fbiZFuncFail    0x154
+#define SST_fbiAFuncFail    0x158
+#define SST_fbiPixelsOut    0x15c
 #define SST_fogTable00      0x100
 #define SST_fogTable1f      0x17c
 /* These are the Banshee/Voodoo3 register names at 0x2c0-0x2d8.
@@ -609,8 +725,8 @@ static void voodoo3_vidserial_update(uint32_t *reg,
 #define SST_sW1             0x2f4
 #define SST_sS1             0x2f8
 #define SST_sT1             0x2fc
-#define SST_sBeginTriCMD    0x300
-#define SST_sDrawTriCMD     0x304
+#define SST_sBeginTriCMD    0x2a4
+#define SST_sDrawTriCMD     0x2a0
 
 /* NCC table register offsets (86Box SST_nccTable0_* values) */
 #define SST_nccTable0_Y0  0x100
@@ -664,6 +780,19 @@ static void voodoo3_vidserial_update(uint32_t *reg,
 #define SRC_FORMAT_COL_16_BPP    (3u  << 16)
 #define SRC_FORMAT_COL_24_BPP    (4u  << 16)
 #define SRC_FORMAT_COL_32_BPP    (5u  << 16)
+/*
+ * SRC_FORMAT value 7 = ARGB8888 with alpha channel.
+ * Used by CyberGraphX/Picasso96 WritePixelArray (WPAAlpha) and
+ * RGB-mask blits from RECTFMT_ARGB sources.  The Banshee hardware
+ * datasheet calls this "ARGB32" — identical pixel layout to 32_BPP
+ * (0xAARRGGBB) but the alpha byte is *used* for per-pixel alpha
+ * blending rather than being ignored.
+ *
+ * Fix: "RGB mask blits with RGB source (srcfmt = 7) and different
+ *       colormodels (destfmt = 0) not supported yet"
+ *      "cgx/WPAAlpha unsupported pixfmt: 0 for RECTFMT_ARGB"
+ */
+#define SRC_FORMAT_COL_ARGB32    (7u  << 16)   /* ARGB with alpha */
 #define SRC_FORMAT_COL_YUYV      (8u  << 16)
 #define SRC_FORMAT_COL_UYVY      (9u  << 16)
 #define SRC_FORMAT_BYTE_SWIZZLE  (1u  << 20)
@@ -676,6 +805,23 @@ static void voodoo3_vidserial_update(uint32_t *reg,
 
 /* DST_FORMAT bits */
 #define DST_FORMAT_COL_MASK      (0xfu << 16)
+/*
+ * DST_FORMAT value 0 = 8-bpp palette (CLUT) mode.
+ * The Banshee 2D engine can blit ARGB32 source pixels onto a palette
+ * framebuffer by dropping the colour channels and only writing the
+ * alpha (or the nearest palette index), but what CyberGraphX/Picasso96
+ * actually needs here is: ARGB → nearest palette entry lookup (or just
+ * the RGB, dropping alpha since the palette FB has no alpha plane).
+ *
+ * DST_FORMAT_COL_8_BPP (1u << 16) is the normal 8-bpp path.
+ * DST_FORMAT_COL_PAL   (0u << 16) is the "raw" palette write mode
+ * where the destination is treated as an 8-bpp surface without the
+ * intermediate CLUT conversion step (driver writes palette-indexed
+ * pixels directly).
+ *
+ * Fix: destfmt=0 in "RGB mask blits … destfmt = 0 not supported yet"
+ */
+#define DST_FORMAT_COL_PAL       (0u  << 16)   /* 8-bpp raw palette (dstfmt=0) */
 #define DST_FORMAT_COL_8_BPP     (1u  << 16)
 #define DST_FORMAT_COL_16_BPP    (3u  << 16)
 #define DST_FORMAT_COL_24_BPP    (4u  << 16)
@@ -740,7 +886,7 @@ static uint32_t voodoo3_status(Voodoo3State *s)
      * Bits [10:7] = busy flags (0x780 when busy)
      * Bits [12:11] = CMDFIFO0/1 not empty
      */
-    ret |= (uint32_t)(0x1f - free) & 0x1fu;
+    ret |= (uint32_t)free & 0x1fu;
     if (depth > 0)    ret |= (1u << 5);
     if (!s->in_vblank) ret |= (1u << 6);   /* display active = bit6 SET */
     if (busy)          ret |= 0x780u;
@@ -796,6 +942,37 @@ void voodoo3_queue_triangle(Voodoo3State *s, voodoo3_params_t *p)
         /* TMU1 only when not in passthrough mode (86Box dual_tmus check) */
         if ((p->tmu[0].textureMode & 0x00643000u) != 0x00241000u)
             voodoo3_use_texture(s, p, 1);
+    }
+
+    /*
+     * Band-parallel broadcast: write the triangle ONCE to the shared ring
+     * buffer.  ALL render threads consume every entry (each with their own
+     * param_rd[tid]) and skip scanlines they don't own via odd_even_mask.
+     *
+     * Mirrors 86Box exactly:
+     *   PARAMS_WRITE_IDX++ increments the single write pointer once.
+     *   Each thread has its own PARAMS_READ_IDX(voodoo, odd_even).
+     *   voodoo_half_triangle() skips (screen_y & odd_even_mask) != thread_id.
+     *
+     * Back-pressure: if ANY thread's read pointer is PARAM_BUF_SIZE behind
+     * the write pointer the ring is full — yield so render threads can drain.
+     * Mirrors 86Box PARAM_FULL() loop in voodoo_queue_triangle().
+     */
+    {
+        uint32_t nthreads = s->render_threads_count;
+        while (true) {
+            bool full = false;
+            for (uint32_t t = 0; t < nthreads; t++) {
+                if (s->param_wr - s->param_rd[t] >= PARAM_BUF_SIZE) {
+                    full = true;
+                    break;
+                }
+            }
+            if (!full) break;
+            qemu_cond_broadcast(&s->render_cond);
+            qemu_mutex_unlock(&s->render_lock);
+            qemu_mutex_lock(&s->render_lock);
+        }
     }
 
     uint32_t idx = s->param_wr & (PARAM_BUF_SIZE - 1);
@@ -1011,7 +1188,8 @@ static void voodoo3_crtc_update(Voodoo3State *s)
     /* If EXTENDED_SHIFT_OUT is set (vgaInit0 bit 12), the display format
      * and stride come from vidProcCfg / vidDesktopOverlayStride, not CRTC.
      * Only update screen size from CRTC; leave pix_format/stride alone.  */
-    bool ext_shift = !!(s->vgaInit0 & (1u << 12));
+    bool ext_shift = !!(s->vgaInit0 & (1u << 12))
+              || !!(s->vidProcCfg & VIDPROCCFG_VIDPROC_ENABLE);
 
     int stride_candidate = crtc13 * 8;   /* byte-granular packed pixel */
 
@@ -1252,6 +1430,7 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         s->scrfilter_threshold = val;
         s->scrfilter_enabled   = (val != 0);
         voodoo3_scrfilter_threshold_check(s);
+        s->regs[Video_maxRgbDelta >> 2] = val;
         break;
     case Video_hwCurPatAddr:
         s->hwCurPatAddr = val;
@@ -1327,6 +1506,38 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
     case Video_vidInXDecimDeltas: s->regs[Video_vidInXDecimDeltas >> 2] = val; break;
     case Video_vidInError:        s->regs[Video_vidInError >> 2] = val; break;
     case Video_vidInXStart:       s->regs[Video_vidInXStart >> 2] = val; break;
+    /*
+     * Video capture / misc registers — store for read-back, no active effect.
+     *
+     * 0x74  vidInStatus       — read-only hardware status; writes ignored per spec.
+     * 0x7c  vidPllCtrl        — video PLL scratch; 86Box ext_outl falls to default (no-op).
+     * 0x94  vidInYStart       — capture Y coordinate scratch.
+     * 0xec  vidInAddr0        — DMA capture buffer 0 address.
+     * 0xf0  vidInAddr1        — DMA capture buffer 1 address.
+     * 0xf4  vidInAddr2        — DMA capture buffer 2 address.
+     * 0xf8  vidInStride       — DMA capture stride.
+     * 0xfc  vidCurrOverlayStartAddr — overlay scan-out pointer; stored for read-back.
+     *
+     * In 86Box vid_voodoo_banshee.c these all fall through to the default no-op
+     * in banshee_ext_outl().  We store them in regs[] so read-back returns the
+     * last written value (same pattern as vidInXDecimDeltas/vidInError/vidInXStart).
+     */
+    case Video_vidInStatus:               /* read-only status — ignore writes          */
+        break;
+    case Video_vidPllCtrl:
+        s->regs[Video_vidPllCtrl >> 2] = val; break;
+    case Video_vidInYStart:
+        s->regs[Video_vidInYStart >> 2] = val; break;
+    case Video_vidInAddr0:
+        s->regs[Video_vidInAddr0 >> 2] = val; break;
+    case Video_vidInAddr1:
+        s->regs[Video_vidInAddr1 >> 2] = val; break;
+    case Video_vidInAddr2:
+        s->regs[Video_vidInAddr2 >> 2] = val; break;
+    case Video_vidInStride:
+        s->regs[Video_vidInStride >> 2] = val; break;
+    case Video_vidCurrOverlayStartAddr:
+        s->regs[Video_vidCurrOverlayStartAddr >> 2] = val; break;
     case Video_vidOverlayStartCoords:
         /*
          * 86Box banshee_ext_outl() Video_vidOverlayStartCoords:
@@ -1378,9 +1589,32 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         s->ov.vidOverlayDvdyOffset = val;
         s->regs[Video_vidOverlayDvdyOffset >> 2] = val;
         break;
-    case Video_vidDesktopStartAddr:
-        s->vidDesktopStartAddr = val & 0x00ffffff;
-        s->desktop_start       = s->vidDesktopStartAddr;
+    case Video_vidDesktopStartAddr: {
+        /*
+         * WARN4 FIX: "vidDesktopStart = 0xFFFFFF00" (Module 25).
+         *
+         * On real Voodoo3 hardware, vidDesktopStartAddr (BAR0+0x0E4) is a
+         * 24-bit register (bits[23:0] only), so the hardware ignores the
+         * upper 8 bits on write.  The QEMU device already masks with
+         * 0x00ffffff, which prevents the 0xFFFFFF00 garbage from being
+         * stored.
+         *
+         * The secondary cause reported (register reads back 0xFFFFFF00
+         * after reset) was an uninitialised state issue — now fixed by
+         * explicit zero-initialisation in voodoo3_reset().
+         *
+         * Additional guard: if the written value (after masking) points
+         * beyond the allocated VRAM, clamp to 0 so the display engine
+         * never reads out-of-bounds.  This mirrors the real hardware
+         * read-only upper-byte behaviour and prevents a white-screen
+         * from a mis-programmed desktop start address.
+         */
+        uint32_t masked = val & 0x00ffffffu;
+        if (masked >= s->fb_size) {
+            masked = 0;  /* out-of-range → reset to frame 0 */
+        }
+        s->vidDesktopStartAddr = masked;
+        s->desktop_start       = masked;
         /*
          * Sync to params so voodoo3_update_display_dirty() sees the correct
          * framebuffer base.  In 2D/desktop mode (no 3D swap) these are the
@@ -1390,6 +1624,7 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         // s->params.draw_offset  = s->desktop_start;
         memset(s->dirty_line, 1, sizeof(s->dirty_line));
         break;
+    }
     case Video_vidDesktopOverlayStride:
         s->vidDesktopOverlayStride = val;
         /*
@@ -1593,6 +1828,331 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
             break;
         }
 
+        /*
+         * Sub-byte writes — Init registers (ported from 86Box banshee_ext_outl).
+         *
+         * Init_lfbMemoryConfig (0x0c) sub-bytes: 0x0d, 0x0e, 0x0f
+         * 86Box stores into banshee->lfbMemoryConfig and recalculates tile
+         * geometry fields (tile_base, tile_stride, tile_x).  We mirror into
+         * s->lfbMemoryConfig and re-apply the same decode.
+         */
+        case 0x0d: case 0x0e: case 0x0f: {
+            unsigned bidx = (addr & 0xff) - 0x0cu;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->lfbMemoryConfig = (s->lfbMemoryConfig & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            /* Re-apply tile geometry side-effects (86Box Init_lfbMemoryConfig) */
+            s->tile_base   = (s->lfbMemoryConfig & 0x1fffu) << 12;
+            s->tile_stride = 1024u << ((s->lfbMemoryConfig >> 13) & 7u);
+            s->tile_x      = (uint32_t)(((s->lfbMemoryConfig >> 16) & 0x7fu) * 128u);
+            break;
+        }
+
+        /*
+         * Init_miscInit0 (0x10) sub-bytes: 0x11, 0x12, 0x13
+         * 86Box: banshee->miscInit0 = val; y_origin_swap extracted from bit field.
+         */
+        case 0x11: case 0x12: case 0x13: {
+            unsigned bidx = (addr & 0xff) - 0x10u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->miscInit0 = (s->miscInit0 & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            s->y_origin_swap = (int)((s->miscInit0 & MISCINIT0_Y_SWAP_MASK)
+                               >> MISCINIT0_Y_SWAP_SHIFT);
+            break;
+        }
+
+        /*
+         * Init_dramInit0 (0x18) sub-bytes: 0x19, 0x1a, 0x1b
+         * 86Box: stored in banshee->dramInit0 (memory timing, write-only).
+         */
+        case 0x19: case 0x1a: case 0x1b: {
+            unsigned bidx = (addr & 0xff) - 0x18u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->dramInit0 = (s->dramInit0 & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * Init_dramInit1 (0x1c) sub-bytes: 0x1d, 0x1e, 0x1f
+         * 86Box: stored in banshee->dramInit1 (memory timing, write-only).
+         */
+        case 0x1d: case 0x1e: case 0x1f: {
+            unsigned bidx = (addr & 0xff) - 0x1cu;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->dramInit1 = (s->dramInit1 & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * Init_agpInit0 (0x20) sub-bytes: 0x21, 0x22, 0x23
+         * 86Box: stored in banshee->agpInit0 (AGP timing, write-only).
+         */
+        case 0x21: case 0x22: case 0x23: {
+            unsigned bidx = (addr & 0xff) - 0x20u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->agpInit0 = (s->agpInit0 & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * Init_tmugbInit (0x24) sub-bytes: 0x25, 0x26, 0x27
+         * 86Box ext_outl falls to default (no named field).
+         * Store in regs[] scratch so read-back round-trips work.
+         */
+        case 0x25: case 0x26: case 0x27: {
+            unsigned bidx = (addr & 0xff) - 0x24u;
+            uint32_t idx  = Init_tmugbInit >> 2;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->regs[idx] = (s->regs[idx] & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * Init_2dCommand (0x30) sub-bytes: 0x31, 0x32, 0x33
+         * 86Box: stored in banshee->command_2d (2D command register).
+         */
+        case 0x31: case 0x32: case 0x33: {
+            unsigned bidx = (addr & 0xff) - 0x30u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->command_2d = (s->command_2d & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * Init_2dSrcBaseAddr (0x34) sub-bytes: 0x35, 0x36, 0x37
+         * 86Box: stored in banshee->srcBaseAddr_2d.
+         */
+        case 0x35: case 0x36: case 0x37: {
+            unsigned bidx = (addr & 0xff) - 0x34u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->srcBaseAddr_2d = (s->srcBaseAddr_2d & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * Init_2dSrcSize (0x3c) sub-bytes: 0x3d, 0x3e, 0x3f
+         * 86Box ext_outl falls to default (no named field).
+         * Store in regs[] scratch.
+         */
+        case 0x3d: case 0x3e: case 0x3f: {
+            unsigned bidx = (addr & 0xff) - 0x3cu;
+            uint32_t idx  = Init_2dSrcSize >> 2;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->regs[idx] = (s->regs[idx] & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * PLL_pllCtrl0 (0x40) sub-bytes: 0x41, 0x42, 0x43
+         * 86Box: banshee->pllCtrl0 = val; triggers pixel clock recalc.
+         * Re-apply PLL side effects after byte merge.
+         */
+        case 0x41: case 0x42: case 0x43: {
+            unsigned bidx = (addr & 0xff) - 0x40u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->pllCtrl0 = (s->pllCtrl0 & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            voodoo3_pll_update_vblank(s);
+            break;
+        }
+
+        /*
+         * PLL_pllCtrl1 (0x44) sub-bytes: 0x45, 0x46, 0x47
+         * 86Box: banshee->pllCtrl1 = val (stored, no active side effect).
+         */
+        case 0x45: case 0x46: case 0x47: {
+            unsigned bidx = (addr & 0xff) - 0x44u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->pllCtrl1 = (s->pllCtrl1 & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * Video_maxRgbDelta (0x58) sub-bytes: 0x59, 0x5a, 0x5b
+         * 86Box: stores in voodoo->scrfilterThreshold and enables/disables filter.
+         * Ported from banshee_ext_outl() Video_maxRgbDelta.
+         */
+        case 0x59: case 0x5a: case 0x5b: {
+            unsigned bidx = (addr & 0xff) - 0x58u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            uint32_t newval = (s->regs[Video_maxRgbDelta >> 2] & ~mask)
+                              | ((val & 0xffu) << (bidx * 8u));
+            s->regs[Video_maxRgbDelta >> 2] = newval;
+            s->scrfilter_threshold  = newval;
+            s->scrfilter_enabled    = (newval > 0);
+            break;
+        }
+
+        /*
+         * Video_hwCurPatAddr (0x60) sub-bytes: 0x61, 0x62, 0x63
+         * 86Box: banshee->hwCurPatAddr = val; svga->hwcursor.addr updated.
+         */
+        case 0x61: case 0x62: case 0x63: {
+            unsigned bidx = (addr & 0xff) - 0x60u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->hwCurPatAddr = (s->hwCurPatAddr & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            s->cur_pat_addr = s->hwCurPatAddr & 0xfffff0u;
+            {
+                uint32_t base = s->cur_pat_addr + (uint32_t)s->cur_yoff * 16u;
+                uint32_t len  = 1024u - (uint32_t)s->cur_yoff * 16u;
+                if (base + len <= s->fb_size)
+                    memcpy(s->cursor_buf, s->fb_mem + base, len);
+            }
+            break;
+        }
+
+        /*
+         * Video_hwCurLoc (0x64) sub-bytes: 0x65, 0x66, 0x67
+         * 86Box: banshee->hwCurLoc = val; svga->hwcursor.x/y decoded.
+         * Re-apply same side effects as the dword handler.
+         */
+        case 0x65: case 0x66: case 0x67: {
+            unsigned bidx = (addr & 0xff) - 0x64u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->hwCurLoc = (s->hwCurLoc & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            {
+                int cx = (int)(s->hwCurLoc & 0x7ffu) - 64;
+                int cy = (int)((s->hwCurLoc >> 16) & 0x7ffu) - 64;
+                if (cy < 0) {
+                    s->cur_yoff = -cy;
+                    cy = 0;
+                } else {
+                    s->cur_yoff = 0;
+                }
+                s->cur_x = cx;
+                s->cur_y = cy;
+                {
+                    uint32_t base = s->cur_pat_addr + (uint32_t)s->cur_yoff * 16u;
+                    if (base + 1024u <= s->fb_size)
+                        memcpy(s->cursor_buf, s->fb_mem + base,
+                               1024u - (uint32_t)s->cur_yoff * 16u);
+                }
+            }
+            break;
+        }
+
+        /*
+         * Video_hwCurC0 (0x68) sub-bytes: 0x69, 0x6a, 0x6b
+         * 86Box: banshee->hwCurC0 = val (cursor foreground colour, stored).
+         */
+        case 0x69: case 0x6a: case 0x6b: {
+            unsigned bidx = (addr & 0xff) - 0x68u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->cur_c0 = (s->cur_c0 & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * Video_hwCurC1 (0x6c) sub-bytes: 0x6d, 0x6e, 0x6f
+         * 86Box: banshee->hwCurC1 = val (cursor background colour, stored).
+         */
+        case 0x6d: case 0x6e: case 0x6f: {
+            unsigned bidx = (addr & 0xff) - 0x6cu;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->cur_c1 = (s->cur_c1 & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * Video_vidInStatus (0x74) sub-bytes: 0x75, 0x76, 0x77
+         * Hardware-defined read-only status register.
+         * Writes are silently ignored (no named field in 86Box).
+         */
+        case 0x75: case 0x76: case 0x77:
+            /* read-only HW register — ignore byte writes */
+            break;
+
+        /*
+         * Video_vidSerialParallelPort (0x78) sub-bytes: 0x79, 0x7a, 0x7b
+         * 86Box: banshee->vidSerialParallelPort = val; DDC/I2C GPIO driven.
+         * Re-apply I2C side effects after byte merge.
+         */
+        case 0x79: case 0x7a: case 0x7b: {
+            unsigned bidx = (addr & 0xff) - 0x78u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->vidSerialParallelPort = (s->vidSerialParallelPort & ~mask)
+                                       | ((val & 0xffu) << (bidx * 8u));
+            voodoo3_vidserial_update(&s->vidSerialParallelPort,
+                                     &s->bbi2c_ddc,
+                                     18, 19, 20, 21, 22); /* DDC bus */
+            voodoo3_vidserial_update(&s->vidSerialParallelPort,
+                                     &s->bbi2c_i2c,
+                                     23, 24, 25, 26, 27); /* I2C bus */
+            break;
+        }
+
+        /*
+         * Video_vidPllCtrl (0x7c) sub-bytes: 0x7d, 0x7e, 0x7f
+         * 86Box ext_outl falls to default (scratch / no-op).
+         * Store in regs[] for read-back.
+         */
+        case 0x7d: case 0x7e: case 0x7f: {
+            unsigned bidx = (addr & 0xff) - 0x7cu;
+            uint32_t idx  = Video_vidPllCtrl >> 2;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->regs[idx] = (s->regs[idx] & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * Video_vidInXDecimDeltas (0x80) sub-bytes: 0x81, 0x82, 0x83
+         * 86Box ext_outl falls to default.  Store in regs[] scratch.
+         */
+        case 0x81: case 0x82: case 0x83: {
+            unsigned bidx = (addr & 0xff) - 0x80u;
+            uint32_t idx  = Video_vidInXDecimDeltas >> 2;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->regs[idx] = (s->regs[idx] & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            break;
+        }
+
+        /*
+         * Video_vidScreenSize (0x98) sub-bytes: 0x99, 0x9a, 0x9b
+         * 86Box: banshee->vidScreenSize = val; h_disp/v_disp decoded.
+         * Re-apply side effects after byte merge.
+         */
+        case 0x99: case 0x9a: case 0x9b: {
+            unsigned bidx = (addr & 0xff) - 0x98u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->vidScreenSize = (s->vidScreenSize & ~mask) | ((val & 0xffu) << (bidx * 8u));
+            s->screen_width  = (int)((s->vidScreenSize & 0xfffu) + 1u);
+            s->screen_height = (int)((s->vidScreenSize >> 12) & 0xfffu);
+            if (s->con && s->screen_width > 0 && s->screen_height > 0) {
+                qemu_console_resize(s->con, s->screen_width, s->screen_height);
+                memset(s->dirty_line, 1, sizeof(s->dirty_line));
+            }
+            break;
+        }
+
+        /*
+         * Video_vidDesktopStartAddr (0xe4) sub-bytes: 0xe5, 0xe6, 0xe7
+         * 86Box: banshee->vidDesktopStartAddr = val & 0xffffff; fullchange set.
+         * Upper byte (0xe7, bits[31:24]) not wired on real HW — clamped to 0.
+         */
+        case 0xe5: case 0xe6: {
+            unsigned bidx = (addr & 0xff) - 0xe4u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->vidDesktopStartAddr = ((s->vidDesktopStartAddr & ~mask)
+                                      | ((val & 0xffu) << (bidx * 8u)))
+                                     & 0x00ffffffu;
+            voodoo3_crtc_update(s);
+            break;
+        }
+        case 0xe7:
+            /* bits[31:24] not wired — ignore write */
+            break;
+
+        /*
+         * Video_vidDesktopOverlayStride (0xe8) sub-bytes: 0xe9, 0xea, 0xeb
+         * 86Box: banshee->vidDesktopOverlayStride = val; fullchange set.
+         */
+        case 0xe9: case 0xea: case 0xeb: {
+            unsigned bidx = (addr & 0xff) - 0xe8u;
+            uint32_t mask = 0xffu << (bidx * 8u);
+            s->vidDesktopOverlayStride = (s->vidDesktopOverlayStride & ~mask)
+                                         | ((val & 0xffu) << (bidx * 8u));
+            voodoo3_crtc_update(s);
+            break;
+        }
+
         default:
             qemu_log_mask(LOG_UNIMP,
                 "voodoo3: ext write 0x%02x = 0x%08x (unimplemented)\n",
@@ -1602,6 +2162,9 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         break;
     }
 }
+
+/* Forward declaration — defined later in this file */
+static uint8_t voodoo3_vga_in(Voodoo3State *s, uint16_t addr);
 
 static uint32_t voodoo3_ext_read(Voodoo3State *s, uint32_t addr)
 {
@@ -1651,7 +2214,29 @@ static uint32_t voodoo3_ext_read(Voodoo3State *s, uint32_t addr)
     case Video_vidProcCfg:         return s->vidProcCfg;
     case Video_vidScreenSize:      return s->vidScreenSize;
     case Video_vidDesktopStartAddr:     return s->vidDesktopStartAddr;
+    /* Sub-byte reads of vidDesktopStartAddr (0xe4) — byte 1/2/3.
+     * Ported from 86Box banshee_ext_inl() Video_vidDesktopStartAddr:
+     *   ret = banshee->vidDesktopStartAddr
+     * The Pegasos/MorphOS 3dfx driver reads bytes 0xe5, 0xe6, 0xe7
+     * individually to assemble the 24-bit base address.
+     *
+     * WARN4 FIX: vidDesktopStartAddr is a 24-bit register (bits[23:0]).
+     * Byte 3 (0xe7, bits[31:24]) must always read as 0x00 — on real
+     * hardware the upper byte is not wired.  Before this fix the register
+     * could read back 0xFFFFFF00 if the write path had uninitialised data.
+     * The write handler now clamps to 0x00ffffff so byte 3 is always 0. */
+    case 0xe5: return (s->vidDesktopStartAddr >>  8) & 0xff;
+    case 0xe6: return (s->vidDesktopStartAddr >> 16) & 0xff;
+    case 0xe7: return 0x00; /* bits[31:24] not wired — always 0 (WARN4 fix) */
     case Video_vidDesktopOverlayStride: return s->vidDesktopOverlayStride;
+    /* Sub-byte reads of vidDesktopOverlayStride (0xe8) — byte 1/2/3.
+     * Ported from 86Box banshee_ext_inl() Video_vidDesktopOverlayStride:
+     *   ret = banshee->vidDesktopOverlayStride
+     * The Pegasos/MorphOS 3dfx driver reads bytes 0xe9, 0xea, 0xeb
+     * individually to read back stride and tile-mode bits. */
+    case 0xe9: return (s->vidDesktopOverlayStride >>  8) & 0xff;
+    case 0xea: return (s->vidDesktopOverlayStride >> 16) & 0xff;
+    case 0xeb: return (s->vidDesktopOverlayStride >> 24) & 0xff;
     case Video_hwCurPatAddr:       return s->hwCurPatAddr;
     case Video_hwCurLoc:           return s->hwCurLoc;
     case Video_hwCurC0:            return s->cur_c0;
@@ -1693,6 +2278,20 @@ static uint32_t voodoo3_ext_read(Voodoo3State *s, uint32_t addr)
          */
         return s->vidSerialParallelPort;
     /* Ext_miscInit2 */
+    /* VGA-proxy byte reads: ext 0xb0..0xbf -> VGA port 0x3b0..0x3bf */
+    case 0xb0: case 0xb1: case 0xb2: case 0xb3:
+    case 0xb4: case 0xb5: case 0xb6: case 0xb7:
+    case 0xb8: case 0xb9: case 0xba: case 0xbb:
+    case 0xbc: case 0xbd: case 0xbe: case 0xbf:
+    /* VGA-proxy for unhandled ext 0xc0-0xdf sub-range */
+    case 0xc1:
+    case 0xc7: case 0xc8: case 0xc9: case 0xca: case 0xcb:
+    case 0xcc: case 0xcd:
+    case 0xd0: case 0xd1: case 0xd2: case 0xd3:
+    case 0xd6: case 0xd7:
+    case 0xd8: case 0xd9: case 0xdb:
+    case 0xdc: case 0xdd: case 0xde: case 0xdf:
+        return (uint32_t)voodoo3_vga_in(s, (uint16_t)((addr & 0xff) + 0x300u));
     case Ext_miscInit2:
         return s->regs[Ext_miscInit2 >> 2];
     /* CRTC frequency regs */
@@ -1717,8 +2316,16 @@ static uint32_t voodoo3_ext_read(Voodoo3State *s, uint32_t addr)
      * Return 0 = DAC ready, not in VSYNC.  The driver polls this to
      * determine when the DAC palette write is safe.
      */
+    case Init_sipMonitor:      /* 0x08 - SIP monitor, read-only scratch */
+        return s->regs[Init_sipMonitor >> 2];
     case Ext_dacStatus:
-        return s->in_vblank ? 0x08u : 0x00u;
+        /*
+         * Bit 3 = VSYNC active, bit 0 = DAC ready.
+         * On real hardware bit 0 is SET after DAC initialisation.
+         * QEMU's DAC is always ready, so always assert bit 0.
+         * FIX: voodoo3diag Module 9 -- DAC ready flag was 0.
+         */
+        return 0x01u | (s->in_vblank ? 0x08u : 0x00u);
 
     /* Sub-byte reads — return the relevant byte of each 32-bit register */
     case 0x29: return (s->vgaInit0  >>  8) & 0xff;
@@ -1758,10 +2365,127 @@ static uint32_t voodoo3_ext_read(Voodoo3State *s, uint32_t addr)
     case 0x72: return (s->regs[Ext_miscInit2 >> 2] >> 16) & 0xff;
     case 0x73: return (s->regs[Ext_miscInit2 >> 2] >> 24) & 0xff;
 
+    /*
+     * Previously-unimplemented ext register read-backs.
+     *
+     * All ported from 86Box vid_voodoo_banshee.c behaviour:
+     *   - Registers that 86Box ext_outl stores in named fields → read back those fields.
+     *   - Registers that fall through to default in 86Box → return 0 (not 0xffffffff)
+     *     so that driver probes don't misinterpret them as "register not present".
+     *   - vidInStatus (0x74) is hardware read-only status; we return 0 (idle, no
+     *     capture active) which matches having no capture hardware in the emulation.
+     *
+     * Register map references:
+     *   0x24  Init_tmugbInit            — write-only; return stored scratch value
+     *   0x3c  Init_2dSrcSize            — 86Box stores in regs[]; return it
+     *   0x58  Video_maxRgbDelta         — 86Box stores scrfilterThreshold; return it
+     *   0x74  Video_vidInStatus         — read-only HW status; return 0 (idle)
+     *   0x7c  Video_vidPllCtrl          — scratch; return stored value
+     *   0x80  Video_vidInXDecimDeltas   — 86Box falls to default (returns 0)
+     *   0x84  Video_vidInError          — 86Box falls to default (returns 0)
+     *   0x88  Video_vidInXStart         — 86Box falls to default (returns 0)
+     *   0x94  Video_vidInYStart         — scratch; return stored value
+     *   0xec  Video_vidInAddr0          — DMA addr scratch
+     *   0xf0  Video_vidInAddr1          — DMA addr scratch
+     *   0xf4  Video_vidInAddr2          — DMA addr scratch
+     *   0xf8  Video_vidInStride         — DMA stride scratch
+     *   0xfc  Video_vidCurrOverlayStartAddr — overlay pointer scratch
+     */
+    case Init_tmugbInit:
+        /*
+         * write-only in 86Box (no field stored).  The AmigaOS Tequila/3dfx driver
+         * reads this back as part of a register-presence probe; return 0 to signal
+         * "not busy / TMU buffer reset complete" rather than the all-ones sentinel
+         * that would indicate "register absent".
+         */
+        return 0x00000000;
+    case Init_2dSrcSize:
+        return s->regs[Init_2dSrcSize >> 2];
+    case Video_maxRgbDelta:
+        /*
+         * 86Box stores this as voodoo->scrfilterThreshold.  We mirror it into
+         * regs[] on write (see ext_write handler above); return the stored value.
+         */
+        return s->regs[Video_maxRgbDelta >> 2];
+    case Video_vidInStatus:
+        /*
+         * Read-only hardware capture status register.
+         * Bit 0 = capture active; bit 1 = odd field; bits 31:16 = line counter.
+         * Return 0 — no capture hardware in emulation, so "idle, even field, line 0".
+         * 86Box banshee_ext_inl() falls to default (returns 0xffffffff); returning 0
+         * is safer for driver probes.
+         */
+        return 0x00000000;
+    case Video_vidPllCtrl:
+        return s->regs[Video_vidPllCtrl >> 2];
+    case Video_vidInXDecimDeltas:
+        return s->regs[Video_vidInXDecimDeltas >> 2];
+    case Video_vidInError:
+        return s->regs[Video_vidInError >> 2];
+    case Video_vidInXStart:
+        return s->regs[Video_vidInXStart >> 2];
+    case Video_vidInYStart:
+        return s->regs[Video_vidInYStart >> 2];
+    case Video_vidInAddr0:
+        return s->regs[Video_vidInAddr0 >> 2];
+    case Video_vidInAddr1:
+        return s->regs[Video_vidInAddr1 >> 2];
+    case Video_vidInAddr2:
+        return s->regs[Video_vidInAddr2 >> 2];
+    case Video_vidInStride:
+        return s->regs[Video_vidInStride >> 2];
+    case Video_vidCurrOverlayStartAddr:
+        return s->regs[Video_vidCurrOverlayStartAddr >> 2];
+
+    /*
+     * Sub-byte reads — Init/PLL/Video registers ported from 86Box.
+     * Each group returns the relevant byte of its parent 32-bit register.
+     */
+
+    /* Init_lfbMemoryConfig (0x0c) sub-bytes */
+    case 0x0d: return (s->lfbMemoryConfig >>  8) & 0xff;
+    case 0x0e: return (s->lfbMemoryConfig >> 16) & 0xff;
+    case 0x0f: return (s->lfbMemoryConfig >> 24) & 0xff;
+
+    /* Init_miscInit0 (0x10) sub-bytes */
+    case 0x11: return (s->miscInit0 >>  8) & 0xff;
+    case 0x12: return (s->miscInit0 >> 16) & 0xff;
+    case 0x13: return (s->miscInit0 >> 24) & 0xff;
+
+    /* Init_dramInit0 (0x18) sub-bytes */
+    case 0x19: return (s->dramInit0 >>  8) & 0xff;
+    case 0x1a: return (s->dramInit0 >> 16) & 0xff;
+    case 0x1b: return (s->dramInit0 >> 24) & 0xff;
+
+    /* Init_dramInit1 (0x1c) sub-bytes */
+    case 0x1d: return (s->dramInit1 >>  8) & 0xff;
+    case 0x1e: return (s->dramInit1 >> 16) & 0xff;
+    case 0x1f: return (s->dramInit1 >> 24) & 0xff;
+
     default:
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: ext read 0x%02x (unimplemented)\n", addr & 0xff);
-        return 0xffffffff;
+        /*
+         * FIX 7: returning 0xffffffff from an unrecognised ext register read
+         * is the worst possible sentinel — many drivers probe registers by
+         * reading them and treat all-ones as "absent/broken hardware".
+         *
+         * Strategy:
+         *   1. Try regs[] first — any write handler that stored a value there
+         *      will be returned correctly, making write->read round-trips work
+         *      for registers we accept but don't decode (capture params etc.).
+         *   2. Fall back to 0x00000000 (hardware-absent / idle) rather than
+         *      0xFFFFFFFF (broken).  This matches 86Box behaviour for the
+         *      handful of capture/misc registers it leaves as default-0.
+         */
+        {
+            uint32_t idx = (addr & 0xffcu) >> 2;
+            if (idx < 512u && s->regs[idx] != 0u) {
+                return s->regs[idx];
+            }
+            qemu_log_mask(LOG_UNIMP,
+                "voodoo3: ext read 0x%03x (unimplemented, returning 0)\n",
+                addr & 0xfffu);
+            return 0x00000000u;
+        }
     }
 }
 
@@ -1969,7 +2693,29 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
             }
             return;
         default:
-            return; /* unknown TMU register — silently ignore */
+            /*
+             * FIX B: Texture Download Port — unrecognised TMU register
+             * write at 0x300+ is raw texel data uploaded via CMDFIFO.
+             *
+             * When the Glide/Warp3D driver uploads texture data via
+             * CMDFIFO Packet-5 register writes (chip=TREX0/1 or broadcast),
+             * it writes sequential 32-bit pixel words to addresses in the
+             * 0x300-0x3fc range.  Each word contains two packed RGB565
+             * texels (or one ARGB8888 texel for 32-bpp formats).
+             *
+             * voodoo3_tex_download() uses (fifo_addr & 0x1ffffc) as the
+             * byte offset within the download window, then adds tex_base[0]
+             * to get the SGRAM destination.  Passing `addr` directly gives
+             * the correct 0x300-0x3fc offset range for the first 1 KB block.
+             *
+             * Ported from: 86Box vid_voodoo_reg.c default case for TMU
+             * register writes at offset >= 0x300 that are not NCC entries.
+             */
+            if (chip & 0x2)
+                voodoo3_tex_download(s, addr, val, 0);
+            if (chip & 0x4)
+                voodoo3_tex_download(s, addr, val, 1);
+            return;
         }
     }
 
@@ -2008,6 +2754,17 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         s->params.fogColor.b = (uint8_t)(val & 0xff);
         break;
     case SST_zaColor:   s->params.zaColor   = val; break;
+    /*
+     * SST_intrCtrl (0x004) — interrupt control register.
+     * Ported from 86Box vid_voodoo_banshee.c banshee->intrCtrl handling.
+     * The AmigaOS4/Warp3D driver writes this register via CMDFIFO Packet-1
+     * with the current render-state value before each draw call; 86Box stores
+     * it filtered by 0x0030003f (only the defined interrupt-enable bits).
+     * Previously fell through to LOG_UNIMP; now handled silently.
+     */
+    case SST_intrCtrl:
+        s->intrCtrl = val & 0x0030003fu;
+        break;
     case SST_chromaKey:
         s->params.chromaKey_r = (uint8_t)((val >> 16) & 0xff);
         s->params.chromaKey_g = (uint8_t)((val >>  8) & 0xff);
@@ -2030,12 +2787,107 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
             }
             break;
         }
+        /*
+         * FBI-only writes to the TMU register range (0x300–0x3fc):
+         * When chip-select has no TREX bits set (chip == 1, FBI-only), these
+         * addresses bypass the TMU handler above and land here.  In 86Box
+         * vid_voodoo_reg.c the main switch has no case for 0x300+, so they
+         * hit `default: break` — silently discarded.  Match that behaviour:
+         * the TMU state is written separately via the TREX chip-select path
+         * (chip & 0x6), which IS handled; the FBI-only writes are redundant
+         * state broadcast that must not produce LOG_UNIMP noise.
+         */
+        if (addr >= 0x300u) {
+            break;
+        }
         /* fall through to unimplemented log */
         qemu_log_mask(LOG_UNIMP,
             "voodoo3: 3D reg 0x%03x = 0x%08x (unimplemented)\n", addr, val);
         break;
 
-    /* --- Integer vertex / gradient registers --- */
+    /*
+     * FIX A: Voodoo2 SST register layout aliases (0x048–0x088)
+     * =========================================================
+     * The AmigaOS4 Warp3D driver and some Glide libraries issue CMDFIFO
+     * Packet-5 register writes using the ORIGINAL Voodoo2 SST byte offsets,
+     * not the Banshee/Voodoo3 remapped layout used by the cases above.
+     *
+     * In the Voodoo2 SST layout:
+     *   0x008-0x01c = vertexAx..vertexCy  (int16 ×16 sub-pixel)
+     *   0x020-0x03c = startR..startW      (int color/Z/ST/W)
+     *   0x040-0x07c = dRdX..dWdY          (int gradients)
+     *   0x080       = triangleCMD          (triggers rasterize)
+     *   0x084-0x088 = fvertexAx, fvertexAy (float vertex, Voodoo2 position)
+     *
+     * QEMU's Banshee layout shifts those registers to 0x180-0x1f8, so
+     * writes at the Voodoo2 addresses fall through to LOG_UNIMP.
+     *
+     * The CMDFIFO handler passes packet register addresses verbatim to
+     * voodoo3_3d_reg_write(), so we add explicit alias cases here.
+     *
+     * addr & 0x3fc is already applied — these are the raw byte offsets.
+     *
+     * Voodoo2 0x008-0x044 are NOT in the log because they coincide with
+     * QEMU's render-state registers (fbzColorPath=0x008 etc.) which are
+     * already handled above. The driver writes state first, then vertex
+     * data — the vertex writes at 0x048+ are the ones that hit the gap.
+     *
+     * Ported from: 86Box vid_voodoo_reg.c voodoo_reg_writel() cases
+     *              SST_dBdX (0x048) through SST_fvertexAy (0x088).
+     */
+
+    /* -- V2 integer gradient dXd aliases (0x048-0x07c) -- */
+    case 0x048: /* V2 dBdX  */ s->params.dBdX = (int32_t)(val & 0xffffff) |
+                    (((val) & 0x800000) ? (int32_t)0xff000000u : 0); break;
+    case 0x04c: /* V2 dZdX  */ s->params.dZdX = (int32_t)val; break;
+    case 0x050: /* V2 dAdX  */ s->params.dAdX = (int32_t)(val & 0xffffff) |
+                    (((val) & 0x800000) ? (int32_t)0xff000000u : 0); break;
+    case 0x054: /* V2 dSdX  */
+        s->params.tmu[0].dSdX = ((int64_t)(int32_t)val) << 14;
+        s->params.tmu[1].dSdX = s->params.tmu[0].dSdX; break;
+    case 0x058: /* V2 dTdX  */
+        s->params.tmu[0].dTdX = ((int64_t)(int32_t)val) << 14;
+        s->params.tmu[1].dTdX = s->params.tmu[0].dTdX; break;
+    case 0x05c: /* V2 dWdX  */
+        s->params.dWdX        = (int64_t)(int32_t)val << 2;
+        s->params.tmu[0].dWdX = s->params.dWdX;
+        s->params.tmu[1].dWdX = s->params.dWdX; break;
+    case 0x060: /* V2 dRdY  */ s->params.dRdY = (int32_t)(val & 0xffffff) |
+                    (((val) & 0x800000) ? (int32_t)0xff000000u : 0); break;
+    case 0x064: /* V2 dGdY  */ s->params.dGdY = (int32_t)(val & 0xffffff) |
+                    (((val) & 0x800000) ? (int32_t)0xff000000u : 0); break;
+    case 0x068: /* V2 dBdY  */ s->params.dBdY = (int32_t)(val & 0xffffff) |
+                    (((val) & 0x800000) ? (int32_t)0xff000000u : 0); break;
+    case 0x06c: /* V2 dZdY  */ s->params.dZdY = (int32_t)val; break;
+    case 0x070: /* V2 dAdY  */ s->params.dAdY = (int32_t)(val & 0xffffff) |
+                    (((val) & 0x800000) ? (int32_t)0xff000000u : 0); break;
+    case 0x074: /* V2 dSdY  */
+        s->params.tmu[0].dSdY = ((int64_t)(int32_t)val) << 14;
+        s->params.tmu[1].dSdY = s->params.tmu[0].dSdY; break;
+    case 0x078: /* V2 dTdY  */
+        s->params.tmu[0].dTdY = ((int64_t)(int32_t)val) << 14;
+        s->params.tmu[1].dTdY = s->params.tmu[0].dTdY; break;
+    case 0x07c: /* V2 dWdY  */
+        s->params.dWdY        = (int64_t)(int32_t)val << 2;
+        s->params.tmu[0].dWdY = s->params.dWdY;
+        s->params.tmu[1].dWdY = s->params.dWdY; break;
+
+    /* -- V2 triangleCMD alias (0x080) -- triggers integer rasterize -- */
+    case 0x080: /* V2 triangleCMD */
+        s->params.sign = (int)(val >> 31);
+        voodoo3_queue_triangle(s, &s->params);
+        s->cmd_read++;
+        break;
+
+    /* -- V2 float vertex aliases (0x084-0x088) -- */
+    case 0x084: /* V2 fvertexAx */
+        f.i = val;
+        s->params.vertexAx = (int32_t)(int16_t)(int32_t)(f.f * 16.0f) & 0xffff;
+        break;
+    case 0x088: /* V2 fvertexAy */
+        f.i = val;
+        s->params.vertexAy = (int32_t)(int16_t)(int32_t)(f.f * 16.0f) & 0xffff;
+        break;
     case SST_vertexAx: s->params.vertexAx = (int32_t)(int16_t)(val & 0xffff); break;
     case SST_vertexAy: s->params.vertexAy = (int32_t)(int16_t)(val & 0xffff); break;
     case SST_vertexBx: s->params.vertexBx = (int32_t)(int16_t)(val & 0xffff); break;
@@ -2109,6 +2961,35 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         break;
 
     /* --- Floating-point vertex / gradient registers --- */
+    /*
+     * 86Box address aliases (SST_fvertexBy/Cx/Cy at 0x094/0x098/0x09c):
+     * The Voodoo 2 register map placed fvertexBy/Cx/Cy at 0x094-0x09c.
+     * Banshee/Voodoo3 remaps them to 0x20c-0x214 (SST_fvertexBy below),
+     * but some drivers (especially older Win9x Voodoo3 drivers) still
+     * write to the Voodoo-2-era addresses.  86Box handles both in
+     * vid_voodoo_reg.c via SST_fvertexBy (0x094) and
+     * SST_remap_fvertexBy (0x094|0x400).  Port the same aliasing here.
+     * Ported from: 86Box vid_voodoo_reg.c lines 357-370.
+     */
+    case 0x08c: /* SST_fvertexAy (Voodoo2/86Box address alias) */
+        f.i = val; s->params.vertexAy = (int32_t)(int16_t)(int32_t)(f.f * 16.0f) & 0xffff; break;
+    case 0x090: /* SST_fvertexBx (Voodoo2/86Box address alias) */
+        f.i = val; s->params.vertexBx = (int32_t)(int16_t)(int32_t)(f.f * 16.0f) & 0xffff; break;
+    case 0x094: /* SST_fvertexBy (Voodoo2/86Box address alias) */
+        f.i = val; s->params.vertexBy = (int32_t)(int16_t)(int32_t)(f.f * 16.0f) & 0xffff; break;
+    case 0x098: /* SST_fvertexCx (Voodoo2/86Box address alias) */
+        f.i = val; s->params.vertexCx = (int32_t)(int16_t)(int32_t)(f.f * 16.0f) & 0xffff; break;
+    case 0x09c: /* SST_fvertexCy (Voodoo2/86Box address alias) */
+        f.i = val; s->params.vertexCy = (int32_t)(int16_t)(int32_t)(f.f * 16.0f) & 0xffff; break;
+
+    /*
+     * 0x1fc: Sits between dWdY (0x1f4) and triangleCMD (0x1f8) / fvertexAx (0x200).
+     * Not defined in the Banshee spec nor in 86Box's register table.
+     * Writes arrive here only with uninitialised data (0xcfcfcfcf) during
+     * driver startup — silently ignore to suppress LOG_UNIMP spam.
+     */
+    case 0x1fc: break; /* reserved/undocumented — silent ignore */
+
     case SST_fvertexAx:
         f.i = val; s->params.vertexAx = (int32_t)(int16_t)(int32_t)(f.f * 16.0f) & 0xffff; break;
     case SST_fvertexAy:
@@ -2121,6 +3002,131 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         f.i = val; s->params.vertexCx = (int32_t)(int16_t)(int32_t)(f.f * 16.0f) & 0xffff; break;
     case SST_fvertexCy:
         f.i = val; s->params.vertexCy = (int32_t)(int16_t)(int32_t)(f.f * 16.0f) & 0xffff; break;
+
+    /*
+     * Float gradient remap registers: 0x0a0 – 0x0fc
+     *
+     * The Banshee/Voodoo3 CMDFIFO remap address space encodes floating-point
+     * triangle-setup parameters in an interleaved per-component layout:
+     *   offset 0x0a0 = fstartR,  0x0a4 = fdRdX,  0x0a8 = fdRdY
+     *   offset 0x0ac = fstartG,  0x0b0 = fdGdX,  0x0b4 = fdGdY
+     *   offset 0x0b8 = fstartB,  0x0bc = fdBdX,  0x0c0 = fdBdY
+     *   offset 0x0c4 = fstartZ,  0x0c8 = fdZdX,  0x0cc = fdZdY
+     *   offset 0x0d0 = fstartA,  0x0d4 = fdAdX,  0x0d8 = fdAdY
+     *   offset 0x0dc = fstartS,  0x0e0 = fdSdX,  0x0e4 = fdSdY  (TMU)
+     *   offset 0x0e8 = fstartT,  0x0ec = fdTdX,  0x0f0 = fdTdY  (TMU)
+     *   offset 0x0f4 = fstartW,  0x0f8 = fdWdX,  0x0fc = fdWdY  (FBI+TMU)
+     *
+     * These map to SST_remap_fstartR .. SST_remap_fdWdY in 86Box vid_voodoo_regs.h.
+     * The AmigaOS 3dfxVoodoo driver issues all triangle-setup parameters via
+     * this remap layout, so missing these causes triangles to render with zero
+     * colour/Z/texture gradients (flat black or garbage).
+     *
+     * Conversion factors (from 86Box vid_voodoo_reg.c):
+     *   R/G/B/Z/A:         float → fixed-point s12.12  (× 4096.0f)
+     *   S/T (tex coords):  float → fixed-point s32.32  (× 4294967296.0f)
+     *   W (perspective):   float → fixed-point s32.32  (× 4294967296.0f)
+     *
+     * S/T/W use the chip-select field (chip = (addr_before_mask >> 10) & 7):
+     *   CHIP_FBI=0x1, CHIP_TREX0=0x2, CHIP_TREX1=0x4
+     *
+     * Ported from: 86Box vid_voodoo_reg.c lines 374–530
+     *              (SST_remap_fstartR .. SST_remap_fdWdY cases)
+     */
+
+    /* --- fstart/fdXd/fdYd : Red --- */
+    case 0x0a0: /* remap_fstartR */
+        f.i = val; s->params.startR = (int32_t)(f.f * 4096.0f); break;
+    case 0x0a4: /* remap_fdRdX */
+        f.i = val; s->params.dRdX   = (int32_t)(f.f * 4096.0f); break;
+    case 0x0a8: /* remap_fdRdY */
+        f.i = val; s->params.dRdY   = (int32_t)(f.f * 4096.0f); break;
+
+    /* --- fstart/fdXd/fdYd : Green --- */
+    case 0x0ac: /* remap_fstartG */
+        f.i = val; s->params.startG = (int32_t)(f.f * 4096.0f); break;
+    case 0x0b0: /* remap_fdGdX */
+        f.i = val; s->params.dGdX   = (int32_t)(f.f * 4096.0f); break;
+    case 0x0b4: /* remap_fdGdY */
+        f.i = val; s->params.dGdY   = (int32_t)(f.f * 4096.0f); break;
+
+    /* --- fstart/fdXd/fdYd : Blue --- */
+    case 0x0b8: /* remap_fstartB */
+        f.i = val; s->params.startB = (int32_t)(f.f * 4096.0f); break;
+    case 0x0bc: /* remap_fdBdX */
+        f.i = val; s->params.dBdX   = (int32_t)(f.f * 4096.0f); break;
+    case 0x0c0: /* remap_fdBdY */
+        f.i = val; s->params.dBdY   = (int32_t)(f.f * 4096.0f); break;
+
+    /* --- fstart/fdXd/fdYd : Z --- */
+    case 0x0c4: /* remap_fstartZ */
+        f.i = val; s->params.startZ = (int32_t)(f.f * 4096.0f); break;
+    case 0x0c8: /* remap_fdZdX */
+        f.i = val; s->params.dZdX   = (int32_t)(f.f * 4096.0f); break;
+    case 0x0cc: /* remap_fdZdY */
+        f.i = val; s->params.dZdY   = (int32_t)(f.f * 4096.0f); break;
+
+    /* --- fstart/fdXd/fdYd : Alpha --- */
+    case 0x0d0: /* remap_fstartA */
+        f.i = val; s->params.startA = (int32_t)(f.f * 4096.0f); break;
+    case 0x0d4: /* remap_fdAdX */
+        f.i = val; s->params.dAdX   = (int32_t)(f.f * 4096.0f); break;
+    case 0x0d8: /* remap_fdAdY */
+        f.i = val; s->params.dAdY   = (int32_t)(f.f * 4096.0f); break;
+
+    /* --- fstart/fdXd/fdYd : S (texture coord, per-TMU via chip select) --- */
+    case 0x0dc: /* remap_fstartS */
+        f.i = val;
+        if (chip & 0x2) s->params.tmu[0].startS = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x4) s->params.tmu[1].startS = (int64_t)(f.f * 4294967296.0f);
+        break;
+    case 0x0e0: /* remap_fdSdX */
+        f.i = val;
+        if (chip & 0x2) s->params.tmu[0].dSdX = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x4) s->params.tmu[1].dSdX = (int64_t)(f.f * 4294967296.0f);
+        break;
+    case 0x0e4: /* remap_fdSdY */
+        f.i = val;
+        if (chip & 0x2) s->params.tmu[0].dSdY = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x4) s->params.tmu[1].dSdY = (int64_t)(f.f * 4294967296.0f);
+        break;
+
+    /* --- fstart/fdXd/fdYd : T (texture coord, per-TMU via chip select) --- */
+    case 0x0e8: /* remap_fstartT */
+        f.i = val;
+        if (chip & 0x2) s->params.tmu[0].startT = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x4) s->params.tmu[1].startT = (int64_t)(f.f * 4294967296.0f);
+        break;
+    case 0x0ec: /* remap_fdTdX */
+        f.i = val;
+        if (chip & 0x2) s->params.tmu[0].dTdX = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x4) s->params.tmu[1].dTdX = (int64_t)(f.f * 4294967296.0f);
+        break;
+    case 0x0f0: /* remap_fdTdY */
+        f.i = val;
+        if (chip & 0x2) s->params.tmu[0].dTdY = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x4) s->params.tmu[1].dTdY = (int64_t)(f.f * 4294967296.0f);
+        break;
+
+    /* --- fstart/fdXd/fdYd : W (perspective, FBI + per-TMU via chip select) --- */
+    case 0x0f4: /* remap_fstartW */
+        f.i = val;
+        if (chip & 0x1) s->params.startW        = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x2) s->params.tmu[0].startW = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x4) s->params.tmu[1].startW = (int64_t)(f.f * 4294967296.0f);
+        break;
+    case 0x0f8: /* remap_fdWdX */
+        f.i = val;
+        if (chip & 0x1) s->params.dWdX        = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x2) s->params.tmu[0].dWdX = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x4) s->params.tmu[1].dWdX = (int64_t)(f.f * 4294967296.0f);
+        break;
+    case 0x0fc: /* remap_fdWdY */
+        f.i = val;
+        if (chip & 0x1) s->params.dWdY        = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x2) s->params.tmu[0].dWdY = (int64_t)(f.f * 4294967296.0f);
+        if (chip & 0x4) s->params.tmu[1].dWdY = (int64_t)(f.f * 4294967296.0f);
+        break;
 
     case SST_fstartR: f.i = val; s->params.startR = (int32_t)(f.f * 4096.0f); break;
     case SST_fstartG: f.i = val; s->params.startG = (int32_t)(f.f * 4096.0f); break;
@@ -2199,6 +3205,7 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         s->params.draw_offset  = val & 0xfffff0;
         break;
     case SST_colBufferStride:
+        s->params.col_stride_raw = val;  /* FIX: keep raw value for readback (diag Module 22) */
 		s->params.col_tiled = !!(val & (1u << 15));
 		s->params.row_width = s->params.col_tiled
 							  ? (val & 0x3fffu) * 128u * 32u
@@ -2208,6 +3215,7 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         s->params.aux_offset = val & 0xfffff0;
         break;
     case SST_auxBufferStride:
+        s->params.aux_stride_raw = val;  /* FIX: keep raw value for readback */
         s->params.aux_tiled     = (int)(val & (1u << 15));
         s->params.aux_row_width = s->params.aux_tiled
                                   ? (val & 0x7fu) * 128u * 32u
@@ -2249,6 +3257,48 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         break;
 
     /* --- Setup engine vertex accumulator --- */
+    /*
+     * 0x2a8–0x2bc: Immediately after sBeginTriCMD (0x2a4).
+     * These addresses exist in neither the Banshee register spec nor 86Box's
+     * register table.  The AmigaOS driver writes real vertex-parameter data
+     * here (values look like packed colour/coordinate words), likely a
+     * driver-specific extension or a misidentified hardware feature.
+     * Until the exact semantics are known, silently ignore to avoid
+     * LOG_UNIMP spam during rendering — the triangles are still drawn via
+     * the standard sDrawTriCMD/sBeginTriCMD path.
+     */
+    case 0x2a8: case 0x2ac: case 0x2b0: case 0x2b4:
+    case 0x2b8: case 0x2bc:
+        break; /* post-sBeginTriCMD reserved range — silent ignore */
+
+    /*
+     * 0x000 = status register: read-only on real hardware.
+     * 86Box silently drops writes (no case in vid_voodoo_reg.c).
+     * QEMU was falling through to LOG_UNIMP; suppress that.
+     */
+    case SST_status: break; /* read-only: silently ignore writes */
+
+    /* --- Setup engine vertex accumulator --- */
+    /*
+     * 86Box address aliases for setup/vertex registers (0x27c–0x2a4):
+     * The Voodoo3 Banshee register remap moves these registers relative
+     * to where the Voodoo 2 spec placed them.  86Box vid_voodoo_regs.h:
+     *   SST_sAlpha = 0x27c, SST_sVz = 0x280, SST_sWb = 0x284,
+     *   SST_sW0 = 0x288,   SST_sS0 = 0x28c, SST_sT0 = 0x290,
+     *   SST_sW1 = 0x294,   SST_sS1 = 0x298, SST_sT1 = 0x29c
+     * QEMU maps these same registers at 0x2dc–0x2fc (SST_sAlpha etc.).
+     * Older Win9x Voodoo3 drivers write both address ranges during init.
+     * Ported from: 86Box vid_voodoo_reg.c lines 774-810.
+     */
+    case 0x27c: { fi_t g; g.i = val; s->verts[3].sAlpha = g.f; } break; /* sAlpha (86Box addr) */
+    case 0x280: { fi_t g; g.i = val; s->verts[3].sVz    = g.f; } break; /* sVz    (86Box addr) */
+    case 0x284: { fi_t g; g.i = val; s->verts[3].sWb    = g.f; } break; /* sWb    (86Box addr) */
+    case 0x288: { fi_t g; g.i = val; s->verts[3].sW0    = g.f; } break; /* sW0    (86Box addr) */
+    case 0x28c: { fi_t g; g.i = val; s->verts[3].sS0    = g.f; } break; /* sS0    (86Box addr) */
+    case 0x290: { fi_t g; g.i = val; s->verts[3].sT0    = g.f; } break; /* sT0    (86Box addr) */
+    case 0x294: { fi_t g; g.i = val; s->verts[3].sW1    = g.f; } break; /* sW1    (86Box addr) */
+    case 0x298: { fi_t g; g.i = val; s->verts[3].sS1    = g.f; } break; /* sS1    (86Box addr) */
+    case 0x29c: { fi_t g; g.i = val; s->verts[3].sT1    = g.f; } break; /* sT1    (86Box addr) */
         case SST_sAlpha: { fi_t g; g.i = val; s->verts[3].sAlpha = g.f; } break;
     case SST_sVz:    { fi_t g; g.i = val; s->verts[3].sVz    = g.f; } break;
     case SST_sWb:    { fi_t g; g.i = val; s->verts[3].sWb    = g.f; } break;
@@ -2411,6 +3461,131 @@ static inline uint32_t blt_get_addr(Voodoo3State *s, int x, int y,
  * PLOT — write one pixel at (x,y) with ROP + pattern + colorkey.
  * Ported from 86Box PLOT() macro.
  * ------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------
+ * blt_alpha_blend_argb32 — per-pixel alpha-blend ARGB32 source onto dest.
+ *
+ * Called when srcFormat is SRC_FORMAT_COL_ARGB32 (srcfmt=7).
+ * Implements Porter-Duff "src over dst" using the alpha byte from the
+ * ARGB32 source pixel, then converts the blended RGB to the destination
+ * pixel format (8-bpp palette index pass-through, 16-bpp RGB565, 32-bpp).
+ *
+ * For dstFormat=0 (DST_FORMAT_COL_PAL / raw 8-bpp palette):
+ *   The Picasso96 driver programs ARGB source pixels but the destination
+ *   is an 8-bpp surface.  We cannot do palette lookup here (no LUT), so
+ *   we write the luminance of the blended RGB as the destination byte.
+ *   This matches what 86Box does (palette-indexed WPAAlpha is a degenerate
+ *   case; drivers that rely on true palette matching use 16/32-bpp dst).
+ *
+ * FIX: "RGB mask blits with RGB source (srcfmt = 7) and different
+ *       colormodels (destfmt = 0) not supported yet"
+ *      "cgx/WPAAlpha unsupported pixfmt: 0 for RECTFMT_ARGB"
+ * ------------------------------------------------------------------------- */
+static inline void blt_alpha_blend_argb32(Voodoo3State *s,
+                                           int x, int y,
+                                           uint32_t src_argb)
+{
+    voodoo3_blt_t *blt = &s->blt;
+    uint32_t alpha = (src_argb >> 24) & 0xffu;
+
+    /* Fully transparent — nothing to write */
+    if (alpha == 0) return;
+
+    /* Decompose source RGB */
+    int sr = (src_argb >> 16) & 0xff;
+    int sg = (src_argb >>  8) & 0xff;
+    int sb =  src_argb        & 0xff;
+
+    switch (blt->dstFormat & DST_FORMAT_COL_MASK) {
+
+    case DST_FORMAT_COL_PAL: /* dstfmt=0 — raw 8-bpp palette surface */
+    case DST_FORMAT_COL_8_BPP: {
+        /* Fully opaque fast-path */
+        uint32_t addr = blt_get_addr(s, x, y, 0, 0);
+        if (addr >= s->fb_size) break;
+        if (alpha == 0xff) {
+            /* Write luminance as palette index (best we can do without LUT) */
+            s->fb_mem[addr] = (uint8_t)(((sr * 77) + (sg * 150) + (sb * 29)) >> 8);
+        } else {
+            uint8_t dst_idx = s->fb_mem[addr];
+            /* Blend luminance with existing value */
+            int dst_lum = dst_idx; /* treat existing byte as luminance */
+            int src_lum = ((sr * 77) + (sg * 150) + (sb * 29)) >> 8;
+            s->fb_mem[addr] = (uint8_t)((src_lum * alpha + dst_lum * (255 - alpha)) / 255);
+        }
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+
+    case DST_FORMAT_COL_16_BPP: {
+        uint32_t addr = blt_get_addr(s, x * 2, y, 0, 0);
+        if (addr + 1 >= s->fb_size) break;
+        if (alpha == 0xff) {
+            /* Fully opaque: direct RGB565 write */
+            uint16_t pix = (uint16_t)(((sr >> 3) << 11) | ((sg >> 2) << 5) | (sb >> 3));
+            *(uint16_t *)(s->fb_mem + addr) = pix;
+        } else {
+            /* Alpha-blend over existing RGB565 */
+            uint16_t dst16 = *(uint16_t *)(s->fb_mem + addr);
+            int dr = ((dst16 >> 11) & 0x1f) << 3;
+            int dg = ((dst16 >>  5) & 0x3f) << 2;
+            int db =  (dst16        & 0x1f) << 3;
+            int rr = (sr * alpha + dr * (255 - alpha)) / 255;
+            int rg = (sg * alpha + dg * (255 - alpha)) / 255;
+            int rb = (sb * alpha + db * (255 - alpha)) / 255;
+            *(uint16_t *)(s->fb_mem + addr) =
+                (uint16_t)(((rr >> 3) << 11) | ((rg >> 2) << 5) | (rb >> 3));
+        }
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+
+    case DST_FORMAT_COL_24_BPP: {
+        uint32_t addr = blt_get_addr(s, x * 3, y, 0, 0);
+        if (addr + 3 >= s->fb_size) break;
+        if (alpha == 0xff) {
+            uint32_t dst32 = *(uint32_t *)(s->fb_mem + addr);
+            *(uint32_t *)(s->fb_mem + addr) =
+                ((src_argb & 0xffffffu)) | (dst32 & 0xff000000u);
+        } else {
+            uint32_t dst32 = *(uint32_t *)(s->fb_mem + addr);
+            int dr = (dst32 >> 16) & 0xff, dg = (dst32 >> 8) & 0xff, db = dst32 & 0xff;
+            int rr = (sr * alpha + dr * (255 - alpha)) / 255;
+            int rg = (sg * alpha + dg * (255 - alpha)) / 255;
+            int rb = (sb * alpha + db * (255 - alpha)) / 255;
+            *(uint32_t *)(s->fb_mem + addr) =
+                ((uint32_t)rr << 16) | ((uint32_t)rg << 8) | (uint32_t)rb
+                | (dst32 & 0xff000000u);
+        }
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+
+    case DST_FORMAT_COL_32_BPP: {
+        uint32_t addr = blt_get_addr(s, x * 4, y, 0, 0);
+        if (addr + 3 >= s->fb_size) break;
+        if (alpha == 0xff) {
+            *(uint32_t *)(s->fb_mem + addr) = src_argb;
+        } else {
+            uint32_t dst32 = *(uint32_t *)(s->fb_mem + addr);
+            int dr = (dst32 >> 16) & 0xff, dg = (dst32 >> 8) & 0xff, db = dst32 & 0xff;
+            int da = (dst32 >> 24) & 0xff;
+            int rr = (sr * alpha + dr * (255 - alpha)) / 255;
+            int rg = (sg * alpha + dg * (255 - alpha)) / 255;
+            int rb = (sb * alpha + db * (255 - alpha)) / 255;
+            int ra = alpha + (da * (255 - alpha)) / 255;
+            *(uint32_t *)(s->fb_mem + addr) =
+                ((uint32_t)ra << 24) | ((uint32_t)rr << 16) |
+                ((uint32_t)rg << 8)  |  (uint32_t)rb;
+        }
+        if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
+        break;
+    }
+
+    default: break;
+    }
+}
+
 static inline void blt_plot(Voodoo3State *s, int x, int y,
                              int pat_x, int pat_y, uint8_t pat_mono,
                              uint32_t src, int src_ck_fmt)
@@ -2418,6 +3593,7 @@ static inline void blt_plot(Voodoo3State *s, int x, int y,
     voodoo3_blt_t *blt = &s->blt;
 
     switch (blt->dstFormat & DST_FORMAT_COL_MASK) {
+    case DST_FORMAT_COL_PAL: /* dstfmt=0 — raw palette (fall-through) */
     case DST_FORMAT_COL_8_BPP: {
         uint32_t addr = blt_get_addr(s, x, y, 0, 0);
         if (addr >= s->fb_size) break;
@@ -2579,6 +3755,7 @@ static void blt_update_src_stride_full(Voodoo3State *s)
     case SRC_FORMAT_COL_8_BPP:  bpp =  8; break;
     case SRC_FORMAT_COL_16_BPP: bpp = 16; break;
     case SRC_FORMAT_COL_24_BPP: bpp = 24; break;
+    case SRC_FORMAT_COL_ARGB32: bpp = 32; break; /* srcfmt=7: ARGB32 */
     default:                     bpp = 32; break;
     }
     switch (blt->srcFormat & SRC_FORMAT_PACKING_MASK) {
@@ -2707,6 +3884,20 @@ static void blt_do_s2s_line(Voodoo3State *s, const uint8_t *src_p,
                     case SRC_FORMAT_COL_24_BPP:
                     case SRC_FORMAT_COL_32_BPP:
                         src_data = *(const uint32_t *)(src_p + sxr); break;
+                    /*
+                     * srcfmt=7: ARGB32 — identical wire format to 32_BPP
+                     * (0xAARRGGBB) but alpha byte drives per-pixel blending.
+                     * FIX: "RGB mask blits with RGB source (srcfmt = 7) and
+                     *       different colormodels (destfmt = 0) not supported"
+                     *      "cgx/WPAAlpha unsupported pixfmt: 0 for RECTFMT_ARGB"
+                     */
+                    case SRC_FORMAT_COL_ARGB32:
+                        src_data = *(const uint32_t *)(src_p + sxr);
+                        /* Dispatch via alpha-blend path; skip normal ROP plot */
+                        if (!transparent) {
+                            blt_alpha_blend_argb32(s, dst_x, dst_y, src_data);
+                        }
+                        goto s2s_next_pixel;
                     case SRC_FORMAT_COL_YUYV:
                         yuv_data = *(const uint32_t *)(src_p + sxr); break;
                     case SRC_FORMAT_COL_UYVY:
@@ -2750,7 +3941,7 @@ static void blt_do_s2s_line(Voodoo3State *s, const uint8_t *src_p,
                     }
                 }
             }
-
+s2s_next_pixel:
             if (use_x_dir) {
                 cur_sx += (blt->command & COMMAND_DX) ? -1 : 1;
                 dst_x  += (blt->command & COMMAND_DX) ? -1 : 1;
@@ -2827,6 +4018,11 @@ static void blt_do_stretch_line(Voodoo3State *s, const uint8_t *src_p,
                     }
                     case SRC_FORMAT_COL_24_BPP:
                     case SRC_FORMAT_COL_32_BPP: src_data = *(const uint32_t *)(src_p+sxr); break;
+                    /* srcfmt=7: ARGB32 with alpha — use alpha-blend path */
+                    case SRC_FORMAT_COL_ARGB32:
+                        src_data = *(const uint32_t *)(src_p+sxr);
+                        if (!transparent) blt_alpha_blend_argb32(s, dst_x, dst_y, src_data);
+                        goto stretch_next_pixel;
                     case SRC_FORMAT_COL_YUYV: yuv_data = *(const uint32_t *)(src_p+sxr); break;
                     case SRC_FORMAT_COL_UYVY:
                         yuv_data = *(const uint32_t *)(src_p+sxr);
@@ -2864,6 +4060,7 @@ static void blt_do_stretch_line(Voodoo3State *s, const uint8_t *src_p,
                 }
             }
 
+stretch_next_pixel:
             /* Bresenham X step */
             error_x -= blt->srcSizeX;
             while (error_x < 0) { error_x += blt->dstSizeX; cur_sx++; }
@@ -3299,9 +4496,29 @@ static void blt_polyfill_continue(Voodoo3State *s, uint32_t data)
     int y_start = MAX(blt->ly[0], blt->ry[0]);
     int y_end;
 
-    /* Determine which edge gets the new vertex */
+    /*
+     * FIX 10: polyfill edge-selection — exact 86Box semantics restored.
+     *
+     * 86Box banshee_polyfill_continue() rule (from source):
+     *   if (ry[1] >= ly[1]) → assign new vertex to LEFT edge
+     *   else                 → assign new vertex to RIGHT edge
+     *
+     * Meaning: when the right tip is at or above (Y-wise equal or further
+     * along) the left tip, the LEFT edge has been consumed first and
+     * receives the next vertex.  This is the correct criterion for a
+     * scanline-fill that walks downward.
+     *
+     * FIX 6 comment was correct in diagnosis but the implementation
+     * `if (blt->ly[1] < blt->ry[1])` is logically equivalent to the
+     * pre-fix code (ly[1] < ry[1]  ⟺  ry[1] > ly[1]) and does NOT
+     * match 86Box's  ry[1] >= ly[1]  (which also fires when they are
+     * equal).  The equal case is the horizontal-top-edge scenario that
+     * was identified as broken — it must select LEFT, not RIGHT.
+     *
+     * Retire logic at the bottom uses the same ry[1] >= ly[1] sense.
+     */
     if (blt->ry[1] >= blt->ly[1]) {
-        /* Left edge */
+        /* Right tip is at or ahead — left edge needs the new vertex */
         blt->lx[1] = ((int32_t)(data << 19)) >> 19;
         blt->ly[1] = ((int32_t)(data <<  3)) >> 19;
         blt->dx[0]    = abs(blt->lx[1] - blt->lx[0]);
@@ -3309,7 +4526,7 @@ static void blt_polyfill_continue(Voodoo3State *s, uint32_t data)
         blt->x_inc[0] = (blt->lx[1] > blt->lx[0]) ? 1 : -1;
         blt->error[0] = blt->dy[0] / 2;
     } else {
-        /* Right edge */
+        /* Left tip is ahead — right edge needs the new vertex */
         blt->rx[1] = ((int32_t)(data << 19)) >> 19;
         blt->ry[1] = ((int32_t)(data <<  3)) >> 19;
         blt->dx[1]    = abs(blt->rx[1] - blt->rx[0]);
@@ -3341,13 +4558,20 @@ static void blt_polyfill_continue(Voodoo3State *s, uint32_t data)
         while (blt->error[1] < 0) { blt->error[1] += blt->dy[1]; blt->rx_cur += blt->x_inc[1]; }
     }
 
-    /* Retire completed vertices */
+    /*
+     * Retire completed vertices — 86Box-faithful.
+     * When both tips meet (ry[1]==ly[1]): both edges exhausted, retire both.
+     * When ry[1] >= ly[1]: left was just extended (its old [0] is now done).
+     * Otherwise:           right was just extended (its old [0] is now done).
+     */
     if (blt->ry[1] == blt->ly[1]) {
         blt->lx[0]=blt->lx[1]; blt->ly[0]=blt->ly[1];
         blt->rx[0]=blt->rx[1]; blt->ry[0]=blt->ry[1];
     } else if (blt->ry[1] >= blt->ly[1]) {
+        /* Left edge was the one we just extended — retire left [0] */
         blt->lx[0]=blt->lx[1]; blt->ly[0]=blt->ly[1];
     } else {
+        /* Right edge was the one we just extended — retire right [0] */
         blt->rx[0]=blt->rx[1]; blt->ry[0]=blt->ry[1];
     }
 }
@@ -3392,6 +4616,7 @@ static void voodoo3_blt_execute(Voodoo3State *s)
 
     /* Decode dstBpp from dstFormat bits[19:16] */
     switch (blt->dstFormat & DST_FORMAT_COL_MASK) {
+    case DST_FORMAT_COL_PAL:    blt->dstBpp = 1; break; /* dstfmt=0: raw 8-bpp palette */
     case DST_FORMAT_COL_8_BPP:  blt->dstBpp = 1; break;
     case DST_FORMAT_COL_16_BPP: blt->dstBpp = 2; break;
     case DST_FORMAT_COL_24_BPP: blt->dstBpp = 3; break;
@@ -3431,9 +4656,65 @@ static void voodoo3_blt_execute(Voodoo3State *s)
     case COMMAND_CMD_POLYFILL:
         /* Polyfill: handled entirely via polyfill_start/continue */
         break;
-    default:
-        qemu_log_mask(LOG_UNIMP, "voodoo3: unknown 2D cmd %u\n",
-                      blt->command & COMMAND_CMD_MASK);
+
+    /*
+     * FIX C: 2D blitter command 11 — TRANS_MONO_BLT
+     *   Host-to-screen monochrome expand with transparency.
+     *   Each bit in the host data stream maps to one destination pixel:
+     *     bit=1 → colorFore  (opaque)
+     *     bit=0 → transparent (skip, preserve dst)
+     *   Used for: text rendering, icon blitting, cursor compositing.
+     *   The host data is written via launch registers (like H2S_BLT);
+     *   here we set up the state so blt_do_h2s_blt() processes it
+     *   correctly.  blt_do_h2s_blt() already checks SRC_FORMAT_COL_1_BPP
+     *   and COMMAND_TRANS_MONO — ensure both bits are set.
+     *
+     *   Ported from: 86Box vid_voodoo_banshee_blitter.c blt_blt() case 11.
+     */
+    case 11: /* TRANS_MONO_BLT */
+        blt->host_data_count = 0;
+        blt->cur_y           = 0;
+        /* Force 1-bpp source format and TRANS_MONO so blt_do_h2s_blt()
+         * uses the monochrome expand path with transparency. */
+        blt->srcFormat = (blt->srcFormat & ~SRC_FORMAT_COL_MASK)
+                       | SRC_FORMAT_COL_1_BPP;
+        blt->command  |= COMMAND_TRANS_MONO | COMMAND_PATTERN_MONO;
+        voodoo3_blt_update_dst_stride(s);
+        voodoo3_blt_update_src_stride(s);
+        blt_update_src_stride_full(s);
+        break;
+
+    /*
+     * FIX C: 2D blitter command 13 — H2S raw pixel blit
+     *   Identical to H2S_BLT (cmd 3) but the host data is raw 32-bit
+     *   ARGB pixels without format conversion.  The driver uploads
+     *   pre-converted pixels directly (icons, scaled bitmaps).
+     *   We treat it as a standard H2S_BLT (same data path); blt_do_h2s_blt()
+     *   writes host_data bytes directly into the framebuffer via
+     *   blt_do_s2s_line() which copies raw bytes when srcBpp==dstBpp.
+     *
+     *   Ported from: 86Box blt_blt() case 13 (same as case 3).
+     */
+    case 13: /* H2S raw pixel blit */
+        blt->host_data_count = 0;
+        blt->cur_y           = 0;
+        voodoo3_blt_update_dst_stride(s);
+        voodoo3_blt_update_src_stride(s);
+        blt_update_src_stride_full(s);
+        break;
+
+    /*
+     * FIX C: 2D blitter command 14 — S2S_FLIP (horizontal mirror)
+     *   Screen-to-screen blit with left-right flip: source pixels are
+     *   read right-to-left (srcX decreasing) and written left-to-right.
+     *   Used by some drivers for double-buffer flips and mirror effects.
+     *   Implemented as a full S2S blit with COMMAND_DX forced active so
+     *   the existing slow-path iterates X in reverse.
+     *
+     *   Ported from: 86Box blt_blt() case 14.
+     */
+    case 14: /* S2S_FLIP */
+        blt_do_s2s_blt(s);
         break;
     }
 }
@@ -3478,6 +4759,10 @@ static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         case COMMAND_CMD_H2S_STRETCH:
             blt_do_h2s_stretch_blt(s, val);
             break;
+        case 11: /* TRANS_MONO_BLT — host data same path as H2S */
+        case 13: /* H2S raw pixel — same data path as H2S */
+            blt_do_h2s_blt(s, val);
+            break;
         case COMMAND_CMD_RECTFILL:
             blt->dstXY = val;
             blt->dstX  = ((int32_t)(val << 19)) >> 19;
@@ -3504,6 +4789,94 @@ static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
             break;
         }
         return;
+    }
+
+    /*
+     * ---- 3Dfx spec-defined control register aliases 0x100..0x154 ----
+     *
+     * The Voodoo3 / Banshee datasheet places the BLT control registers at
+     * offsets 0x100–0x154 within the 2D engine window (BAR0 + 0x100000).
+     * The 86Box-ported code uses an alternate layout (0x10..0x70) for the
+     * same registers.  We intercept the spec offsets here and redirect them
+     * to the identical blt fields so that both layouts work.
+     *
+     * voodoo3diag Module 20 probes these spec offsets and previously got
+     * readback 0 on all six tested registers — now fixed.
+     *
+     * NOTE: offsets 0x128..0x1fc remain pattern-register territory.
+     */
+    if (off >= 0x100 && off <= 0x154) {
+        switch (off) {
+        case 0x100:                              /* dstBaseAddr  [SPEC] */
+            blt->dstBaseAddr       = val & 0xffffffu;
+            blt->dstBaseAddr_tiled = val & 0x80000000u;
+            blt->dstTiled          = !!(val & 0x80000000u);
+            break;
+        case 0x104:                              /* dstFormat    [SPEC] */
+            blt->dstFormat = val;
+            break;
+        case 0x108:                              /* dstSize      [SPEC] */
+            blt->dstSize  = val;
+            blt->dstSizeX = blt->dstW = (int)(val & 0x1fffu);
+            blt->dstSizeY = blt->dstH = (int)((val >> 16) & 0x1fffu);
+            break;
+        case 0x10c:                              /* dstXY        [SPEC] */
+            blt->dstXY = val;
+            blt->dstX  = ((int32_t)(val << 19)) >> 19;
+            blt->dstY  = ((int32_t)(val <<  3)) >> 19;
+            break;
+        case 0x110:                              /* srcBaseAddr  [SPEC] */
+            blt->srcBaseAddr       = val & 0xffffffu;
+            blt->srcBaseAddr_tiled = val & 0x80000000u;
+            blt->srcTiled          = !!(val & 0x80000000u);
+            break;
+        case 0x114:                              /* srcFormat    [SPEC] */
+            blt->srcFormat = val;
+            switch (val & SRC_FORMAT_COL_MASK) {
+            case SRC_FORMAT_COL_1_BPP:  blt->src_bpp =  1; break;
+            case SRC_FORMAT_COL_8_BPP:  blt->src_bpp =  8; break;
+            case SRC_FORMAT_COL_24_BPP: blt->src_bpp = 24; break;
+            case SRC_FORMAT_COL_32_BPP:
+            case SRC_FORMAT_COL_ARGB32: /* srcfmt=7: ARGB32 = 4 bytes/pixel */
+            case SRC_FORMAT_COL_YUYV:
+            case SRC_FORMAT_COL_UYVY:   blt->src_bpp = 32; break;
+            default:                     blt->src_bpp = 16; break;
+            }
+            break;
+        case 0x118:                              /* srcSize      [SPEC] */
+            blt->srcSize  = val;
+            blt->srcSizeX = blt->srcW = (int)(val & 0x1fffu);
+            blt->srcSizeY = blt->srcH = (int)((val >> 16) & 0x1fffu);
+            break;
+        case 0x11c:                              /* srcXY        [SPEC] */
+            blt->srcXY = val;
+            blt->srcX  = ((int32_t)(val << 19)) >> 19;
+            blt->srcY  = ((int32_t)(val <<  3)) >> 19;
+            break;
+        case 0x120: blt->colorBack = val; break; /* colorBack    [SPEC] */
+        case 0x124: blt->colorFore = val; break; /* colorFore    [SPEC] */
+        case 0x150:                              /* rop          [SPEC] */
+            blt->rop     = val;
+            blt->rops[1] = (uint8_t)(val);
+            blt->rops[2] = (uint8_t)(val >> 8);
+            blt->rops[3] = (uint8_t)(val >> 16);
+            break;
+        case 0x154:                              /* command      [SPEC] (write triggers launch) */
+            blt->command = val;
+            blt->launch_pending = 1;
+            voodoo3_blt_execute(s);
+            break;
+        default:
+            /* 0x128..0x14c: fall through to pattern registers below */
+            break;
+        }
+        /*
+         * Return for all properly aliased offsets (0x100..0x124, 0x150, 0x154).
+         * Offsets 0x128..0x14c are NOT aliased and fall through to the
+         * pattern-register handler below (they are valid colorPattern slots).
+         */
+        if (off <= 0x124 || off == 0x150 || off == 0x154)
+            return;
     }
 
     /* ---- Pattern registers 0x100..0x1fc — 8×8 colour pattern ---- */
@@ -3636,6 +5009,7 @@ static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         case SRC_FORMAT_COL_8_BPP:  blt->src_bpp =  8; break;
         case SRC_FORMAT_COL_24_BPP: blt->src_bpp = 24; break;
         case SRC_FORMAT_COL_32_BPP:
+        case SRC_FORMAT_COL_ARGB32: /* srcfmt=7: ARGB32 = 4 bytes/pixel */
         case SRC_FORMAT_COL_YUYV:
         case SRC_FORMAT_COL_UYVY:   blt->src_bpp = 32; break;
         default:                     blt->src_bpp = 16; break;
@@ -3958,9 +5332,43 @@ static uint64_t voodoo3_mmio_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (addr & 0x1f00000) {
     case BAR0_IO_REMAP:
-        ret = (addr & 0x80000u)
-              ? voodoo3_cmd_read(s, (uint32_t)(addr & 0x1fc))
-              : voodoo3_ext_read(s, addr & 0xff);
+        if (addr & 0x80000u) {
+            ret = voodoo3_cmd_read(s, (uint32_t)(addr & 0x1fc));
+        } else {
+            uint32_t eaddr = addr & 0xfc;   /* 4-byte-aligned ext offset */
+            /*
+             * BAR0 IO-remap ext register space layout:
+             *
+             *   0x00..0xAC = native 32-bit registers: ext_read(eaddr) returns
+             *                the full 32-bit value in a single call.
+             *
+             *   0xB0..0xFF = byte-wide DAC / VGA-proxy registers packed four
+             *                per dword.  A 32-bit host read at 4-byte-aligned
+             *                offset 0xXC must assemble bytes [0xXF:0xXE:0xXD:0xXC]
+             *                into a LE uint32.
+             *
+             *                Example: a 32-bit read at 0xD8 must return
+             *                  bits[31:24] = ext_read(0xDB)
+             *                  bits[23:16] = ext_read(0xDA) = dacStatus ← bit 0 = DAC ready
+             *                  bits[15:8]  = ext_read(0xD9)
+             *                  bits[7:0]   = ext_read(0xD8)
+             *
+             *                voodoo3diag Module 9 reads 32 bits at 0xD8 and
+             *                checks dacStatus in bits[23:16].  Without assembly
+             *                that byte was always 0 (DAC not ready).
+             *
+             * FIX: voodoo3diag Module 9 -- dacStatus byte was 0.
+             */
+            if (eaddr >= 0xb0u) {
+                uint32_t b0 = voodoo3_ext_read(s, eaddr);
+                uint32_t b1 = voodoo3_ext_read(s, eaddr + 1u);
+                uint32_t b2 = voodoo3_ext_read(s, eaddr + 2u);
+                uint32_t b3 = voodoo3_ext_read(s, eaddr + 3u);
+                ret = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+            } else {
+                ret = voodoo3_ext_read(s, eaddr);
+            }
+        }
         break;
     case BAR0_2D_REGS:
         switch (addr & 0x1fc) {
@@ -3972,6 +5380,11 @@ static uint64_t voodoo3_mmio_read(void *opaque, hwaddr addr, unsigned size)
          * Return 0 = engine idle so AmigaOS blt waits don't spin.
          */
         case BLT2D_STATUS: ret = 0x00000000u;               break;
+        /*
+         * 86Box-derived control register offsets (0x10..0x70).
+         * Kept for backwards-compatibility with any code using the
+         * 86Box Banshee layout.
+         */
         case 0x010: ret = s->blt.dstBaseAddr;               break;
         case 0x014: ret = s->blt.dstFormat;                 break;
         case 0x034: ret = s->blt.srcBaseAddr;               break;
@@ -3982,6 +5395,24 @@ static uint64_t voodoo3_mmio_read(void *opaque, hwaddr addr, unsigned size)
          */
         case BLT2D_SRCBASE: ret = 0x00000000u;              break;
         case 0x070: ret = s->blt.command;                   break;
+        /*
+         * 3Dfx Voodoo3 / Banshee datasheet register offsets (0x100..0x124).
+         * voodoo3diag Module 20 probes these spec-defined offsets.
+         * They map to the same underlying blt state as the 86Box offsets above.
+         * FIX: all 6 registers were reading back 0x00000000 (MISMATCH).
+         */
+        case 0x100: ret = s->blt.dstBaseAddr;               break; /* dstBaseAddr  [SPEC 0x100] */
+        case 0x104: ret = s->blt.dstFormat;                 break; /* dstFormat    [SPEC 0x104] */
+        case 0x108: ret = s->blt.dstSize;                   break; /* dstSize      [SPEC 0x108] */
+        case 0x10c: ret = s->blt.dstXY;                     break; /* dstXY        [SPEC 0x10C] */
+        case 0x110: ret = s->blt.srcBaseAddr;               break; /* srcBaseAddr  [SPEC 0x110] */
+        case 0x114: ret = s->blt.srcFormat;                 break; /* srcFormat    [SPEC 0x114] */
+        case 0x118: ret = s->blt.srcSize;                   break; /* srcSize      [SPEC 0x118] */
+        case 0x11c: ret = s->blt.srcXY;                     break; /* srcXY        [SPEC 0x11C] */
+        case 0x120: ret = s->blt.colorBack;                 break; /* colorBack    [SPEC 0x120] */
+        case 0x124: ret = s->blt.colorFore;                 break; /* colorFore    [SPEC 0x124] */
+        case 0x150: ret = s->blt.rop;                       break; /* rop          [SPEC 0x150] */
+        case 0x154: ret = s->blt.command;                   break; /* command      [SPEC 0x154] */
         default:
             ret = s->regs[(addr & 0x1fc) >> 2];
             break;
@@ -3995,9 +5426,44 @@ static uint64_t voodoo3_mmio_read(void *opaque, hwaddr addr, unsigned size)
         case SST_status:   ret = voodoo3_status(s);        break;
         case SST_intrCtrl: ret = s->intrCtrl & 0x0030003f; break;
         case SST_fbzColorPath: ret = s->params.fbzColorPath; break;
-        case SST_fbzMode:  ret = s->params.fbzMode;         break;
-        case SST_alphaMode:ret = s->params.alphaMode;       break;
-        case SST_lfbMode:  ret = s->lfbMode;                break;
+        case SST_fogMode:   ret = s->params.fogMode;         break;
+        case SST_fbzMode:   ret = s->params.fbzMode;         break;
+        case SST_alphaMode: ret = s->params.alphaMode;       break;
+        case SST_lfbMode:   ret = s->lfbMode;                break;
+        case SST_stipple:   ret = s->params.stipple;         break;
+        case SST_color0:    ret = s->params.color0;          break;
+        case SST_color1:    ret = s->params.color1;          break;
+        case SST_fogColor:  ret = (uint32_t)s->params.fogColor.r << 16
+                                 | (uint32_t)s->params.fogColor.g <<  8
+                                 | (uint32_t)s->params.fogColor.b;        break;
+        case SST_zaColor:   ret = s->params.zaColor;         break;
+        case SST_chromaKey: ret = s->params.chromaKey;       break;
+        /* clip registers */
+        case SST_clipLeftRight:
+            ret = ((uint32_t)s->params.clipLeft << 16) | (uint32_t)s->params.clipRight;
+            break;
+        case SST_clipLowYHighY:
+            ret = ((uint32_t)s->params.clipLowY << 16) | (uint32_t)s->params.clipHighY;
+            break;
+        case SST_clipLeftRight1:
+            ret = ((uint32_t)s->params.clipLeft1 << 16) | (uint32_t)s->params.clipRight1;
+            break;
+        case SST_clipTopBottom1:
+            ret = ((uint32_t)s->params.clipLowY1 << 16) | (uint32_t)s->params.clipHighY1;
+            break;
+        /* buffer addresses */
+        case SST_colBufferAddr:   ret = s->params.draw_offset;    break;
+        case SST_colBufferStride: ret = s->params.col_stride_raw; break; /* FIX: raw reg, not transformed row_width (diag Module 22) */
+        case SST_auxBufferAddr:   ret = s->params.aux_offset;     break;
+        case SST_auxBufferStride: ret = s->params.aux_stride_raw; break; /* FIX: raw reg */
+        /* fbi statistics counters */
+        case SST_fbiPixelsIn:   ret = s->params.fbiPixelsIn   & 0xffffffu; break;
+        case SST_fbiChromaFail: ret = s->params.fbiChromaFail & 0xffffffu; break;
+        case SST_fbiZFuncFail:  ret = s->params.fbiZFuncFail  & 0xffffffu; break;
+        case SST_fbiAFuncFail:  ret = s->params.fbiAFuncFail  & 0xffffffu; break;
+        case SST_fbiPixelsOut:  ret = s->params.fbiPixelsOut  & 0xffffffu; break;
+        /* setup-unit registers */
+        /* SST_sSetupMode (0x2c0) aliases SST_clipLeftRight1 — handled above */
         default:
             qemu_log_mask(LOG_UNIMP,
                 "voodoo3: 3D reg read 0x%03x\n", (unsigned)(addr & 0x3fc));
@@ -4005,6 +5471,98 @@ static uint64_t voodoo3_mmio_read(void *opaque, hwaddr addr, unsigned size)
             break;
         }
         break;
+    case BAR0_TEX0:
+    case 0x0700000:
+    case BAR0_TEX1:
+    case 0x0900000: {
+        /* TMU register read-back (textureMode, tLOD, etc.) */
+        int tmu = (addr & 0x1f00000) >= BAR0_TEX1 ? 1 : 0;
+        switch (addr & 0x3fc) {
+        case 0x300u: ret = s->params.tmu[tmu].textureMode; break;
+        case 0x304u: ret = s->params.tmu[tmu].tLOD;        break;
+        case 0x308u: /* tDetail - return 0 (no detail tex) */ ret = 0; break;
+        case 0x30cu: ret = s->params.tmu[tmu].texBaseAddr;  break;
+        default:     ret = 0xffffffffu;                     break;
+        }
+        break;
+    }
+    case 0x0a00000: case 0x0b00000: case 0x0c00000: case 0x0d00000:
+    case 0x0e00000: case 0x0f00000:
+        /* Reserved BAR0 regions - return 0 to avoid spurious logs */
+        ret = 0x00000000u;
+        break;
+
+    /*
+     * 3D LFB aperture read — BAR0 offsets 0x1000000–0x1FFFFFF
+     *
+     * Ported from 86Box voodoo_fb_readl() in vid_voodoo_fb.c.
+     * Original author: Sarah Walker.
+     *
+     * The Banshee/V3 uses a different address encoding than Voodoo1/2:
+     *   bits[11:1]  = X byte coordinate within row  (addr & 0xffe)
+     *   bits[21:12] = Y row coordinate              ((addr >> 12) & 0x3ff)
+     *
+     * The read buffer is selected by lfbMode bits[7:6] (LFB_READ_MASK):
+     *   0x00 = front buffer  → params.front_offset
+     *   0x40 = back buffer   → params.draw_offset  (draw = back on Banshee)
+     *   0x80 = aux buffer    → params.aux_offset
+     *
+     * Tiled mode (col_tiled) uses the same 128-column × 32-row tile layout
+     * as the write path in voodoo3_fb_writel():
+     *   read_addr = base
+     *             + (x & 127)                       ← column within tile
+     *             + (x >> 7) * 128 * 32             ← tile strip offset
+     *             + (y & 31) * 128                  ← row within tile
+     *             + (y >> 5) * row_width             ← tile band offset
+     *
+     * Note: The 16-bit read path (voodoo_fb_readw) is not needed here
+     * because QEMU's DEVICE_LITTLE_ENDIAN MemoryRegion decomposes 32-bit
+     * reads to 16-bit automatically if the guest issues a 16-bit access.
+     * All LFB reads via BAR0 MMIO are handled as 32-bit; the upper or
+     * lower half is selected by the MemoryRegion size dispatch.
+     */
+    case 0x1000000: case 0x1100000: case 0x1200000: case 0x1300000:
+    case 0x1400000: case 0x1500000: case 0x1600000: case 0x1700000:
+    case 0x1800000: case 0x1900000: case 0x1a00000: case 0x1b00000:
+    case 0x1c00000: case 0x1d00000: case 0x1e00000: case 0x1f00000:
+    {
+        /* Banshee address decode (type >= VOODOO_BANSHEE):
+         *   x = addr & 0xffe  (byte X, low bit always 0 for 16-bit alignment)
+         *   y = (addr >> 12) & 0x3ff
+         * SLI is not applicable (single-GPU). */
+        int      lx = (int)(addr & 0xffeu);
+        int      ly = (int)((addr >> 12) & 0x3ffu);
+
+        /* Select read buffer from lfbMode bits[7:6] */
+        uint32_t read_base;
+        switch (s->lfbMode & 0xc0u) {
+        case 0x40:  read_base = s->params.draw_offset;  break; /* back  */
+        case 0x80:  read_base = s->params.aux_offset;   break; /* aux   */
+        default:    read_base = s->params.front_offset; break; /* front */
+        }
+
+        /* Tiled or linear address */
+        uint32_t read_addr;
+        if (s->params.col_tiled) {
+            read_addr = read_base
+                      + (uint32_t)(lx & 127)
+                      + (uint32_t)(lx >> 7) * 128u * 32u
+                      + (uint32_t)(ly & 31) * 128u
+                      + (uint32_t)(ly >> 5) * s->params.row_width;
+        } else {
+            read_addr = read_base
+                      + (uint32_t)lx
+                      + (uint32_t)ly * s->params.row_width;
+        }
+
+        if (read_addr + 3u >= s->fb_size) {
+            ret = 0xffffffffu;
+        } else {
+            memcpy(&ret, s->fb_mem + read_addr, 4);
+        }
+        break;
+    }
+
     default:
         qemu_log_mask(LOG_UNIMP,
             "voodoo3: MMIO read 0x%"HWADDR_PRIx"\n", addr);
@@ -5042,8 +6600,17 @@ static void voodoo3_process_cmdfifo(Voodoo3State *s)
                 switch (dst_space) {
                 case 0: /* Linear framebuffer — direct VRAM write */
                 case 1: /* Planar YUV — treat as linear for now */
-                    if (addr + 3 < s->fb_size)
+                    if (addr + 3 < s->fb_size) {
                         memcpy(s->fb_mem + addr, &val, 4);
+                        /*
+                         * Bug 4 fix: invalidate texture cache if the write
+                         * address overlaps a cached texture.
+                         * Ported from 86Box texture_present[] check +
+                         * flush_texture_cache() in voodoo_tex_writel() and
+                         * banshee_linear_write() (vid_voodoo_texture.c).
+                         */
+                        voodoo3_flush_tex_if_dirty(s, addr & s->tex_mask);
+                    }
                     break;
                 case 2: /* Framebuffer through render pipeline */
                     voodoo3_push_fifo(s, (addr & 0xfffffcu) | FIFO_WRITEL_FB, val);
@@ -5074,6 +6641,29 @@ static void voodoo3_process_cmdfifo(Voodoo3State *s)
             break;
         }
 
+        /* ---- Packet 7: Extended packet (Voodoo3 reserved, not in 86Box either) ---- */
+        case 7:
+            /*
+             * Packet type 7 is the "extended" header type reserved in the
+             * Voodoo3/Banshee CMDFIFO spec.  Neither 86Box nor any known driver
+             * actually generates it under normal operation; when it appears the
+             * FIFO almost always contains uninitialised memory (0xcfcfcfcf).
+             *
+             * 86Box behaviour: falls into fatal() — we cannot do that in QEMU.
+             * Previous behaviour: goto drain (flushes the entire FIFO, causing
+             * rendering stalls and repeat log spam for every subsequent dword).
+             *
+             * New behaviour (ported rationale from 86Box vid_voodoo_fifo.c):
+             * Log once and skip the single header dword already consumed, then
+             * continue processing.  The FIFO length counter was already
+             * decremented by cmdfifo_read_dword(); no additional data to skip.
+             */
+            qemu_log_mask(LOG_UNIMP,
+                "voodoo3: unknown CMDFIFO packet type %u header=0x%08x rp=0x%08x"
+                " (skipping, likely uninit FIFO data)\n",
+                header & 7u, header, rp);
+            break;
+
         default:
             qemu_log_mask(LOG_UNIMP,
                 "voodoo3: unknown CMDFIFO packet type %u header=0x%08x rp=0x%08x\n",
@@ -5093,6 +6683,292 @@ drain:
     s->cmdfifo_depth_rd = s->cmdfifo_depth_wr;
     s->cmdfifo_rp       = rp;
     s->cmdfifo_in_sub   = 0;
+}
+
+/*
+ * cmdfifo_read_dword_2 — read one dword from CMDFIFO1 ring buffer.
+ *
+ * Mirrors cmdfifo_read_dword() but operates on the _2 fields (FIFO1).
+ * Ported from 86Box cmdfifo_get_2() in vid_voodoo_fifo.c.
+ *
+ * AGP host memory (cmdfifo_in_agp_2) is not directly accessible in the
+ * QEMU device model (no mem_readl_phys equivalent); we fall back to VRAM,
+ * which is correct for PCI mode where the driver places FIFO1 in SGRAM.
+ */
+static uint32_t cmdfifo_read_dword_2(Voodoo3State *s, uint32_t *rp,
+                                     bool in_sub)
+{
+    uint32_t val = 0;
+    uint32_t off = *rp & (s->fb_size - 1);
+    if (off + 3u < s->fb_size)
+        memcpy(&val, s->fb_mem + off, 4);
+
+    if (!in_sub)
+        s->cmdfifo_depth_rd_2++;
+    *rp += 4;
+
+    /* Wrap within FIFO1 ring */
+    if (s->cmdfifo_end_2 > s->cmdfifo_base_2 && *rp >= s->cmdfifo_end_2)
+        *rp = s->cmdfifo_base_2 + (*rp - s->cmdfifo_end_2);
+
+    return val;
+}
+
+static inline float cmdfifo_read_float_2(Voodoo3State *s, uint32_t *rp,
+                                         bool in_sub)
+{
+    union { uint32_t i; float f; } u;
+    u.i = cmdfifo_read_dword_2(s, rp, in_sub);
+    return u.f;
+}
+
+/*
+ * voodoo3_process_cmdfifo2 — CMDFIFO1 (AGP ring buffer) packet processor.
+ *
+ * Ported from the second while-loop in 86Box voodoo_fifo_thread()
+ * (vid_voodoo_fifo.c, starting at "while (voodoo->cmdfifo_enabled_2 &&
+ * (voodoo->cmdfifo_depth_rd_2 != voodoo->cmdfifo_depth_wr_2 || ...))").
+ *
+ * FIFO1 has the same 7 packet types as FIFO0.  The only difference is:
+ *  - reads come from cmdfifo_read_dword_2() (uses _2 fields)
+ *  - register dispatch still calls cmdfifo_reg_dispatch() (same 3D/2D logic)
+ *  - subroutine state uses cmdfifo_in_sub_2 / cmdfifo_ret_addr_2
+ *
+ * On Pegasos2/AmigaOS4 (PCI bus) FIFO1 is normally never used by the
+ * 3Dfx driver; this path is exercised on AGP boards (MorphOS on G4 Mac).
+ * The function is called from voodoo3_render_thread() after FIFO0.
+ */
+static void voodoo3_process_cmdfifo2(Voodoo3State *s)
+{
+    if (!s->cmdfifo_enabled_2 || s->cmdfifo_base_2 == 0) return;
+
+    /* Packet type 3 component mask bits — same as FIFO0 */
+    enum {
+        CF3_RGB   = 1u << 10, CF3_ALPHA = 1u << 11, CF3_Z    = 1u << 12,
+        CF3_Wb    = 1u << 13, CF3_W0    = 1u << 14, CF3_S0T0 = 1u << 15,
+        CF3_W1    = 1u << 16, CF3_S1T1  = 1u << 17, CF3_PC   = 1u << 28,
+    };
+
+    uint32_t rp      = s->cmdfifo_rp_2;
+    uint32_t ret_rp  = 0;          /* JSR return address */
+    bool     in_sub  = (bool)s->cmdfifo_in_sub_2;
+
+    while (in_sub || (s->cmdfifo_depth_rd_2 < s->cmdfifo_depth_wr_2)) {
+
+        uint32_t header = cmdfifo_read_dword_2(s, &rp, in_sub);
+
+        switch (header & 7u) {
+
+        /* ---- Packet 0: Control ---- */
+        case 0:
+            switch ((header >> 3) & 7u) {
+            case 0: /* NOP */ break;
+            case 1: /* JSR */
+                ret_rp = rp;
+                rp     = (header >> 4) & 0xfffffc;
+                in_sub = true;
+                s->cmdfifo_in_sub_2 = 1;
+                break;
+            case 2: /* RET */
+                rp     = ret_rp;
+                in_sub = false;
+                s->cmdfifo_in_sub_2 = 0;
+                break;
+            case 3: /* JMP local framebuffer */
+                rp = (header >> 4) & 0xfffffc;
+                s->cmdfifo_in_agp_2 = false;
+                break;
+            case 4: /* JMP AGP */
+                {
+                    uint32_t lo = cmdfifo_read_dword_2(s, &rp, in_sub);
+                    rp = ((header >> 4) & 0x1fffffc) | (lo << 25);
+                    s->cmdfifo_in_agp_2 = false; /* no AGP mapping in QEMU */
+                }
+                break;
+            default:
+                qemu_log_mask(LOG_UNIMP,
+                    "voodoo3: CMDFIFO2 bad PKT0 subtype %u header=0x%08x\n",
+                    (header >> 3) & 7u, header);
+                break;
+            }
+            s->cmdfifo_in_sub_2 = in_sub ? 1 : 0;
+            break;
+
+        /* ---- Packet 1: Sequential / strided register write ---- */
+        case 1:
+            {
+                int      cnt  = (int)(header >> 16);
+                uint32_t waddr = (header & 0x7ff8u) >> 1; /* word address */
+                bool     inc  = !!(header & (1u << 15));
+                while (cnt--) {
+                    uint32_t val = cmdfifo_read_dword_2(s, &rp, in_sub);
+                    cmdfifo_reg_dispatch(s, waddr, val);
+                    if (inc) waddr++;
+                }
+            }
+            break;
+
+        /* ---- Packet 2: 2D register write with bitmask ---- */
+        case 2:
+            {
+                uint32_t mask  = header >> 3;
+                uint32_t baddr = 8; /* 2D regs start at byte offset 8 */
+                while (mask) {
+                    if (mask & 1u) {
+                        uint32_t val = cmdfifo_read_dword_2(s, &rp, in_sub);
+                        voodoo3_2d_reg_write(s, baddr, val);
+                    }
+                    baddr += 4;
+                    mask  >>= 1;
+                }
+            }
+            break;
+
+        /* ---- Packet 3: Setup / vertex ---- */
+        case 3:
+            {
+                int      extra        = (int)((header >> 29) & 7u);
+                uint32_t comp_mask    = header;
+                int      smode        = (int)((header >> 22) & 0xfu);
+                int      num_verts    = (int)((header >> 6) & 0xfu);
+                int      v_num        = ((header >> 3) & 7u) == 2 ? 1 : 0;
+
+                voodoo3_3d_reg_write(s, SST_sSetupMode,
+                    ((header >> 10) & 0xffu) | ((uint32_t)smode << 16));
+
+                while (num_verts--) {
+                    s->verts[3].sVx = cmdfifo_read_float_2(s, &rp, in_sub);
+                    s->verts[3].sVy = cmdfifo_read_float_2(s, &rp, in_sub);
+                    if (comp_mask & CF3_RGB) {
+                        if (comp_mask & CF3_PC) {
+                            uint32_t packed = cmdfifo_read_dword_2(s, &rp, in_sub);
+                            s->verts[3].sBlue  = (float)(packed & 0xffu);
+                            s->verts[3].sGreen = (float)((packed >> 8)  & 0xffu);
+                            s->verts[3].sRed   = (float)((packed >> 16) & 0xffu);
+                            s->verts[3].sAlpha = (float)((packed >> 24) & 0xffu);
+                        } else {
+                            s->verts[3].sRed   = cmdfifo_read_float_2(s, &rp, in_sub);
+                            s->verts[3].sGreen = cmdfifo_read_float_2(s, &rp, in_sub);
+                            s->verts[3].sBlue  = cmdfifo_read_float_2(s, &rp, in_sub);
+                        }
+                    }
+                    if ((comp_mask & CF3_ALPHA) && !(comp_mask & CF3_PC))
+                        s->verts[3].sAlpha = cmdfifo_read_float_2(s, &rp, in_sub);
+                    if (comp_mask & CF3_Z)
+                        s->verts[3].sVz = cmdfifo_read_float_2(s, &rp, in_sub);
+                    if (comp_mask & CF3_Wb)
+                        s->verts[3].sWb = cmdfifo_read_float_2(s, &rp, in_sub);
+                    if (comp_mask & CF3_W0)
+                        s->verts[3].sW0 = cmdfifo_read_float_2(s, &rp, in_sub);
+                    if (comp_mask & CF3_S0T0) {
+                        s->verts[3].sS0 = cmdfifo_read_float_2(s, &rp, in_sub);
+                        s->verts[3].sT0 = cmdfifo_read_float_2(s, &rp, in_sub);
+                    }
+                    if (comp_mask & CF3_W1)
+                        s->verts[3].sW1 = cmdfifo_read_float_2(s, &rp, in_sub);
+                    if (comp_mask & CF3_S1T1) {
+                        s->verts[3].sS1 = cmdfifo_read_float_2(s, &rp, in_sub);
+                        s->verts[3].sT1 = cmdfifo_read_float_2(s, &rp, in_sub);
+                    }
+                    /* Fire sBeginTriCMD or sDrawTriCMD */
+                    if (v_num)
+                        voodoo3_3d_reg_write(s, SST_sDrawTriCMD, 0);
+                    else
+                        voodoo3_3d_reg_write(s, SST_sBeginTriCMD, 0);
+                    v_num++;
+                    if (v_num == 3 && ((header >> 3) & 7u) == 0)
+                        v_num = 0;
+                }
+                /* Consume tail padding dwords */
+                while (extra--)
+                    cmdfifo_read_dword_2(s, &rp, in_sub);
+            }
+            break;
+
+        /* ---- Packet 4: Register write with explicit bitmask ---- */
+        case 4:
+            {
+                int      extra = (int)((header >> 29) & 7u);
+                uint32_t mask  = (header >> 15) & 0x3fffu;
+                uint32_t waddr = (header & 0x7ff8u) >> 1;
+                while (mask) {
+                    if (mask & 1u) {
+                        uint32_t val = cmdfifo_read_dword_2(s, &rp, in_sub);
+                        cmdfifo_reg_dispatch(s, waddr, val);
+                    }
+                    waddr++;
+                    mask >>= 1;
+                }
+                while (extra--)
+                    cmdfifo_read_dword_2(s, &rp, in_sub);
+            }
+            break;
+
+        /* ---- Packet 5: Raw VRAM / FB / texture block ---- */
+        case 5:
+            {
+                int      count     = (int)((header >> 3) & 0x7ffffu);
+                unsigned dst_space = (header >> 30) & 3u;
+                uint32_t addr      = cmdfifo_read_dword_2(s, &rp, in_sub)
+                                     & 0xffffffu;
+                if (!count) count = 1;
+
+                while (count--) {
+                    uint32_t val = cmdfifo_read_dword_2(s, &rp, in_sub);
+                    switch (dst_space) {
+                    case 0: /* Linear framebuffer */
+                    case 1: /* Planar YUV — treat as linear */
+                        if (addr + 3u < s->fb_size) {
+                            memcpy(s->fb_mem + addr, &val, 4);
+                            /* Bug 4 fix: texture cache invalidation for
+                             * direct VRAM writes (same as FIFO0 path). */
+                            voodoo3_flush_tex_if_dirty(s, addr & s->tex_mask);
+                        }
+                        break;
+                    case 2: /* Framebuffer through render pipeline */
+                        voodoo3_push_fifo(s,
+                            (addr & 0xfffffcu) | FIFO_WRITEL_FB, val);
+                        break;
+                    case 3: /* Texture RAM */
+                        voodoo3_tex_download(s, addr, val,
+                                             (addr >> 22) & 1);
+                        break;
+                    }
+                    addr += 4;
+                }
+            }
+            break;
+
+        /* ---- Packet 6: AGP DMA (stub — no DMA engine on PCI) ---- */
+        case 6:
+            {
+                /* Consume the 5 DMA parameter dwords (86Box: agpReqSize,
+                 * hostAddressLow, hostAddressHigh, graphicsAddress,
+                 * graphicsStride).  On PCI this is a no-op. */
+                (void)cmdfifo_read_dword_2(s, &rp, in_sub);
+                for (int i = 0; i < 4; i++)
+                    cmdfifo_read_dword_2(s, &rp, in_sub);
+                qemu_log_mask(LOG_UNIMP,
+                    "voodoo3: CMDFIFO2 PKT6 AGP DMA (PCI stub, ignored)\n");
+            }
+            break;
+
+        default:
+            qemu_log_mask(LOG_UNIMP,
+                "voodoo3: CMDFIFO2 unknown packet type %u header=0x%08x"
+                " rp=0x%08x (draining)\n", header & 7u, header, rp);
+            /* Drain to avoid infinite spin on uninitialised FIFO data */
+            s->cmdfifo_depth_rd_2 = s->cmdfifo_depth_wr_2;
+            s->cmdfifo_rp_2       = rp;
+            s->cmdfifo_in_sub_2   = 0;
+            return;
+        }
+
+        s->cmdfifo_rp_2     = rp;
+        s->cmdfifo_in_sub_2 = in_sub ? 1 : 0;
+    }
+    s->cmdfifo_rp_2     = rp;
+    s->cmdfifo_in_sub_2 = in_sub ? 1 : 0;
 }
 
 static void *voodoo3_render_thread(void *arg)
@@ -5141,47 +7017,42 @@ static void *voodoo3_render_thread(void *arg)
             voodoo3_process_cmdfifo(s);
 
             /*
-             * CMDFIFO1 (AGP ring buffer) — process if enabled and non-empty.
+             * Process CMDFIFO1 (AGP ring buffer).
              *
-             * 86Box processes both FIFOs in the same fifo thread.  On PCI
-             * (Pegasos2 / AmigaOS4) CMDFIFO1 is never used by the driver, so
-             * this path is exercised only in AGP configurations.  We reuse the
-             * same packet processor with the FIFO1 base/end/rp/depth fields.
+             * Ported from the second while-loop in 86Box voodoo_fifo_thread()
+             * in vid_voodoo_fifo.c.  86Box runs both FIFOs sequentially in
+             * the same fifo thread; we do the same here.
              *
-             * NOTE: cmdfifo_read_dword() currently reads from FIFO0's ring
-             * and increments cmdfifo_depth_rd (FIFO0).  A full FIFO1 implementation
-             * requires either a parallel read helper that uses the _2 fields,
-             * or a refactor to pass the active FIFO context as a pointer.
-             * For now we drain FIFO1 depth so STATUS never reports "not idle"
-             * when FIFO0 is already empty, avoiding a driver spin on Banshee
-             * boards that initialise CMDFIFO1 even in PCI mode.
+             * On PCI (Pegasos2 / AmigaOS4) FIFO1 is never populated by
+             * the 3Dfx driver, so voodoo3_process_cmdfifo2() returns
+             * immediately (depth_rd_2 == depth_wr_2 and in_sub_2 == 0).
+             * On AGP boards that initialise FIFO1, all 7 packet types are
+             * handled identically to FIFO0.
              */
-            if (s->cmdfifo_enabled_2 &&
-                s->cmdfifo_depth_rd_2 != s->cmdfifo_depth_wr_2) {
-                /* Drain: mark all written dwords as consumed. */
-                s->cmdfifo_depth_rd_2 = s->cmdfifo_depth_wr_2;
-                s->cmdfifo_rp_2       = s->cmdfifo_base_2;
-            }
+            voodoo3_process_cmdfifo2(s);
         }
 
         /*
-         * All threads: rasterize triangles.
-         * 86Box uses band-parallel rendering — each thread renders every
-         * Nth scanline.  We use round-robin triangle dispatch: thread T
-         * processes triangle indices where (idx % nthreads == tid).
-         * This avoids false sharing of param_rd[] across threads.
+         * Band-parallel triangle rasterization — ported from 86Box
+         * render_thread() in vid_voodoo_render.c.
+         *
+         * 86Box model (2-thread example):
+         *   • One shared write pointer (PARAMS_WRITE_IDX).
+         *   • Each thread has its OWN read pointer (PARAMS_READ_IDX[odd_even]).
+         *   • Every triangle is read by EVERY thread.
+         *   • voodoo_half_triangle() skips scanlines where
+         *       (screen_y & odd_even_mask) != thread_id
+         *     so thread 0 draws even scanlines, thread 1 draws odd scanlines.
+         *
+         * Result: zero false-sharing on the framebuffer — adjacent scanlines
+         * are always owned by different threads, preventing the write-tearing
+         * race that the old round-robin dispatch produced on overlapping
+         * triangles.
          */
         uint32_t nthreads = s->render_threads_count;
-        while (true) {
-            uint32_t next = s->param_rd[tid];
-            if (next >= s->param_wr) break;
-            /* Claim this slot atomically */
-            if (next % nthreads != (uint32_t)tid) {
-                s->param_rd[tid]++;
-                continue;
-            }
-            uint32_t idx = next & (PARAM_BUF_SIZE - 1);
-            voodoo3_triangle(s, &s->param_buf[idx]);
+        while (s->param_rd[tid] < s->param_wr) {
+            uint32_t idx = s->param_rd[tid] & (PARAM_BUF_SIZE - 1);
+            voodoo3_triangle(s, &s->param_buf[idx], (int)tid);
             s->param_rd[tid]++;
         }
 
@@ -5198,6 +7069,7 @@ static void *voodoo3_render_thread(void *arg)
     qemu_mutex_unlock(&s->render_lock);
     return NULL;
 }
+
 
 /* =========================================================================
  * Power-on register defaults
@@ -5235,7 +7107,13 @@ static void voodoo3_reset_state(Voodoo3State *s)
     case VOODOO3_MODEL_V3_1000:
         /* Velocity 100: 8 MB SGRAM (single chip) */
         s->dramInit0 = (1u << 27) | (1u << 16); /* SGRAM, 8 MB */
-        s->dramInit1 = 0;
+        /*
+         * Bit 27 = mem_init_done: firmware sets this after DRAM initialisation.
+         * QEMU skips the DRAM init sequence, so we assert it at reset to signal
+         * that memory is valid and ready.
+         * FIX: voodoo3diag Module 18 -- "mem init NOT done" warning.
+         */
+        s->dramInit1 = (1u << 27);
         break;
     case VOODOO3_MODEL_V3_2000:
     case VOODOO3_MODEL_V3_3000:
@@ -5243,7 +7121,7 @@ static void voodoo3_reset_state(Voodoo3State *s)
     default:
         /* V3 2000/3000/3500: 16 MB SGRAM (2 chips) */
         s->dramInit0 = (1u << 27) | (1u << 26) | (1u << 16);
-        s->dramInit1 = 0;
+        s->dramInit1 = (1u << 27); /* mem_init_done — FIX Module 18 */
         break;
     }
     s->pllCtrl0 = s->pllCtrl1 = s->pllCtrl2 = 0;
@@ -5260,6 +7138,11 @@ static void voodoo3_reset_state(Voodoo3State *s)
     s->screen_height   = 480;
     s->desktop_stride  = 640 * 2;    /* RGB565 default: 2 bytes/pixel */
     s->desktop_start   = 0;
+    s->vidDesktopStartAddr = 0;         /* FIX: diag Module 25 WARN -- register
+                                         * readback at 0xE4 returned 0xFFFFFF00
+                                         * (uninitialised garbage > 16 MB VRAM).
+                                         * desktop_start and vidDesktopStartAddr
+                                         * must be kept in sync from reset. */
     s->pix_format      = PIX_FORMAT_RGB565;
     s->display_enabled = false;
     s->in_vblank       = false;
@@ -5389,7 +7272,7 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
      * Subsystem Device IDs from 86Box vid_voodoo_banshee.c pci_regs[0x2e]:
      *   Banshee          0x0003
      *   V3-1000          0x0052  (PCI only — no AGP variant sold)
-     *   V3-2000 PCI      0x0030  /  AGP  0x0038
+     *   V3-2000 PCI      0x0036  /  AGP  0x0038
      *   V3-3000 PCI      0x003A  /  AGP  0x003C
      *   V3-3500          0x0060  (AGP only)
      * ----------------------------------------------------------------------- */
@@ -5404,7 +7287,7 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
         break;
     case VOODOO3_MODEL_V3_2000:
     {
-        uint16_t subid = s->is_agp ? 0x0038u : 0x0030u;
+        uint16_t subid = s->is_agp ? 0x0038u : 0x0036u;
         pci_set_word(cfg + PCI_SUBSYSTEM_ID, subid);
         break;
     }
@@ -5431,10 +7314,6 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
     cfg[PCI_LATENCY_TIMER] = 0x40;
 
     s->fb_size = VOODOO3_FB_SIZE;
-    s->fb_mem  = g_malloc0(s->fb_size);
-    if (!s->fb_mem) {
-        error_setg(errp, "voodoo3: cannot allocate framebuffer"); return;
-    }
 
     /* Allocate texture RAM (4 MB per TMU — shared SGRAM, split evenly) */
     s->tex_mem_size = V3_TEX_MEM_SIZE;
@@ -5455,10 +7334,11 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
         PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_32,
         &s->mmio);
 
-    memory_region_init_ram_device_ptr(&s->lfb_ram, OBJECT(s),
-                                      "voodoo3-lfb",
-                                      VOODOO3_LFB_SIZE,
-                                      s->fb_mem);
+    memory_region_init_ram(&s->lfb_ram, OBJECT(s),
+                           "voodoo3-lfb",
+                           VOODOO3_LFB_SIZE,
+                           &error_fatal);
+    s->fb_mem = memory_region_get_ram_ptr(&s->lfb_ram);
     pci_register_bar(pci_dev, 1,
         PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_32 |
         PCI_BASE_ADDRESS_MEM_PREFETCH, &s->lfb_ram);
@@ -5526,7 +7406,15 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
     uint32_t nthreads = s->render_threads_count;
     if (nthreads < 1) nthreads = 1;
     if (nthreads > MAX_RENDER_THREADS) nthreads = MAX_RENDER_THREADS;
+    /* odd_even_mask must be (power-of-two - 1); clamp to supported values */
+    if (nthreads > 2) nthreads = 4;
+    else if (nthreads > 1) nthreads = 2;
     s->render_threads_count = nthreads;
+    /*
+     * Band-parallel scanline mask (86Box: odd_even_mask = render_threads - 1).
+     * Thread T renders scanlines where (screen_y & odd_even_mask) == T.
+     */
+    s->odd_even_mask = nthreads - 1u;
 
     for (uint32_t i = 0; i < nthreads; i++) {
         uint64_t *arg = g_new(uint64_t, 2);
@@ -5595,7 +7483,6 @@ static void voodoo3_pci_exit(PCIDevice *pci_dev)
     qemu_cond_destroy(&s->fifo_cond);
 
     timer_free(s->vblank_timer);
-    g_free(s->fb_mem);
     s->fb_mem = NULL;
     for (int t = 0; t < 2; t++) {
         g_free(s->tex_mem[t]);
@@ -5610,10 +7497,114 @@ static void voodoo3_reset(DeviceState *dev)
 
 /* =========================================================================
  * VMState
- * ========================================================================= */
+ * =========================================================================
+ *
+ * VMSTATE_VBUFFER_UINT8 — saves a pointer-backed byte buffer whose length
+ * is stored in a uint32_t struct member (the byte count, not word count).
+ *
+ * QEMU ships VMSTATE_VBUFFER_UINT32 (VMS_VBUFFER | VMS_MULTIPLY) which
+ * multiplies the size field by sizeof(uint32_t).  We need the raw byte
+ * count, so we define the _UINT8 variant locally without VMS_MULTIPLY.
+ * This is the only way to save fb_mem (a uint8_t * pointer, 16 MiB) with
+ * fb_size (uint32_t, value = 16*1024*1024 bytes) as the length field.
+ */
+#ifndef VMSTATE_VBUFFER_UINT8
+#define VMSTATE_VBUFFER_UINT8(_field, _state, _version, _test, _num_field) { \
+    .name         = (stringify(_field)),                                       \
+    .version_id   = (_version),                                                \
+    .field_exists = (_test),                                                   \
+    .size_offset  = vmstate_offset_value(_state, _num_field, uint32_t),       \
+    .info         = &vmstate_info_uint8,                                       \
+    .flags        = VMS_VBUFFER,                                               \
+    .offset       = offsetof(_state, _field),                                  \
+}
+#endif
+
+/*
+ * FIX 11: pre_save / post_load hooks for "voodoo3/3dstate" subsection.
+ *
+ * Pack params.fogTable (struct array) and verts[] (struct array) into flat
+ * shadow buffers before save; unpack them after load.
+ */
+static int voodoo3_3dstate_pre_save(void *opaque)
+{
+    Voodoo3State *s = opaque;
+    /* Pack fogTable: {fog,dfog}[64] → uint8_t[128] interleaved */
+    for (int i = 0; i < 64; i++) {
+        s->fog_table_save[i * 2 + 0] = s->params.fogTable[i].fog;
+        s->fog_table_save[i * 2 + 1] = s->params.fogTable[i].dfog;
+    }
+    /* Pack verts[4]: each vertex has 14 floats in declaration order.
+     * verts_save is uint32_t[] - use memcpy to avoid strict-aliasing UB. */
+    for (int v = 0; v < 4; v++) {
+        const voodoo3_vert_t *vsrc = &s->verts[v];
+        float tmp[14] = {
+            vsrc->sVx,   vsrc->sVy,   vsrc->sVz,
+            vsrc->sWb,   vsrc->sRed,  vsrc->sGreen,
+            vsrc->sBlue, vsrc->sAlpha,
+            vsrc->sW0,   vsrc->sS0,   vsrc->sT0,
+            vsrc->sW1,   vsrc->sS1,   vsrc->sT1,
+        };
+        memcpy(s->verts_save + v * 14, tmp, sizeof(tmp));
+    }
+    return 0;
+}
+
+static int voodoo3_3dstate_post_load(void *opaque, int version_id)
+{
+    Voodoo3State *s = opaque;
+    (void)version_id;
+    /* Unpack fogTable */
+    for (int i = 0; i < 64; i++) {
+        s->params.fogTable[i].fog  = s->fog_table_save[i * 2 + 0];
+        s->params.fogTable[i].dfog = s->fog_table_save[i * 2 + 1];
+    }
+    /* Unpack verts[4] */
+    for (int v = 0; v < 4; v++) {
+        float tmp[14];
+        memcpy(tmp, s->verts_save + v * 14, sizeof(tmp));
+        voodoo3_vert_t *vdst = &s->verts[v];
+        vdst->sVx    = tmp[ 0]; vdst->sVy    = tmp[ 1]; vdst->sVz    = tmp[ 2];
+        vdst->sWb    = tmp[ 3]; vdst->sRed   = tmp[ 4]; vdst->sGreen = tmp[ 5];
+        vdst->sBlue  = tmp[ 6]; vdst->sAlpha = tmp[ 7];
+        vdst->sW0    = tmp[ 8]; vdst->sS0    = tmp[ 9]; vdst->sT0    = tmp[10];
+        vdst->sW1    = tmp[11]; vdst->sS1    = tmp[12]; vdst->sT1    = tmp[13];
+    }
+    return 0;
+}
+
+/*
+ * Subsection needed() predicate for "voodoo3/sgram".
+ * Always returns true — we always want to save/restore SGRAM when
+ * migrating.  A non-NULL needed() is required by QEMU's subsection
+ * machinery; passing NULL causes an assertion failure on load in some
+ * QEMU versions.
+ */
+static bool voodoo3_sgram_needed(void *opaque)
+{
+    return true;
+}
+
+/*
+ * FIX 11: Subsection needed() predicate for "voodoo3/3dstate".
+ * Always save — the 3D parameter set (gradients, fog, detail, TMU
+ * texture coordinates, swap state, setup vertices) must survive a
+ * snapshot/restore cycle, otherwise the next triangle submitted after
+ * restore uses stale or zeroed gradient registers and renders garbage.
+ *
+ * This is a new subsection (version 1) so snapshots taken before this
+ * fix load cleanly: QEMU skips unknown subsections, leaving all fields
+ * at their reset() defaults.  The guest driver will re-program all 3D
+ * registers before the next draw call — acceptable for the legacy case.
+ */
+static bool voodoo3_3dstate_needed(void *opaque)
+{
+    return true;
+}
+
 static const VMStateDescription vmstate_voodoo3 = {
     .name           = "voodoo3",
-    .version_id     = 3,
+    .version_id     = 4,
     .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(parent_obj, Voodoo3State),
@@ -5656,9 +7647,261 @@ static const VMStateDescription vmstate_voodoo3 = {
         VMSTATE_UINT32(blt.rop,            Voodoo3State),
         VMSTATE_UINT32(blt.clip0Min,       Voodoo3State),
         VMSTATE_UINT32(blt.clip0Max,       Voodoo3State),
-        VMSTATE_VARRAY_UINT32(fb_mem, Voodoo3State, fb_size, 1, vmstate_info_uint8, uint8_t),
         VMSTATE_UINT32_ARRAY(ncc_gen, Voodoo3State, 2),
+
+        /* --- 3D render-state (missing before version 4) --- */
+        /* params: render-state registers */
+        VMSTATE_UINT32(params.fbzColorPath,    Voodoo3State),
+        VMSTATE_UINT32(params.fbzMode,         Voodoo3State),
+        VMSTATE_UINT32(params.fogMode,         Voodoo3State),
+        VMSTATE_UINT32(params.alphaMode,       Voodoo3State),
+        VMSTATE_UINT32(params.lfbMode,         Voodoo3State),
+        VMSTATE_UINT32(params.stipple,         Voodoo3State),
+        VMSTATE_UINT32(params.color0,          Voodoo3State),
+        VMSTATE_UINT32(params.color1,          Voodoo3State),
+        VMSTATE_UINT32(params.zaColor,         Voodoo3State),
+        VMSTATE_UINT32(params.chromaKey,       Voodoo3State),
+        VMSTATE_UINT32(params.draw_offset,     Voodoo3State),
+        VMSTATE_UINT32(params.front_offset,    Voodoo3State),
+        VMSTATE_UINT32(params.aux_offset,      Voodoo3State),
+        VMSTATE_UINT32(params.row_width,       Voodoo3State),
+        VMSTATE_UINT32(params.aux_row_width,   Voodoo3State),
+        VMSTATE_INT32(params.col_tiled,        Voodoo3State),
+        VMSTATE_INT32(params.aux_tiled,        Voodoo3State),
+        /* FIX: raw stride register values for correct readback (diag Module 22) */
+        VMSTATE_UINT32(params.col_stride_raw,  Voodoo3State),
+        VMSTATE_UINT32(params.aux_stride_raw,  Voodoo3State),
+        VMSTATE_INT32(params.clipLeft,         Voodoo3State),
+        VMSTATE_INT32(params.clipRight,        Voodoo3State),
+        VMSTATE_INT32(params.clipLowY,         Voodoo3State),
+        VMSTATE_INT32(params.clipHighY,        Voodoo3State),
+        VMSTATE_INT32(params.clipLeft1,        Voodoo3State),
+        VMSTATE_INT32(params.clipRight1,       Voodoo3State),
+        VMSTATE_INT32(params.clipLowY1,        Voodoo3State),
+        VMSTATE_INT32(params.clipHighY1,       Voodoo3State),
+        /* params: vertex positions and gradients */
+        VMSTATE_INT32(params.vertexAx,         Voodoo3State),
+        VMSTATE_INT32(params.vertexAy,         Voodoo3State),
+        VMSTATE_INT32(params.vertexBx,         Voodoo3State),
+        VMSTATE_INT32(params.vertexBy,         Voodoo3State),
+        VMSTATE_INT32(params.vertexCx,         Voodoo3State),
+        VMSTATE_INT32(params.vertexCy,         Voodoo3State),
+        VMSTATE_INT32(params.startR,           Voodoo3State),
+        VMSTATE_INT32(params.startG,           Voodoo3State),
+        VMSTATE_INT32(params.startB,           Voodoo3State),
+        VMSTATE_INT32(params.startA,           Voodoo3State),
+        VMSTATE_INT32(params.startZ,           Voodoo3State),
+        VMSTATE_INT32(params.dRdX,             Voodoo3State),
+        VMSTATE_INT32(params.dGdX,             Voodoo3State),
+        VMSTATE_INT32(params.dBdX,             Voodoo3State),
+        VMSTATE_INT32(params.dAdX,             Voodoo3State),
+        VMSTATE_INT32(params.dZdX,             Voodoo3State),
+        VMSTATE_INT32(params.dRdY,             Voodoo3State),
+        VMSTATE_INT32(params.dGdY,             Voodoo3State),
+        VMSTATE_INT32(params.dBdY,             Voodoo3State),
+        VMSTATE_INT32(params.dAdY,             Voodoo3State),
+        VMSTATE_INT32(params.dZdY,             Voodoo3State),
+        VMSTATE_INT64(params.startW,           Voodoo3State),
+        VMSTATE_INT64(params.dWdX,             Voodoo3State),
+        VMSTATE_INT64(params.dWdY,             Voodoo3State),
+        /* params.tmu[0] */
+        VMSTATE_UINT32(params.tmu[0].textureMode,    Voodoo3State),
+        VMSTATE_UINT32(params.tmu[0].tLOD,           Voodoo3State),
+        VMSTATE_UINT32(params.tmu[0].texBaseAddr,    Voodoo3State),
+        VMSTATE_UINT32(params.tmu[0].texBaseAddr1,   Voodoo3State),
+        VMSTATE_UINT32(params.tmu[0].texBaseAddr2,   Voodoo3State),
+        VMSTATE_UINT32(params.tmu[0].texBaseAddr38,  Voodoo3State),
+        VMSTATE_INT32(params.tmu[0].tformat,         Voodoo3State),
+        /* params.tmu[1] */
+        VMSTATE_UINT32(params.tmu[1].textureMode,    Voodoo3State),
+        VMSTATE_UINT32(params.tmu[1].tLOD,           Voodoo3State),
+        VMSTATE_UINT32(params.tmu[1].texBaseAddr,    Voodoo3State),
+        VMSTATE_UINT32(params.tmu[1].texBaseAddr1,   Voodoo3State),
+        VMSTATE_UINT32(params.tmu[1].texBaseAddr2,   Voodoo3State),
+        VMSTATE_UINT32(params.tmu[1].texBaseAddr38,  Voodoo3State),
+        VMSTATE_INT32(params.tmu[1].tformat,         Voodoo3State),
+        /* NCC raw coefficient tables [tmu][table_sel] */
+        VMSTATE_UINT32_ARRAY(ncc_table[0][0].y, Voodoo3State, 4),
+        VMSTATE_UINT32_ARRAY(ncc_table[0][0].i, Voodoo3State, 4),
+        VMSTATE_UINT32_ARRAY(ncc_table[0][0].q, Voodoo3State, 4),
+        VMSTATE_UINT32_ARRAY(ncc_table[0][1].y, Voodoo3State, 4),
+        VMSTATE_UINT32_ARRAY(ncc_table[0][1].i, Voodoo3State, 4),
+        VMSTATE_UINT32_ARRAY(ncc_table[0][1].q, Voodoo3State, 4),
+        VMSTATE_UINT32_ARRAY(ncc_table[1][0].y, Voodoo3State, 4),
+        VMSTATE_UINT32_ARRAY(ncc_table[1][0].i, Voodoo3State, 4),
+        VMSTATE_UINT32_ARRAY(ncc_table[1][0].q, Voodoo3State, 4),
+        VMSTATE_UINT32_ARRAY(ncc_table[1][1].y, Voodoo3State, 4),
+        VMSTATE_UINT32_ARRAY(ncc_table[1][1].i, Voodoo3State, 4),
+        VMSTATE_UINT32_ARRAY(ncc_table[1][1].q, Voodoo3State, 4),
+        /* Hardware cursor state */
+        VMSTATE_INT32(cur_x,   Voodoo3State),
+        VMSTATE_INT32(cur_y,   Voodoo3State),
+        VMSTATE_INT32(cur_yoff, Voodoo3State),
+        VMSTATE_UINT32(cur_c0, Voodoo3State),
+        VMSTATE_UINT32(cur_c1, Voodoo3State),
+        VMSTATE_UINT8_ARRAY(cursor_buf, Voodoo3State, 1024),
+
         VMSTATE_END_OF_LIST()
+    },
+    /*
+     * FIX 8: persist SGRAM (fb_mem) across snapshots.
+     *
+     * fb_mem is a pointer into a RAM-backed MemoryRegion (lfb_ram).  QEMU
+     * normally saves RAM regions automatically via the "ram" block mechanism,
+     * but lfb_ram is a device-private region initialised with
+     * memory_region_init_ram_device_ptr() which does NOT register it as a
+     * named RAM block — so it is invisible to the standard RAM saver.
+     *
+     * We use a subsection (introduced in version 5) so that old snapshots
+     * saved at version 4 still load correctly: QEMU skips unknown
+     * subsections on restore, and fb_mem is cleared to zero on realize(),
+     * producing a blank screen rather than a crash.  The guest OS will
+     * redraw the display as soon as it next calls the driver — acceptable
+     * for the legacy-snapshot case.
+     *
+     * VMSTATE_VBUFFER_UINT8 saves exactly fb_size bytes from fb_mem.
+     * fb_size is fixed at VOODOO3_FB_SIZE (16 MiB) for all supported
+     * models, so no length field is needed.
+     */
+    .subsections = (const VMStateDescription * const []) {
+        &(const VMStateDescription) {
+            .name            = "voodoo3/sgram",
+            .version_id      = 1,
+            .minimum_version_id = 1,
+            .needed          = voodoo3_sgram_needed,
+            .fields = (const VMStateField[]) {
+                VMSTATE_VBUFFER_UINT8(fb_mem, Voodoo3State, 1, NULL, fb_size),
+                VMSTATE_END_OF_LIST()
+            },
+        },
+        /*
+         * FIX 11: "voodoo3/3dstate" subsection.
+         *
+         * Saves all 3D register state that was omitted from the main
+         * VMState list:
+         *
+         *   params.tmu[0/1] gradient fields — startS/T/W and their
+         *     dS/dT/dW per-pixel and per-scanline increments.  Without
+         *     these the texture coordinate walker starts at 0,0 after
+         *     restore, producing a single repeated texel.
+         *   params.tmu[0/1] LOD fields — lodbias, lod_min, lod_max.
+         *     Without these the mipmap selector defaults to LOD 0
+         *     regardless of the distance from camera.
+         *   params.fogTable[64] — per-index fog density + dfog step.
+         *     Without this table-fog renders with all-zero coefficients.
+         *   params.fogColor — RGB fog colour used for linear/z fog.
+         *   params.chromaKey_r/g/b — per-channel chromakey thresholds
+         *     decoded from params.chromaKey; without them chromakey
+         *     passes every pixel.
+         *   params.detail_max/bias/scale[2] — TC_MSELECT_DETAIL blend
+         *     factors.  Without them detail texturing returns zero blend.
+         *   params.sign — triangle winding (1/-1).  Without it all
+         *     back-face cull results are inverted after restore.
+         *   params.swapbufferCMD — pending buffer swap command.
+         *   verts[4] / vertex_num / vertex_next_age / vertex_ages[3] /
+         *     num_verticies / cull_pingpong — setup-engine vertex
+         *     accumulator.  Without these the first sDrawTriCMD after
+         *     restore will use one garbage vertex from index 0.
+         *   swap_pending / swap_interval / swap_offset / retrace_count /
+         *     frame_count — buffer-swap synchronisation.  Without these
+         *     a pending swap may be skipped or triggered twice.
+         *
+         * All fields use the same VMSTATE_ macros as the main list.
+         * No new types are needed — int64_t → VMSTATE_INT64,
+         * float[] → VMSTATE_UINT32_ARRAY (bitwise via memcpy, lossless), struct arrays → per-field entries.
+         *
+         * fogTable is saved as two separate UINT8_ARRAY slices (fog
+         * and dfog bytes interleaved in the struct) using the ARRAY2
+         * pattern: save all fog[i] then all dfog[i] to avoid needing
+         * a custom VMStateDescription for the anonymous struct.
+         */
+        &(const VMStateDescription) {
+            .name            = "voodoo3/3dstate",
+            .version_id      = 1,
+            .minimum_version_id = 1,
+            .needed          = voodoo3_3dstate_needed,
+            .pre_save        = voodoo3_3dstate_pre_save,
+            .post_load       = voodoo3_3dstate_post_load,
+            .fields = (const VMStateField[]) {
+                /* TMU 0 — texture coordinate gradients */
+                VMSTATE_INT64(params.tmu[0].startS,  Voodoo3State),
+                VMSTATE_INT64(params.tmu[0].startT,  Voodoo3State),
+                VMSTATE_INT64(params.tmu[0].startW,  Voodoo3State),
+                VMSTATE_INT64(params.tmu[0].dSdX,    Voodoo3State),
+                VMSTATE_INT64(params.tmu[0].dTdX,    Voodoo3State),
+                VMSTATE_INT64(params.tmu[0].dWdX,    Voodoo3State),
+                VMSTATE_INT64(params.tmu[0].dSdY,    Voodoo3State),
+                VMSTATE_INT64(params.tmu[0].dTdY,    Voodoo3State),
+                VMSTATE_INT64(params.tmu[0].dWdY,    Voodoo3State),
+                VMSTATE_INT32(params.tmu[0].lodbias,  Voodoo3State),
+                VMSTATE_INT32(params.tmu[0].lod_min,  Voodoo3State),
+                VMSTATE_INT32(params.tmu[0].lod_max,  Voodoo3State),
+                /* TMU 1 — texture coordinate gradients */
+                VMSTATE_INT64(params.tmu[1].startS,  Voodoo3State),
+                VMSTATE_INT64(params.tmu[1].startT,  Voodoo3State),
+                VMSTATE_INT64(params.tmu[1].startW,  Voodoo3State),
+                VMSTATE_INT64(params.tmu[1].dSdX,    Voodoo3State),
+                VMSTATE_INT64(params.tmu[1].dTdX,    Voodoo3State),
+                VMSTATE_INT64(params.tmu[1].dWdX,    Voodoo3State),
+                VMSTATE_INT64(params.tmu[1].dSdY,    Voodoo3State),
+                VMSTATE_INT64(params.tmu[1].dTdY,    Voodoo3State),
+                VMSTATE_INT64(params.tmu[1].dWdY,    Voodoo3State),
+                VMSTATE_INT32(params.tmu[1].lodbias,  Voodoo3State),
+                VMSTATE_INT32(params.tmu[1].lod_min,  Voodoo3State),
+                VMSTATE_INT32(params.tmu[1].lod_max,  Voodoo3State),
+                /*
+                 * fogTable — saved via shadow array fog_table_save[128].
+                 * Packing/unpacking done in pre_save/post_load above.
+                 * Layout: [fog0, dfog0, fog1, dfog1, ..., fog63, dfog63]
+                 */
+                VMSTATE_UINT8_ARRAY(fog_table_save, Voodoo3State, 128),
+                /* fogColor — three individual bytes (no padding in struct) */
+                VMSTATE_UINT8(params.fogColor.r, Voodoo3State),
+                VMSTATE_UINT8(params.fogColor.g, Voodoo3State),
+                VMSTATE_UINT8(params.fogColor.b, Voodoo3State),
+                /* chromaKey decoded channels */
+                VMSTATE_UINT8(params.chromaKey_r, Voodoo3State),
+                VMSTATE_UINT8(params.chromaKey_g, Voodoo3State),
+                VMSTATE_UINT8(params.chromaKey_b, Voodoo3State),
+                /* Detail-texture parameters [tmu] */
+                VMSTATE_INT32_ARRAY(params.detail_max,   Voodoo3State, 2),
+                VMSTATE_INT32_ARRAY(params.detail_bias,  Voodoo3State, 2),
+                VMSTATE_INT32_ARRAY(params.detail_scale, Voodoo3State, 2),
+                /* Triangle winding and swap command */
+                VMSTATE_INT32(params.sign,           Voodoo3State),
+                VMSTATE_UINT32(params.swapbufferCMD, Voodoo3State),
+                /* Per-stat counters embedded in params (driver reads back) */
+                VMSTATE_UINT32(params.fbiPixelsIn,    Voodoo3State),
+                VMSTATE_UINT32(params.fbiChromaFail,  Voodoo3State),
+                VMSTATE_UINT32(params.fbiZFuncFail,   Voodoo3State),
+                VMSTATE_UINT32(params.fbiAFuncFail,   Voodoo3State),
+                VMSTATE_UINT32(params.fbiPixelsOut,   Voodoo3State),
+                /*
+                 * Setup-engine vertex accumulator — saved via shadow array
+                 * verts_save[4*14].  Packing/unpacking in pre_save/post_load.
+                 */
+                VMSTATE_UINT32_ARRAY(verts_save, Voodoo3State, 56),
+                VMSTATE_INT32(vertex_num,         Voodoo3State),
+                VMSTATE_INT32(vertex_next_age,    Voodoo3State),
+                VMSTATE_INT32_ARRAY(vertex_ages,  Voodoo3State, 3),
+                VMSTATE_INT32(num_verticies,      Voodoo3State),
+                VMSTATE_INT32(cull_pingpong,       Voodoo3State),
+                /* Buffer-swap synchronisation */
+                VMSTATE_BOOL(swap_pending,        Voodoo3State),
+                VMSTATE_INT32(swap_interval,      Voodoo3State),
+                VMSTATE_UINT32(swap_offset,       Voodoo3State),
+                VMSTATE_INT32(retrace_count,      Voodoo3State),
+                VMSTATE_UINT32(frame_count,       Voodoo3State),
+                /* Global 3D pixel counters */
+                VMSTATE_UINT32(fbiPixelsIn,    Voodoo3State),
+                VMSTATE_UINT32(fbiChromaFail,  Voodoo3State),
+                VMSTATE_UINT32(fbiZFuncFail,   Voodoo3State),
+                VMSTATE_UINT32(fbiAFuncFail,   Voodoo3State),
+                VMSTATE_UINT32(fbiPixelsOut,   Voodoo3State),
+                VMSTATE_END_OF_LIST()
+            },
+        },
+        NULL
     },
 };
 

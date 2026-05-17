@@ -77,20 +77,20 @@
 
 /* fbzMode */
 #define FBZ_ENABLE_CLIPPING     (1 << 0)
-#define FBZ_STIPPLE             (1 << 1)
-#define FBZ_STIPPLE_PATT        (1 << 2)
+#define FBZ_STIPPLE             (1 << 2)
+#define FBZ_STIPPLE_PATT        (1 << 12)
 #define FBZ_W_BUFFER            (1 << 3)
 #define FBZ_DEPTH_ENABLE        (1 << 4)
 #define FBZ_DEPTH_OP_SHIFT      5
 #define FBZ_DEPTH_OP_MASK       (7 << FBZ_DEPTH_OP_SHIFT)
-#define FBZ_DEPTH_BIAS          (1 << 8)
-#define FBZ_DEPTH_SOURCE        (1 << 9)
-#define FBZ_RGB_WMASK           (1 << 10)
-#define FBZ_ALPHA_MASK          (1 << 11)
-#define FBZ_DEPTH_WMASK         (1 << 12)
-#define FBZ_DITHER              (1 << 13)
-#define FBZ_DITHER_2X2          (1 << 14)
-#define FBZ_ALPHA_ENABLE        (1 << 15)
+#define FBZ_DEPTH_BIAS          (1 << 16)
+#define FBZ_DEPTH_SOURCE        (1 << 20)
+#define FBZ_RGB_WMASK           (1 << 9)
+#define FBZ_ALPHA_MASK          (1 << 13)
+#define FBZ_DEPTH_WMASK         (1 << 10)
+#define FBZ_DITHER              (1 << 8)
+#define FBZ_DITHER_2X2          (1 << 11)
+#define FBZ_ALPHA_ENABLE        (1 << 18)
 #define FBZ_Y_ORIGIN            (1 << 17)
 #define FBZ_CHROMAKEY           (1 << 1)    /* hardware fbzMode bit 1 */
 #define FBZ_DITHER_SUB          (1 << 19)   /* hardware fbzMode bit 19: subtraction dither */
@@ -126,11 +126,11 @@
  * voodoo_render.c lines 445 and 544.
  */
 #define TEXMODE_TRILINEAR   (1u << 30)
-#define TEXMODE_LOCAL_MASK  0x0c
-#define TEXMODE_LOCAL       0x0c
+#define TEXMODE_LOCAL_MASK  0x00643000
+#define TEXMODE_LOCAL       0x00241000
 #define TEXMODE_PASSTHROUGH 0x00
-#define TEXMODE_TCLAMPS     (1 << 19)
-#define TEXMODE_TCLAMPT     (1 << 20)
+#define TEXMODE_TCLAMPS     (1 << 6)
+#define TEXMODE_TCLAMPT     (1 << 7)
 #define TEXMODE_TMIRROR_S   (1 << 17)
 #define TEXMODE_TMIRROR_T   (1 << 18)
 
@@ -632,7 +632,8 @@ static inline void apply_fog(int *r, int *g, int *b,
  * Ported from 86Box voodoo_half_triangle()
  * ========================================================================= */
 static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
-                              v3_state_t *st, int ystart, int yend)
+                              v3_state_t *st, int ystart, int yend,
+                              int odd_even)
 {
     uint32_t fbz  = p->fbzMode;
     uint32_t fcp  = p->fbzColorPath;
@@ -787,6 +788,24 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
 
         /* Y-origin flip */
         int screen_y = y_origin ? (y_origin_v - (real_y >> 4)) : (real_y >> 4);
+
+        /*
+         * Band-parallel scanline filter — ported from 86Box
+         * voodoo_half_triangle() (vid_voodoo_render.c line 837):
+         *
+         *   if ((real_y & voodoo->odd_even_mask) != odd_even)
+         *       goto next_line;
+         *
+         * Each render thread only draws the scanlines it owns.
+         * With 1 thread: odd_even_mask=0, odd_even=0 → (y & 0)=0==0 always.
+         * With 2 threads: mask=1 → thread 0 draws even rows, thread 1 odd.
+         * With 4 threads: mask=3 → thread T draws rows where y%4 == T.
+         *
+         * We filter on screen_y (display-space row) rather than raw real_y
+         * so the interleaving is correct when y_origin_flip is active.
+         */
+        if (((uint32_t)screen_y & s->odd_even_mask) != (uint32_t)odd_even)
+            goto next_line;
 
         /* Sub-pixel correction for parameter interpolation */
         if (st->xdir > 0) x2 -= (1 << 16); else x  -= (1 << 16);
@@ -1273,7 +1292,7 @@ next_line:
  * Ported from 86Box voodoo_triangle().
  * Sets up scan-conversion state, computes LOD, calls v3_half_triangle().
  * ========================================================================= */
-void voodoo3_triangle(Voodoo3State *s, const voodoo3_params_t *p)
+void voodoo3_triangle(Voodoo3State *s, const voodoo3_params_t *p, int odd_even)
 {
     v3_state_t st = { 0 };
     int  dx, dy;
@@ -1349,11 +1368,29 @@ void voodoo3_triangle(Voodoo3State *s, const voodoo3_params_t *p)
             LOD >>= 2;
         }
 
-        /* TODO: tLOD[t] lodbias — not in voodoo3_params_t yet, use 0 */
-        int lodbias = 0;
+        /*
+         * FIX 1: wire tLOD lodbias into LOD calculation.
+         * p->tmu[t].lodbias is decoded in voodoo3.c (6-bit signed,
+         * tLOD[17:12]) before the triangle is queued — use it here.
+         *
+         * FIX 5: decode lod_min / lod_max from the tLOD register instead of
+         * hardcoding 0 / V3_LOD_MAX.
+         * tLOD bit layout (Voodoo2/3 hardware spec, matches 86Box):
+         *   bits [5:2]  = lod_min  (4-bit integer, 0..8)
+         *   bits [11:8] = lod_max  (4-bit integer, 0..8)
+         * Both are stored as raw integer LOD levels; multiply by 256 to
+         * convert to the 8.8 fixed-point used by the clamp comparisons in
+         * voodoo_tmu_fetch() (st->lod < st->lod_min[tmu]).
+         */
+        int lodbias = p->tmu[t].lodbias;
         st.tmu[t].lod = LOD + (lodbias << 6);
-        st.lod_min[t] = 0;
-        st.lod_max[t] = V3_LOD_MAX << 8;
+
+        int lod_min_reg = (int)((p->tmu[t].tLOD >> 2) & 0xf);
+        int lod_max_reg = (int)((p->tmu[t].tLOD >> 8) & 0xf);
+        if (lod_min_reg > V3_LOD_MAX) lod_min_reg = V3_LOD_MAX;
+        if (lod_max_reg > V3_LOD_MAX) lod_max_reg = V3_LOD_MAX;
+        st.lod_min[t] = lod_min_reg << 8;
+        st.lod_max[t] = lod_max_reg << 8;
     }
 
     /* Wire decoded texture pointers (set by voodoo3_use_texture) */
@@ -1392,7 +1429,7 @@ void voodoo3_triangle(Voodoo3State *s, const voodoo3_params_t *p)
     vertexAy_adj = (st.vertexAy + 7) >> 4;
     vertexCy_adj = (st.vertexCy + 7) >> 4;
 
-    v3_half_triangle(s, p, &st, vertexAy_adj, vertexCy_adj);
+    v3_half_triangle(s, p, &st, vertexAy_adj, vertexCy_adj, odd_even);
 }
 
 /* =========================================================================
@@ -1537,31 +1574,58 @@ void voodoo3_fb_writel(Voodoo3State *s, uint32_t addr, uint32_t val)
     }
 
     /* -----------------------------------------------------------------------
-     * Compute pixel position.
-     * Voodoo / Banshee address encoding (86Box: addr & 0x7fe = x, addr>>11 = y).
-     * addr is a byte address; divide by 2 gives the 16-bit pixel index.
+     * Compute pixel position — Banshee/V3 address encoding.
+     *
+     * Ported from 86Box voodoo_fb_writel() Banshee branch (vid_voodoo_fb.c):
+     *   x = addr & 0xffe          bits[11:1]  — byte X within row
+     *   y = (addr >> 12) & 0x3ff  bits[21:12] — row index
+     *
+     * The old Voodoo1/2 encoding (x = addr & 0x7fe, y = addr >> 11) is
+     * WRONG for Banshee: it only allows 11-bit X (max 1023 pixels wide) and
+     * the bit ranges overlap, corrupting Y for any resolution > 1024 wide.
+     *
+     * For single-pixel 32-bit formats (ARGB8888 / XRGB8888 / depth+colour)
+     * the caller has already shifted addr >>= 1 to convert the 32-bit pixel
+     * address to a 16-bit one, so the decode below is uniform across formats.
      * ----------------------------------------------------------------------- */
-    x = (int)(addr & 0x7feu);           /* x byte offset within row (even) */
-    y = (int)((addr >> 11) & 0x3ffu);   /* row index */
+    x = (int)(addr & 0xffeu);           /* byte X offset within row (always even) */
+    y = (int)((addr >> 12) & 0x3ffu);  /* row index */
 
-    /* Dirty-line tracking (front-buffer writes update the display) */
-    if (p->draw_offset == p->front_offset && y < V3_DIRTY_LINES)
+    /* -----------------------------------------------------------------------
+     * Write-buffer selection from lfbMode bits[5:4] (LFB_WRITE_MASK).
+     *
+     * Ported from 86Box:
+     *   case LFB_WRITE_FRONT (0x00): fb_write_offset = front_offset
+     *   case LFB_WRITE_BACK  (0x10): fb_write_offset = draw_offset  (back buf)
+     *   default:                     fb_write_offset = front_offset
+     *
+     * Previously QEMU always used draw_offset, which was wrong when the Glide
+     * driver selects the front buffer for direct LFB writes (e.g. 2D overlays).
+     * ----------------------------------------------------------------------- */
+    uint32_t fb_write_offset;
+    switch (s->lfbMode & 0x30u) {
+    case 0x10:  fb_write_offset = p->draw_offset;  break;  /* back  */
+    default:    fb_write_offset = p->front_offset; break;  /* front */
+    }
+
+    /* Dirty-line tracking — front-buffer writes must update the display */
+    if (fb_write_offset == p->front_offset && y < V3_DIRTY_LINES)
         s->dirty_line[y] = 1;
 
     /* Address computation — tiled or linear (86Box col_tiled / aux_tiled) */
     if (p->col_tiled)
-        write_addr = p->draw_offset
-            + (x & 127u) + ((x >> 7) * 128u * 32u)
-            + (y & 31u) * 128u + (y >> 5) * p->row_width;
+        write_addr = fb_write_offset
+            + (uint32_t)(x & 127) + (uint32_t)(x >> 7) * 128u * 32u
+            + (uint32_t)(y & 31) * 128u + (uint32_t)(y >> 5) * p->row_width;
     else
-        write_addr = p->draw_offset + x + (uint32_t)y * p->row_width;
+        write_addr = fb_write_offset + (uint32_t)x + (uint32_t)y * p->row_width;
 
     if (p->aux_tiled)
         write_addr_aux = p->aux_offset
-            + (x & 127u) + ((x >> 7) * 128u * 32u)
-            + (y & 31u) * 128u + (y >> 5) * p->aux_row_width;
+            + (uint32_t)(x & 127) + (uint32_t)(x >> 7) * 128u * 32u
+            + (uint32_t)(y & 31) * 128u + (uint32_t)(y >> 5) * p->aux_row_width;
     else
-        write_addr_aux = p->aux_offset + x + (uint32_t)y * p->aux_row_width;
+        write_addr_aux = p->aux_offset + (uint32_t)x + (uint32_t)y * p->aux_row_width;
 
     /* -----------------------------------------------------------------------
      * Per-pixel pipeline (lfbMode bit 8 = pipeline-enable).

@@ -53,6 +53,7 @@
 #define TEX_ARGB4444  12
 #define TEX_A8I8      13
 #define TEX_APAL88    14
+#define TEX_ARGB_8888 15  /* GR_TEXFMT_ARGB_8888 — 32-bit, 4 bytes/texel (Voodoo3/Banshee) */
 
 /* tLOD bit fields */
 #define LOD_S_IS_WIDER      (1 << 20)
@@ -164,7 +165,9 @@ void voodoo3_recalc_tex(voodoo3_tex_params_t *tp, uint32_t tLOD,
             ((lod & 1) && (tLOD & LOD_ODD)) ||
             (!(lod & 1) && !(tLOD & LOD_ODD));
         if (store_this) {
-            if (tformat & 8)
+            if (tformat == TEX_ARGB_8888)
+                offset += (uint32_t)(w * h * 4);
+            else if (tformat & 8)
                 offset += (uint32_t)(w * h * 2);
             else
                 offset += (uint32_t)(w * h);
@@ -191,7 +194,10 @@ void voodoo3_recalc_tex(voodoo3_tex_params_t *tp, uint32_t tLOD,
         tp->tex_h_mask[lod] = heights[tl] - 1;
         tp->tex_shift [lod] = shifts [tl];
         tp->tex_lod   [lod] = tex_lod;
-        if (tformat & 8)
+        if (tformat == TEX_ARGB_8888)
+            tp->tex_end[lod] = base + offsets[tl]
+                              + (uint32_t)(widths[tl] * heights[tl] * 4);
+        else if (tformat & 8)
             tp->tex_end[lod] = base + offsets[tl]
                               + (uint32_t)(widths[tl] * heights[tl] * 2);
         else
@@ -258,9 +264,20 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
         int       w        = tp->tex_w_mask[lod] + 1;
         int       h        = tp->tex_h_mask[lod] + 1;
         int       src_shift= tp->tex_shift[lod];
+        /*
+         * Row byte-stride depends on bytes-per-texel:
+         *   8-bit  formats (tformat 0–6):  stride = width     = 1 << src_shift
+         *   16-bit formats (tformat 8–14): stride = width * 2 = 1 << (src_shift+1)
+         *   32-bit format  (tformat 15):   stride = width * 4 = 1 << (src_shift+2)
+         * Ported from 86Box vid_voodoo_texture.c where 16-bit uses
+         * `tex_addr += (1 << (tex_shift+1))` per row.
+         */
+        int row_shift = (tformat == TEX_ARGB_8888) ? src_shift + 2
+                      : (tformat & 8)              ? src_shift + 1
+                                                   : src_shift;
 
         for (int y = 0; y < h; y++) {
-            uint32_t  row_addr = tex_addr + (uint32_t)(y << src_shift);
+            uint32_t  row_addr = tex_addr + (uint32_t)(y << row_shift);
             uint32_t *dst_row  = base + (uint32_t)(y * w);
             for (int x = 0; x < w; x++) {
                 uint32_t out;
@@ -346,6 +363,23 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
                     uint32_t c   = s->tex_palette[tmu][d & 0xff];
                     out = MAKERGBA((c >> 16) & 0xff, (c >> 8) & 0xff,
                                     c & 0xff, d >> 8);
+                    break; }
+                /*
+                 * TEX_ARGB_8888 (tformat=15) — 32-bit ARGB, 4 bytes per texel.
+                 * GR_TEXFMT_ARGB_8888 in the Glide3 / Voodoo3 register spec.
+                 * Memory layout: [A][R][G][B] little-endian (BGRA in byte order).
+                 * 86Box does not implement this format (fatal() on unknown format);
+                 * it is used by Warp3D/AmigaOS4 drivers for high-quality textures.
+                 * Ported from the SST-1 hardware spec and Glide3 source.
+                 */
+                case TEX_ARGB_8888: {
+                    uint32_t d;
+                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 4)) & tex_mask], 4);
+                    /* Wire layout: bits[31:24]=A, [23:16]=R, [15:8]=G, [7:0]=B */
+                    out = MAKERGBA((d >> 16) & 0xff,   /* R */
+                                   (d >>  8) & 0xff,   /* G */
+                                    d        & 0xff,   /* B */
+                                   (d >> 24) & 0xff);  /* A */
                     break; }
                 default:
                     out = 0xff808080u;
@@ -480,3 +514,93 @@ void voodoo3_tex_download(Voodoo3State *s, uint32_t fifo_addr, uint32_t val,
         memcpy(s->tex_mem[tmu] + waddr, &val, 4);
     }
 }
+
+/* =========================================================================
+ * voodoo3_flush_tex_if_dirty — invalidate texture cache for a VRAM address
+ *
+ * Ported from 86Box flush_texture_cache() in vid_voodoo_texture.c and the
+ * texture_present[] check in voodoo_tex_writel() / banshee_linear_write().
+ *
+ * Called when guest code writes directly to VRAM (PKT5 dst=0/1 in either
+ * CMDFIFO) at an address that may overlap a cached texture.  86Box tracks
+ * this with a texture_present[] dirty-bit array (TEX_DIRTY_SHIFT = 10,
+ * so one bit per 1 KB of texture memory) and calls flush_texture_cache()
+ * when a dirty bit is set.
+ *
+ * QEMU does not carry the texture_present[] array (the QEMU cache uses a
+ * smaller LRU table).  Instead we replicate the same "is the write address
+ * inside any live cache entry?" logic directly, invalidating every entry
+ * that overlaps the written 1 KB-aligned block.  This is strictly correct:
+ * it may evict more entries than 86Box (no missed invalidation is possible),
+ * but in practice VRAM LFB writes almost never land inside a live texture.
+ *
+ * addr_fb  — raw VRAM byte address of the write (already masked to fb_size)
+ *
+ * Must be called WITHOUT the render_lock held (it does not need to wait for
+ * render threads because the FIFO is processed serially before any triangle
+ * is dispatched that could use the texture).
+ * ========================================================================= */
+void voodoo3_flush_tex_if_dirty(Voodoo3State *s, uint32_t addr_fb)
+{
+    /*
+     * 86Box TEX_DIRTY_SHIFT = 10 → granularity = 1 KB.
+     * We align the incoming address to 1 KB and check both TMUs.
+     */
+    uint32_t dirty_block = addr_fb & ~0x3ffu;   /* 1 KB-aligned */
+
+    for (int tmu = 0; tmu < 2; tmu++) {
+        for (int c = 0; c < V3_TEX_CACHE_SIZE; c++) {
+            v3_tex_cache_entry_t *e = &s->tex_cache[tmu][c];
+            if (!e->valid) continue;
+
+            /*
+             * Walk LODs 0..V3_LOD_MAX and check if dirty_block falls inside
+             * any LOD's VRAM range.  We use the same addr_start/addr_end
+             * approach as 86Box flush_texture_cache():
+             *   addr_start_masked = tex_base[lod] & tex_mask & ~0x3ff
+             *   addr_end_masked   = ((tex_end[lod] & tex_mask) + 0x3ff) & ~0x3ff
+             *
+             * For QEMU we only have LOD 0 base/end stored directly in the
+             * cache entry (e->base = tex_base[0]).  For higher LODs the
+             * base address is >= tex_base[0] and end <= tex_end[lod_max].
+             * A conservative check: invalidate if dirty_block is within
+             *   [tex_base[0] & tex_mask & ~0x3ff,
+             *    (tex_base[0] + V3_TEX_MEM_SIZE) & tex_mask & ~0x3ff)
+             * which is always a superset of all LODs.  This matches the
+             * intent of 86Box's loop over d=0..3 (quadrant checks).
+             */
+            uint32_t base_masked = (e->base) & s->tex_mask & ~0x3ffu;
+            /*
+             * Upper bound: the cached texture spans from base up to at most
+             * one full V3_TEX_MEM_SIZE window.  In practice textures are
+             * much smaller; the extra false-positive evictions are harmless.
+             */
+            uint32_t end_masked  = (base_masked + s->tex_mem_size - 1u)
+                                   & s->tex_mask & ~0x3ffu;
+
+            bool overlaps;
+            if (end_masked >= base_masked) {
+                overlaps = (dirty_block >= base_masked &&
+                            dirty_block <= end_masked);
+            } else {
+                /* Wrap-around case */
+                overlaps = (dirty_block >= base_masked ||
+                            dirty_block <= end_masked);
+            }
+
+            if (overlaps) {
+                /*
+                 * 86Box checks refcount vs refcount_r[] here and calls
+                 * voodoo_wait_for_render_thread_idle() if the texture is
+                 * in use by a render thread.  In QEMU the FIFO thread and
+                 * render threads are serialised via render_lock + render_cond:
+                 * FIFO processing only happens when render threads are idle
+                 * (they sleep in voodoo3_render_thread waiting for param_wr
+                 * to advance).  So no extra wait is needed here.
+                 */
+                e->valid = false;
+            }
+        }
+    }
+}
+

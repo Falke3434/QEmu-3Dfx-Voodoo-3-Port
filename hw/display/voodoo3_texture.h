@@ -84,4 +84,11 @@ void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu);
 void voodoo3_tex_download(Voodoo3State *s, uint32_t fifo_addr,
                           uint32_t val, int tmu);
 
+/*
+ * Invalidate texture-cache entries that overlap a direct VRAM write address.
+ * Ported from 86Box flush_texture_cache() + texture_present[] check.
+ * Call after every PKT5 dst=0/1 (linear LFB) VRAM write.
+ */
+void voodoo3_flush_tex_if_dirty(Voodoo3State *s, uint32_t addr_fb);
+
 #endif /* HW_DISPLAY_VOODOO3_TEXTURE_H */
