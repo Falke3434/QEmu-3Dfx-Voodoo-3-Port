@@ -641,7 +641,7 @@ void voodoo3_draw_cursor(Voodoo3State *s,
                          uint8_t *dst_base, int dst_bpp, int dst_pitch,
                          int w, int dirty_lo, int dirty_hi)
 {
-    if (!s->cursor_ena || !s->fb_mem) return;
+    if (!s->cursor_ena || !s->fb_mem || !s->cur_loc_valid) return;
 
     int cx      = s->cur_x;
     int cy      = s->cur_y;      /* already >= 0 after yoff adjustment */
@@ -701,19 +701,19 @@ void voodoo3_draw_cursor(Voodoo3State *s,
                         if (!p0) continue;
                         pixel = p1 ? col1 : col0;
                     } else {
-                        /* Windows AND/XOR mode (86Box default):
-                         *   p0=0, p1=0  → transparent (skip)
-                         *   p0=0, p1=1  → color1 (foreground)
-                         *   p1=0, p0=1  → color0 (background)  -- wait, no:
+                        /* Windows AND/XOR mode — matches 86Box banshee_hwcursor_draw():
+                         *   p0=0, p1=0  → col0 (background colour)
+                         *   p0=0, p1=1  → col1 (foreground colour)
+                         *   p0=1, p1=1  → XOR pixel with 0xffffff (invert)
+                         *   p0=1, p1=0  → transparent (skip)
                          *
-                         * 86Box logic:
-                         *   if !(plane0 & bit) → draw plane1 ? col1 : col0
-                         *   else if (plane1 & bit) → XOR pixel with 0xffffff
+                         * 86Box reference:
+                         *   if !(plane0 & bit) → pixel = plane1 ? col1 : col0
+                         *   else if (plane1 & bit) → pixel ^= 0xffffff
                          *   else → transparent
                          */
-						if (!p0) {
-							if (!p1) continue;
-							pixel = col1;
+                        if (!p0) {
+                            pixel = p1 ? col1 : col0;
                         } else if (p1) {
                             /* XOR invert */
                             if (dst_bpp == 4)

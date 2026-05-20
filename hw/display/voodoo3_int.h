@@ -373,6 +373,7 @@ struct Voodoo3State {
 
     /* Hardware cursor */
     bool          cursor_ena;
+    bool          cur_loc_valid;  /* true after first hwCurLoc write */
     uint32_t      cur_pat_addr;
     int           cur_x, cur_y;
     int           cur_yoff;     /* sprite rows skipped when cursor clips above screen top */
@@ -384,6 +385,10 @@ struct Voodoo3State {
      * [cur_pat_addr, cur_pat_addr+1024).  This avoids reading directly from
      * fb_mem where 32-bit writes from a big-endian CPU have been byte-swapped
      * by QEMU's DEVICE_LITTLE_ENDIAN memory region, corrupting the 1bpp mask.
+     *
+     * Default (reset): plane0=0xFF, plane1=0x00 per row = fully transparent
+     * in Windows AND/XOR mode (p0=1,p1=0 → skip).  This prevents a coloured
+     * rectangle at (0,0) between cursor enable and the first shape write.
      */
     uint8_t       cursor_buf[1024];
 

@@ -212,6 +212,7 @@
 #include "qemu/timer.h"
 #include "qemu/thread.h"
 #include "qapi/error.h"
+#include "qemu/bswap.h"
 #include "hw/pci/pci_device.h"
 #include "hw/display/voodoo3.h"
 #include "hw/display/voodoo3_int.h"
@@ -1436,10 +1437,15 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         s->hwCurPatAddr = val;
         s->cur_pat_addr = val & 0xfffff0u;
         /*
-         * Ported from 86Box: addr = (val & 0xfffff0) + (yoff * 16)
-         * Pre-populate cursor_buf from the correct sprite row.
+         * Only refresh cursor_buf if the OS has already positioned the cursor
+         * (cur_loc_valid).  Before that point fb_mem at cur_pat_addr is still
+         * zero (the OS hasn't written the shape yet), so copying it would turn
+         * cursor_buf from the safe transparent default (plane0=0xFF, plane1=0x00)
+         * into all-zeros → every pixel = col0 → coloured rectangle at boot.
+         * The hwCurLoc handler (which sets cur_loc_valid) always reloads
+         * cursor_buf from the freshly written VRAM anyway.
          */
-        {
+        if (s->cur_loc_valid) {
             uint32_t base = s->cur_pat_addr + (uint32_t)s->cur_yoff * 16u;
             uint32_t len  = 1024u - (uint32_t)s->cur_yoff * 16u;
             if (base + len <= s->fb_size)
@@ -1469,6 +1475,7 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
                 memcpy(s->cursor_buf, s->fb_mem + base,
                        1024u - (uint32_t)s->cur_yoff * 16u);
         }
+        s->cur_loc_valid = true;   /* OS has positioned the cursor — safe to draw */
         break;
     case Video_hwCurC0: s->cur_c0 = val; break;
     case Video_hwCurC1: s->cur_c1 = val; break;
@@ -1990,7 +1997,8 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
             uint32_t mask = 0xffu << (bidx * 8u);
             s->hwCurPatAddr = (s->hwCurPatAddr & ~mask) | ((val & 0xffu) << (bidx * 8u));
             s->cur_pat_addr = s->hwCurPatAddr & 0xfffff0u;
-            {
+            /* Same guard as the dword handler — see comment there */
+            if (s->cur_loc_valid) {
                 uint32_t base = s->cur_pat_addr + (uint32_t)s->cur_yoff * 16u;
                 uint32_t len  = 1024u - (uint32_t)s->cur_yoff * 16u;
                 if (base + len <= s->fb_size)
@@ -2025,6 +2033,7 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
                         memcpy(s->cursor_buf, s->fb_mem + base,
                                1024u - (uint32_t)s->cur_yoff * 16u);
                 }
+                s->cur_loc_valid = true;   /* OS has positioned the cursor — safe to draw */
             }
             break;
         }
@@ -3610,7 +3619,7 @@ static inline void blt_plot(Voodoo3State *s, int x, int y,
         if (addr + 1 >= s->fb_size) break;
         uint32_t dst  = *(uint16_t *)(s->fb_mem + addr);
         uint32_t pat  = (blt->command & COMMAND_PATTERN_MONO)
-            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? blt->colorFore : blt->colorBack)
+            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? bswap16(blt->colorFore) : blt->colorBack)
             : (uint32_t)blt->colorPattern16[(pat_x & 7) + (pat_y & 7) * 8];
         *(uint16_t *)(s->fb_mem + addr) = (uint16_t)blt_mix(blt, dst, src, pat, src_ck_fmt, BLT_COLORKEY_16);
         if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
@@ -3633,7 +3642,7 @@ static inline void blt_plot(Voodoo3State *s, int x, int y,
         if (addr + 3 >= s->fb_size) break;
         uint32_t dst  = *(uint32_t *)(s->fb_mem + addr);
         uint32_t pat  = (blt->command & COMMAND_PATTERN_MONO)
-            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? blt->colorFore : blt->colorBack)
+            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? bswap32(blt->colorFore) : blt->colorBack)
             : blt->colorPattern[(pat_x & 7) + (pat_y & 7) * 8];
         *(uint32_t *)(s->fb_mem + addr) = blt_mix(blt, dst, src, pat, src_ck_fmt, BLT_COLORKEY_32);
         if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
@@ -4126,7 +4135,7 @@ static void blt_do_rectfill(Voodoo3State *s)
                 memset(row, (uint8_t)color, (size_t)w);
                 break;
             case 16: {
-                uint16_t c = (uint16_t)color;
+                uint16_t c = bswap16((uint16_t)color);
                 uint16_t *p = (uint16_t *)row;
                 for (int x = 0; x < w; x++) *p++ = c;
                 break;
@@ -7230,6 +7239,37 @@ static void voodoo3_reset_state(Voodoo3State *s)
         memset(s->tex_cache[t], 0, sizeof(s->tex_cache[t]));
         s->tex_lru[t] = 0;
     }
+
+    /*
+     * Hardware cursor reset.
+     *
+     * Two independent guards prevent the boot artefact (coloured rectangle
+     * at top-left before the OS positions the cursor):
+     *
+     * 1. cur_loc_valid — false until the first explicit hwCurLoc write.
+     *    voodoo3_draw_cursor() returns immediately while this is false,
+     *    so no cursor is drawn even if cursor_ena is set early.
+     *
+     * 2. cursor_buf transparent pattern — every row is initialised with
+     *    plane0=0xFF, plane1=0x00.  In Windows AND/XOR mode this means
+     *    p0=1, p1=0 for every pixel → transparent (skip), so even if
+     *    cur_loc_valid somehow becomes true before the OS writes the real
+     *    sprite shape, the cursor remains invisible.
+     *    (In X11 mode plane0=mask: 0xFF means all pixels drawn, but
+     *    cur_loc_valid still guards that path.)
+     */
+    s->cur_loc_valid = false;
+    s->cur_x         = 0;
+    s->cur_y         = 0;
+    s->cur_yoff      = 0;
+    s->cur_c0        = 0;
+    s->cur_c1        = 0;
+    s->cur_pat_addr  = 0;
+    for (int row = 0; row < 64; row++) {
+        uint8_t *p = s->cursor_buf + row * 16;
+        memset(p,     0xFF, 8);   /* plane0: all 1 → p0=1 (transparent in Win mode) */
+        memset(p + 8, 0x00, 8);   /* plane1: all 0 → p1=0 */
+    }
 }
 
 /* =========================================================================
@@ -7740,6 +7780,7 @@ static const VMStateDescription vmstate_voodoo3 = {
         VMSTATE_UINT32(cur_c0, Voodoo3State),
         VMSTATE_UINT32(cur_c1, Voodoo3State),
         VMSTATE_UINT8_ARRAY(cursor_buf, Voodoo3State, 1024),
+        VMSTATE_BOOL(cur_loc_valid, Voodoo3State),
 
         VMSTATE_END_OF_LIST()
     },
