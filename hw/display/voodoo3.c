@@ -237,6 +237,38 @@
 static void voodoo3_cmdfifo_reposition(Voodoo3State *s);
 
 /* -----------------------------------------------------------------------
+ * SDL-safe deferred console resize — Bottom Half callback.
+ *
+ * All qemu_console_resize() calls that originate from MMIO-write paths or
+ * from inside voodoo3_update_display_dirty() use this BH instead of calling
+ * qemu_console_resize() directly.  The BH fires at the start of the next
+ * QEMU main-loop iteration, guaranteed in the main thread with no blit in
+ * progress — which is the only safe point for SDL surface replacement.
+ * ----------------------------------------------------------------------- */
+static void voodoo3_resize_bh(void *opaque)
+{
+    Voodoo3State *s = VOODOO3_PCI(opaque);
+    int w = s->resize_pending_w;
+    int h = s->resize_pending_h;
+    if (s->con && w > 0 && h > 0) {
+        qemu_console_resize(s->con, w, h);
+        memset(s->dirty_line, 1, sizeof(s->dirty_line));
+    }
+    s->resize_pending_w = 0;
+    s->resize_pending_h = 0;
+}
+
+/* Helper: request a deferred resize.  Idempotent — last write wins. */
+static void voodoo3_request_resize(Voodoo3State *s, int w, int h)
+{
+    if (w <= 0 || h <= 0)
+        return;
+    s->resize_pending_w = w;
+    s->resize_pending_h = h;
+    qemu_bh_schedule(s->resize_bh);
+}
+
+/* -----------------------------------------------------------------------
  * Screen-filter (scrfilter) — ported from 86Box
  * voodoo_generate_vb_filters() in vid_voodoo_banshee.c.
  *
@@ -1246,7 +1278,7 @@ static void voodoo3_crtc_update(Voodoo3State *s)
     }
 
     if (changed && s->con)
-        qemu_console_resize(s->con, w, h);
+        voodoo3_request_resize(s, w, h);
 
     /* Force full redraw after mode change */
     if (changed)
@@ -1506,7 +1538,7 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
         s->screen_width   = (int)((val & 0xfff) + 1);
         s->screen_height  = (int)((val >> 12) & 0xfff);
         if (s->con && s->screen_width > 0 && s->screen_height > 0) {
-            qemu_console_resize(s->con, s->screen_width, s->screen_height);
+            voodoo3_request_resize(s, s->screen_width, s->screen_height);
             memset(s->dirty_line, 1, sizeof(s->dirty_line));
         }
         break;
@@ -2125,7 +2157,7 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
             s->screen_width  = (int)((s->vidScreenSize & 0xfffu) + 1u);
             s->screen_height = (int)((s->vidScreenSize >> 12) & 0xfffu);
             if (s->con && s->screen_width > 0 && s->screen_height > 0) {
-                qemu_console_resize(s->con, s->screen_width, s->screen_height);
+                voodoo3_request_resize(s, s->screen_width, s->screen_height);
                 memset(s->dirty_line, 1, sizeof(s->dirty_line));
             }
             break;
@@ -7437,6 +7469,11 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / VBLANK_HZ);
 
+    /* SDL-safe deferred resize BH — must be allocated before any MMIO write */
+    s->resize_bh        = qemu_bh_new(voodoo3_resize_bh, s);
+    s->resize_pending_w = 0;
+    s->resize_pending_h = 0;
+
     qemu_mutex_init(&s->render_lock);
     qemu_cond_init(&s->render_cond);
     qemu_mutex_init(&s->fifo_lock);
@@ -7521,6 +7558,10 @@ static void voodoo3_pci_exit(PCIDevice *pci_dev)
     qemu_cond_destroy(&s->render_cond);
     qemu_mutex_destroy(&s->fifo_lock);
     qemu_cond_destroy(&s->fifo_cond);
+
+    /* Cancel any pending deferred resize and free the BH */
+    qemu_bh_cancel(s->resize_bh);
+    qemu_bh_delete(s->resize_bh);
 
     timer_free(s->vblank_timer);
     s->fb_mem = NULL;

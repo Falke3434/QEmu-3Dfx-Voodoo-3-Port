@@ -289,9 +289,24 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
     int h = s->screen_height;
 
     if (surface_width(surf) != w || surface_height(surf) != h) {
-        qemu_console_resize(s->con, w, h);
-        surf = qemu_console_surface(s->con);
-        memset(s->dirty_line, 1, sizeof(s->dirty_line));
+        /*
+         * SDL fix: do NOT call qemu_console_resize() here.
+         *
+         * Under -display sdl, qemu_console_resize() calls
+         * dpy_gfx_replace_surface() which replaces the SDL texture/surface
+         * synchronously.  When this happens mid-blit (e.g. from the vblank
+         * timer callback) SDL can deadlock waiting for the main event loop,
+         * freezing the emulator permanently.
+         *
+         * Instead: request the resize via the BH and return without blitting.
+         * The BH fires at the next main-loop tick (safe point for SDL), after
+         * which the surface dimensions will match and blitting resumes on the
+         * following vblank.
+         */
+        s->resize_pending_w = w;
+        s->resize_pending_h = h;
+        qemu_bh_schedule(s->resize_bh);
+        return;
     }
 
     uint8_t *dst_base  = surface_data(surf);
@@ -299,6 +314,22 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
     int      dst_pitch = surface_stride(surf);
 
     int dirty_lo = h, dirty_hi = -1;
+
+    /*
+     * Hold render_lock for the entire blit pass.
+     *
+     * The render threads (real POSIX threads) write dirty_line[] and fb_mem
+     * while holding render_lock.  Without this lock the vblank-timer path
+     * (main thread, no render_lock) would race those writes — reading a
+     * partially-rendered scanline or a stale dirty flag — which is undefined
+     * behaviour under C11 and can produce torn frames in practice.
+     *
+     * dpy_gfx_update() is intentionally called AFTER the unlock (see below):
+     * it sends to the display backend (SDL event queue etc.) and must not be
+     * called with render_lock held, to avoid a lock-order inversion with the
+     * SDL deadlock we already guard against via the BH resize mechanism.
+     */
+    qemu_mutex_lock(&s->render_lock);
 
     for (int y = 0; y < h && y < V3_DIRTY_LINES; y++) {
         if (!s->dirty_line[y]) continue;
@@ -624,6 +655,23 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                              w, dirty_lo, dirty_hi);
         voodoo3_draw_cursor(s, dst_base, dst_bpp, dst_pitch,
                             w, dirty_lo, dirty_hi);
+    }
+
+    qemu_mutex_unlock(&s->render_lock);
+
+    if (dirty_lo <= dirty_hi) {
+        /*
+         * dpy_gfx_update() is called here, OUTSIDE render_lock.
+         *
+         * Under -display sdl it posts to the SDL event queue which can block
+         * waiting for the main event loop.  Calling it with render_lock held
+         * would create a lock-order inversion: the render thread holds
+         * render_lock and can wake up here via a cond_broadcast, while the
+         * SDL event loop might itself be trying to acquire render_lock through
+         * a display callback — resulting in deadlock.  Releasing the lock
+         * first is safe because the surface data has already been fully written
+         * and dirty_line[] cleared inside the lock above.
+         */
         dpy_gfx_update(s->con, 0, dirty_lo, w, dirty_hi - dirty_lo + 1);
     }
 }

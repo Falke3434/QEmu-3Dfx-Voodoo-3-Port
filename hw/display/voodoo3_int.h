@@ -357,6 +357,21 @@ struct Voodoo3State {
     bool          in_vblank;
     int           screen_width, screen_height;
     bool          display_enabled;
+    /*
+     * SDL-safe deferred resize.
+     *
+     * qemu_console_resize() / dpy_gfx_replace_surface() must be called from
+     * the QEMU main thread and must not race an in-progress blit.  Under
+     * -display sdl this is enforced by scheduling a Bottom Half instead of
+     * calling qemu_console_resize() directly from MMIO-write paths or from
+     * inside voodoo3_update_display_dirty().
+     *
+     * resize_bh      – BH handle allocated in realize, freed in unrealize.
+     * resize_pending_w/h – dimensions requested; 0 = no resize pending.
+     */
+    QEMUBH       *resize_bh;
+    int           resize_pending_w;
+    int           resize_pending_h;
     bool          driver_active;    /* true once driver has set VIDPROC_ENABLE=1;
                                      * disables VGA-fallback in vidProcCfg handler */
     int           pix_format;
