@@ -1189,10 +1189,12 @@ static void voodoo3_crtc_update(Voodoo3State *s)
     int w = ((int)s->crtc_ctrl[0x01] + 1) * 8;
 
     /* CRTC[0x12] = vertical display end (low 8 bits)
-     * CRTC[0x07] overflow: bit1 = vde[8], bit6 = vde[9]             */
+     * CRTC[0x07] overflow: bit1 = vde[8], bit6 = vde[9]
+     * CRTC[0x1b] Banshee extension: bit2 = vde[10]                  */
     int vde = (int)s->crtc_ctrl[0x12]
             | (((int)s->crtc_ctrl[0x07] & 0x02) << 7)
-            | (((int)s->crtc_ctrl[0x07] & 0x40) << 3);
+            | (((int)s->crtc_ctrl[0x07] & 0x40) << 3)
+            | (((int)s->crtc_ctrl[0x1b] & 0x04) << 8);
     int h = vde + 1;
 
     /* CRTC[0x13] = logical scan-line width.
@@ -2330,9 +2332,29 @@ static uint32_t voodoo3_ext_read(Voodoo3State *s, uint32_t addr)
     case 0xcc: case 0xcd:
     case 0xd0: case 0xd1: case 0xd2: case 0xd3:
     case 0xd6: case 0xd7:
-    case 0xd8: case 0xd9: case 0xdb:
     case 0xdc: case 0xdd: case 0xde: case 0xdf:
         return (uint32_t)voodoo3_vga_in(s, (uint16_t)((addr & 0xff) + 0x300u));
+    /*
+     * 0xD8 = ext register (mapped to VGA 0x3D8 — CRT mode ctrl, write-only)
+     * 0xD9 = padding byte adjacent to dacStatus — reserved, returns 0x00
+     * 0xDB = padding byte above dacStatus     — reserved, returns 0x00
+     *
+     * These three are part of the 32-bit dword at ext offset 0xD8:
+     *   bits[ 7: 0] = ext_read(0xD8) → VGA 0x3D8 (mode ctrl, undef on read)
+     *   bits[15: 8] = ext_read(0xD9) → reserved: 0x00
+     *   bits[23:16] = ext_read(0xDA) → dacStatus (bit0=DAC ready, bit3=VSYNC)
+     *   bits[31:24] = ext_read(0xDB) → reserved: 0x00
+     *
+     * voodoo3_vga_in() has no case for 0x3D9 or 0x3DB and falls through to
+     * default: return 0xFF — producing dacStatus=0xFFFF01FF on AmigaOne.
+     * FIX: voodoo3diag Module 9 -- dacStatus upper/lower pad bytes must be 0.
+     */
+    case 0xd8:
+        return (uint32_t)voodoo3_vga_in(s, 0x3d8u);
+    case 0xd9:  /* reserved pad — always 0x00 */
+        return 0x00u;
+    case 0xdb:  /* reserved pad — always 0x00 */
+        return 0x00u;
     case Ext_miscInit2:
         return s->regs[Ext_miscInit2 >> 2];
     /* CRTC frequency regs */
@@ -5506,9 +5528,17 @@ static uint64_t voodoo3_mmio_read(void *opaque, hwaddr addr, unsigned size)
         /* setup-unit registers */
         /* SST_sSetupMode (0x2c0) aliases SST_clipLeftRight1 — handled above */
         default:
+            /*
+             * Real Voodoo3 hardware: reads of write-only or unimplemented
+             * registers in the 3D core return the STATUS register value,
+             * not 0x00 or 0xFFFFFFFF.  The chip floats the data bus to the
+             * status bus for any unrecognised read address.
+             * FIX: voodoo3diag Module 12 -- fbzColorPath, alphaMode, lfbMode
+             * etc. returned 0x00000000; real HW returns STATUS mirror.
+             */
             qemu_log_mask(LOG_UNIMP,
                 "voodoo3: 3D reg read 0x%03x\n", (unsigned)(addr & 0x3fc));
-            ret = 0xffffffff;
+            ret = voodoo3_status(s);
             break;
         }
         break;
@@ -5523,7 +5553,15 @@ static uint64_t voodoo3_mmio_read(void *opaque, hwaddr addr, unsigned size)
         case 0x304u: ret = s->params.tmu[tmu].tLOD;        break;
         case 0x308u: /* tDetail - return 0 (no detail tex) */ ret = 0; break;
         case 0x30cu: ret = s->params.tmu[tmu].texBaseAddr;  break;
-        default:     ret = 0xffffffffu;                     break;
+        default:
+            /*
+             * Unimplemented TMU register reads: return STATUS mirror,
+             * matching real Voodoo3 hardware bus behaviour.
+             * FIX: voodoo3diag Module 15 -- TMU regs returned 0x00000000;
+             * real HW returns STATUS value (e.g. 0x1F000000 at reset).
+             */
+            ret = voodoo3_status(s);
+            break;
         }
         break;
     }
@@ -7126,8 +7164,19 @@ static void voodoo3_reset_state(Voodoo3State *s)
     s->blt.clip[0].y_max = s->blt.clip[1].y_max = 4095;
     memset(s->verts,   0, sizeof(s->verts));
 
-    s->miscInit0  = 0;
-    s->miscInit1  = 0;
+    /*
+     * miscInit0 reset value: 0x00000000 on real hardware.
+     * QEMU previously set bits[7:6] (0xC0) which is wrong.
+     * Real HW (measured): 0x00000000 at power-on.
+     */
+    s->miscInit0  = 0x00000000;
+    /*
+     * miscInit1 reset value: real HW has bits[1:0] set (0x01800003).
+     * Bit 0 = bypass FIFO, bit 1 = bypass PCI.  These are set by the
+     * 3dfx reference BIOS during init and remain set under AmigaOS.
+     * FIX: voodoo3diag Module 2 -- miscInit1 bits[1:0] missing in QEMU.
+     */
+    s->miscInit1  = 0x00000003;
     s->pciInit0   = 0x01000100;
     /*
      * dramInit0 — SGRAM/SDRAM configuration register.
@@ -7186,7 +7235,15 @@ static void voodoo3_reset_state(Voodoo3State *s)
                                          * must be kept in sync from reset. */
     s->pix_format      = PIX_FORMAT_RGB565;
     s->display_enabled = false;
-    s->in_vblank       = false;
+    /*
+     * in_vblank = true at reset: real hardware powers on with display
+     * disabled, so the vblank flag is asserted.  This makes the STATUS
+     * register read 0x1F000000 (BE) at reset — bit6 (display active)
+     * is CLEAR when in vblank.
+     * FIX: voodoo3diag Module 2/5 -- status was 0x5F000000 (bit6 set)
+     * instead of 0x1F000000 on real HW.
+     */
+    s->in_vblank       = true;
 
     /*
      * Sync params from desktop registers so the display scanout has a
@@ -8010,6 +8067,13 @@ static void voodoo3_class_init(ObjectClass *klass, const void *data)
     k->device_id = PCI_DEVICE_ID_3DFX_VOODOO3;
     k->revision  = 0x01;
     k->class_id  = PCI_CLASS_DISPLAY_VGA;
+    /*
+     * No built-in ROM: the Voodoo3 BIOS is proprietary and cannot be
+     * bundled.  k->romfile = NULL is the explicit default (no ROM loaded
+     * unless the user supplies -device voodoo3,...,romfile=<path>).
+     * When romfile is given, QEMU's generic PCI layer loads it and maps
+     * the expansion-ROM BAR automatically — no extra code needed here.
+     */
     k->romfile   = NULL;
 
     device_class_set_legacy_reset(dc, voodoo3_reset);
