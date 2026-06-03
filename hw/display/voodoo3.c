@@ -3628,18 +3628,19 @@ static inline void blt_alpha_blend_argb32(Voodoo3State *s,
         uint32_t addr = blt_get_addr(s, x * 4, y, 0, 0);
         if (addr + 3 >= s->fb_size) break;
         if (alpha == 0xff) {
-            *(uint32_t *)(s->fb_mem + addr) = src_argb;
+            *(uint32_t *)(s->fb_mem + addr) = bswap32(src_argb);
         } else {
-            uint32_t dst32 = *(uint32_t *)(s->fb_mem + addr);
+            /* Read existing pixel: undo the BE-in-LE-RAM swap to get ARGB */
+            uint32_t dst32 = bswap32(*(uint32_t *)(s->fb_mem + addr));
             int dr = (dst32 >> 16) & 0xff, dg = (dst32 >> 8) & 0xff, db = dst32 & 0xff;
             int da = (dst32 >> 24) & 0xff;
             int rr = (sr * alpha + dr * (255 - alpha)) / 255;
             int rg = (sg * alpha + dg * (255 - alpha)) / 255;
             int rb = (sb * alpha + db * (255 - alpha)) / 255;
             int ra = alpha + (da * (255 - alpha)) / 255;
-            *(uint32_t *)(s->fb_mem + addr) =
+            *(uint32_t *)(s->fb_mem + addr) = bswap32(
                 ((uint32_t)ra << 24) | ((uint32_t)rr << 16) |
-                ((uint32_t)rg << 8)  |  (uint32_t)rb;
+                ((uint32_t)rg << 8)  |  (uint32_t)rb);
         }
         if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
         break;
@@ -3673,8 +3674,8 @@ static inline void blt_plot(Voodoo3State *s, int x, int y,
         if (addr + 1 >= s->fb_size) break;
         uint32_t dst  = *(uint16_t *)(s->fb_mem + addr);
         uint32_t pat  = (blt->command & COMMAND_PATTERN_MONO)
-            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? bswap16(blt->colorFore) : blt->colorBack)
-            : (uint32_t)blt->colorPattern16[(pat_x & 7) + (pat_y & 7) * 8];
+            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? bswap16(blt->colorFore) : bswap16(blt->colorBack))
+            : bswap16((uint32_t)blt->colorPattern16[(pat_x & 7) + (pat_y & 7) * 8]);
         *(uint16_t *)(s->fb_mem + addr) = (uint16_t)blt_mix(blt, dst, src, pat, src_ck_fmt, BLT_COLORKEY_16);
         if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
         break;
@@ -3694,10 +3695,15 @@ static inline void blt_plot(Voodoo3State *s, int x, int y,
     case DST_FORMAT_COL_32_BPP: {
         uint32_t addr = blt_get_addr(s, x * 4, y, 0, 0);
         if (addr + 3 >= s->fb_size) break;
+        /* All 32-bit values in fb_mem are stored BE-in-LE-RAM (bswap32 of ARGB).
+         * Read dst as-is, keep it in that domain.
+         * colorFore/Back come from MMIO (already LE after DEVICE_LITTLE_ENDIAN
+         * swap), so bswap32 them into the same BE-in-LE-RAM domain.
+         * src is already normalised by the caller (bswap32 applied upstream). */
         uint32_t dst  = *(uint32_t *)(s->fb_mem + addr);
         uint32_t pat  = (blt->command & COMMAND_PATTERN_MONO)
-            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? bswap32(blt->colorFore) : blt->colorBack)
-            : blt->colorPattern[(pat_x & 7) + (pat_y & 7) * 8];
+            ? ((pat_mono & (1u << (7 - (pat_x & 7)))) ? bswap32(blt->colorFore) : bswap32(blt->colorBack))
+            : bswap32(blt->colorPattern[(pat_x & 7) + (pat_y & 7) * 8]);
         *(uint32_t *)(s->fb_mem + addr) = blt_mix(blt, dst, src, pat, src_ck_fmt, BLT_COLORKEY_32);
         if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
         break;
@@ -3727,7 +3733,9 @@ static inline void blt_plot_line(Voodoo3State *s, int x, int y, uint32_t pattern
         uint32_t addr = blt_get_addr(s, x * 2, y, 0, 0);
         if (addr + 1 >= s->fb_size) break;
         uint32_t dst = *(uint16_t *)(s->fb_mem + addr);
-        *(uint16_t *)(s->fb_mem + addr) = (uint16_t)blt_mix(blt, dst, blt->colorFore, pattern, BLT_COLORKEY_16, BLT_COLORKEY_16);
+        *(uint16_t *)(s->fb_mem + addr) = (uint16_t)blt_mix(blt, dst,
+            bswap16(blt->colorFore), bswap16(pattern),
+            BLT_COLORKEY_16, BLT_COLORKEY_16);
         if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
         break;
     }
@@ -3744,7 +3752,9 @@ static inline void blt_plot_line(Voodoo3State *s, int x, int y, uint32_t pattern
         uint32_t addr = blt_get_addr(s, x * 4, y, 0, 0);
         if (addr + 3 >= s->fb_size) break;
         uint32_t dst = *(uint32_t *)(s->fb_mem + addr);
-        *(uint32_t *)(s->fb_mem + addr) = blt_mix(blt, dst, blt->colorFore, pattern, BLT_COLORKEY_32, BLT_COLORKEY_32);
+        *(uint32_t *)(s->fb_mem + addr) = blt_mix(blt, dst,
+            bswap32(blt->colorFore), bswap32(pattern),
+            BLT_COLORKEY_32, BLT_COLORKEY_32);
         if (y < V3_DIRTY_LINES) s->dirty_line[y] = 1;
         break;
     }
@@ -3977,8 +3987,20 @@ static void blt_do_s2s_line(Voodoo3State *s, const uint8_t *src_p,
                         (blt->srcFormat & SRC_FORMAT_COL_MASK) != SRC_FORMAT_COL_YUYV &&
                         (blt->srcFormat & SRC_FORMAT_COL_MASK) != SRC_FORMAT_COL_UYVY) {
                         int r = (src_data >> 16) & 0xff, g = (src_data >> 8) & 0xff, b = src_data & 0xff;
-                        src_data = (b >> 3) | ((g >> 2) << 5) | ((r >> 3) << 11);
+                        src_data = bswap16((b >> 3) | ((g >> 2) << 5) | ((r >> 3) << 11));
                     }
+
+                    /* Normalise src_data to BE-in-LE-RAM format for 32-bpp dst.
+                     * colorFore/Back come from MMIO (DEVICE_LITTLE_ENDIAN gives
+                     * us 0x00RRGGBB); bswap32 puts them in the same domain as
+                     * pixels the PPC guest wrote directly via BAR1.
+                     * 32-bpp src from fb_mem (same-format S2S) is already in
+                     * BE-in-LE-RAM format — those go through the same_fmt path
+                     * above and never reach here. */
+                    if ((blt->dstFormat & DST_FORMAT_COL_MASK) == DST_FORMAT_COL_32_BPP &&
+                        (blt->srcFormat & SRC_FORMAT_COL_MASK) != SRC_FORMAT_COL_YUYV &&
+                        (blt->srcFormat & SRC_FORMAT_COL_MASK) != SRC_FORMAT_COL_UYVY)
+                        src_data = bswap32(src_data);
 
                     if ((blt->srcFormat & SRC_FORMAT_COL_MASK) == SRC_FORMAT_COL_YUYV ||
                         (blt->srcFormat & SRC_FORMAT_COL_MASK) == SRC_FORMAT_COL_UYVY) {
@@ -3993,10 +4015,11 @@ static void blt_do_s2s_line(Voodoo3State *s, const uint8_t *src_p,
                         } else {
                             uint32_t rgb32[2] = {0,0};
                             blt_decode_yuyv422_32(rgb32, (const uint8_t *)&yuv_data);
-                            if (!transparent) blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, rgb32[0], src_ck);
+                            /* YUV→32bpp: also normalise to BE-in-LE-RAM */
+                            if (!transparent) blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, bswap32(rgb32[0]), src_ck);
                             if (use_x_dir) dst_x += (blt->command & COMMAND_DX) ? -1 : 1;
                             else           dst_x++;
-                            if (!transparent) blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, rgb32[1], src_ck);
+                            if (!transparent) blt_plot(s, dst_x, dst_y, pat_x, pat_y, pmask, bswap32(rgb32[1]), src_ck);
                         }
                     } else {
                         if (!transparent)
@@ -4207,8 +4230,9 @@ static void blt_do_rectfill(Voodoo3State *s)
             }
             case 32:
             default: {
+                uint32_t c32 = bswap32(color);
                 uint32_t *p = (uint32_t *)row;
-                for (int x = 0; x < w; x++) *p++ = color;
+                for (int x = 0; x < w; x++) *p++ = c32;
                 break;
             }
             }

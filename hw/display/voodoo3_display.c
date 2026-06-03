@@ -456,7 +456,7 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                      */
 					uint32_t *dst = (uint32_t *)dst_row;
                     for (int x = 0; x < w; x++) {
-                        dst[x] = src[x];
+                        dst[x] = bswap32(src[x]);
                     }
                 } else if (dst_bpp == 3) {
                     uint8_t *dst = dst_row;
@@ -535,7 +535,7 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                     break;
                 default: /* RGB32 */
                     memcpy(&out, px_ptr, 4);
-                    out |= 0xff000000u;
+                    out = bswap32(out) | 0xff000000u;
                     break;
                 }
 
