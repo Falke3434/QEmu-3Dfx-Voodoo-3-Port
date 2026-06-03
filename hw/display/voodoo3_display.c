@@ -672,7 +672,7 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
          * first is safe because the surface data has already been fully written
          * and dirty_line[] cleared inside the lock above.
          */
-        dpy_gfx_update(s->con, 0, dirty_lo, w, dirty_hi - dirty_lo + 1);
+        qemu_console_update(s->con, 0, dirty_lo, w, dirty_hi - dirty_lo + 1);
     }
 }
 

@@ -6311,12 +6311,13 @@ static const MemoryRegionOps voodoo3_io_ops = {
  * vblank callback, which tracks dirty lines for efficiency.
  * This function is kept as a fallback for full-screen invalidation.
  */
-static void voodoo3_update_display(void *opaque)
+static bool voodoo3_update_display(void *opaque)
 {
     Voodoo3State *s = VOODOO3_PCI(opaque);
     /* Force full redraw by marking all lines dirty */
     memset(s->dirty_line, 1, sizeof(s->dirty_line));
     voodoo3_update_display_dirty(s);
+    return true;
 }
 
 static void voodoo3_invalidate_display(void *opaque) { (void)opaque; }
@@ -7511,7 +7512,7 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
                           "voodoo3-io", VOODOO3_IO_SIZE);
     pci_register_bar(pci_dev, 2, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
 
-    s->con = graphic_console_init(DEVICE(pci_dev), 0, &voodoo3_gfx_ops, s);
+    s->con = qemu_graphic_console_create(DEVICE(pci_dev), 0, &voodoo3_gfx_ops, s);
     qemu_console_resize(s->con, 640, 480);
 
     /* -----------------------------------------------------------------------
