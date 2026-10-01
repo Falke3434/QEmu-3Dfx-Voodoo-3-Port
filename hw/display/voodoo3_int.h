@@ -31,7 +31,6 @@
 #include "hw/display/voodoo3_texture.h"  /* voodoo3_tex_params_t etc.  */
 #include "hw/display/voodoo3_render.h"    /* voodoo3_triangle, voodoo3_triangle_setup */
 #include "hw/display/voodoo3_display.h"  /* V3_DIRTY_LINES             */
-#include "vga_int.h"                      /* VGACommonState             */
 
 /* Floating-point/integer union used in reg decode and setup */
 typedef union { uint32_t i; float f; } fi_t;
@@ -44,6 +43,12 @@ typedef struct Voodoo3State     Voodoo3State;
  * voodoo3_setup.c — declare it here so all .c files can see it. */
 void voodoo3_queue_triangle(Voodoo3State *s, voodoo3_params_t *p);
 
+/* Reload the hardware-cursor pattern from SGRAM into cursor_buf. */
+void voodoo3_cursor_reload(Voodoo3State *s);
+
+/* Block until the render threads have finished every queued triangle. */
+void voodoo3_wait_render_idle(Voodoo3State *s);
+
 /* =========================================================================
  * Device variant constants (model property values)
  * ========================================================================= */
@@ -53,7 +58,7 @@ void voodoo3_queue_triangle(Voodoo3State *s, voodoo3_params_t *p);
 #define VOODOO3_MODEL_V3_3000    3u
 #define VOODOO3_MODEL_V3_3500TV  4u
 
-#define VOODOO3_CLUT_SIZE    256
+#define VOODOO3_CLUT_SIZE    512   /* 2 x 256: desktop/overlay CLUT (86Box pallook[512]) */
 #define PARAM_BUF_SIZE       256
 #define MAX_RENDER_THREADS   4
 
@@ -67,6 +72,7 @@ void voodoo3_queue_triangle(Voodoo3State *s, voodoo3_params_t *p);
 #define VIDPROCCFG_CURSOR_MODE           (1u <<  1)  /* 0=Win AND/XOR, 1=X11 */
 #define VIDPROCCFG_OVERLAY_ENABLE        (1u <<  8)
 #define VIDPROCCFG_OVERLAY_CLUT_BYPASS   (1u << 11)
+#define VIDPROCCFG_DESKTOP_CLUT_SEL      (1u << 12)  /* desktop uses pallook[256..511] */
 #define VIDPROCCFG_OVERLAY_CLUT_SEL      (1u << 13)
 #define VIDPROCCFG_H_SCALE_ENABLE        (1u << 14)
 #define VIDPROCCFG_V_SCALE_ENABLE        (1u << 15)
@@ -172,6 +178,13 @@ typedef struct voodoo3_params_t {
      */
     voodoo3_tex_params_t tex_params[2];     /* per-TMU LOD geometry     */
     uint32_t            *tex_ptr[2][V3_LOD_MAX + 1]; /* decoded cache ptrs */
+    /*
+     * Texture-cache slot referenced by this triangle per TMU (-1 = none).
+     * Render threads use it to release their reference (refcount_r[]) once
+     * the triangle is finished, so the slot cannot be recycled underneath
+     * a thread that is still sampling from it.
+     */
+    int8_t               tex_slot[2];
 
     /*
      * Detail-texture parameters — decoded from the tDetail register (0x308).
@@ -308,28 +321,11 @@ struct Voodoo3State {
     PCIDevice   parent_obj;         /* MUST be first */
 
     /*
-     * Embedded VGA core (pattern from hw/display/ati.c).
-     *
-     * vga_init() registers VGA I/O ports 0x3B0–0x3DF on the ISA bus and
-     * maps VGA MMIO at 0xA0000–0xBFFFF.  These are required for:
-     *
-     *   • BIOS/UEFI POST:  probes 0x3C2 (Misc Output) + 0x3DA (Input Status)
-     *   • Linux vesafb/efifb: programs CRTC regs before loading the KMS driver
-     *   • Linux fbdev/vgacon: uses the standard VGA text-mode path on boot
-     *   • Windows VGA miniport: accesses 0x3C0–0x3DF before the ICD loads
-     *
-     * Without these ports display_enabled never becomes true → black screen.
-     *
-     * The VGA console (vga.con, index 0) handles text mode and the early
-     * graphical boot phase.  Once the native Voodoo3 driver sets
-     * VIDPROCCFG_VIDPROC_ENABLE, we switch to the native console (s->con,
-     * index 1) and stop forwarding to vga_update_display().
-     *
-     * vga.vram_size_mb defaults to 4 MB (set in voodoo3_pci_realize before
-     * calling vga_common_init).  The Voodoo3's own SGRAM lives in fb_mem;
-     * the VGA VRAM is only used for VGA-compat text/graphic modes.
+     * Note: legacy VGA (ports 0x3B0-0x3DF on the PCI I/O space and the
+     * 0xA0000 window) is NOT emulated; VGA registers are only reachable
+     * through the BAR2 I/O proxy.  An unused VGACommonState used to live
+     * here; it was never initialised and has been removed.
      */
-    VGACommonState vga;
 
     /* BARs */
     MemoryRegion mmio, io;
@@ -347,9 +343,21 @@ struct Voodoo3State {
      * whenever the driver changes the ring-buffer location or size.
      * Priority 1 ensures it shadows the underlying RAM for those pages.
      */
-    MemoryRegion lfb_ram;          /* RAM-backed, no trap — whole BAR1    */
+    MemoryRegion lfb_bar;          /* BAR1 container (32 MiB)             */
+    MemoryRegion lfb_ram;          /* SGRAM, RAM-backed (fb_size)         */
+    MemoryRegion lfb_alias;        /* upper BAR1 half mirrors the SGRAM   */
     MemoryRegion cmdfifo_mmio;     /* MMIO overlay for CMDFIFO ring window */
     bool         cmdfifo_mmio_active; /* true when subregion is added      */
+    /*
+     * Tiled LFB aperture: MMIO overlay on BAR1 from tile_base to the end of
+     * SGRAM.  CPU accesses in that window are translated with the
+     * lfbMemoryConfig tile geometry (86Box banshee_read/write_linear).
+     */
+    MemoryRegion lfb_tiled_mmio;
+    bool         lfb_tiled_active;
+    uint32_t     lfb_tiled_base;   /* start offset of the active overlay */
+    /* BAR0 3D-LFB window (0x1000000..0x1ffffff) with 8/16/32-bit access */
+    MemoryRegion lfb3d_mmio;
 
     /* Native Voodoo3 display console (index 1, used after driver init) */
     QemuConsole  *con;
@@ -406,6 +414,37 @@ struct Voodoo3State {
      * rectangle at (0,0) between cursor enable and the first shape write.
      */
     uint8_t       cursor_buf[1024];
+
+    /* Last state seen by the display refresh (dirty-row bookkeeping) */
+    bool          last_cur_vis;
+    int           last_cur_x, last_cur_y, last_cur_yoff;
+    uint32_t      last_cur_c0, last_cur_c1, last_vidproccfg;
+    uint8_t       last_cursor_buf[1024];
+    uint32_t      last_front_offset, last_row_width;
+    int           last_col_tiled, last_pix_format;
+    bool          full_redraw;
+    uint32_t      leftOverlayBuf;  /* SST 0x250: buffer to show on swap      */
+    uint32_t      overlay_addr;    /* current overlay scan-out address       */
+    bool          ext_from_io;     /* ext write arrives via BAR2 (bytes)     */
+    uint32_t      chromaRange;     /* SST 0x138 (stored; range test not yet used) */
+    bool          dac_pend;        /* BAR0 dacData write not yet committed   */
+    uint32_t      dac_pend_val;
+    int64_t       last_full_refresh_ms;
+    /*
+     * Pixel byte order in SGRAM (port convention: SGRAM holds pixels the way
+     * the CPU wrote them).  Derived from the LFB swizzle bits in miscInit0:
+     * Both flags are sticky (set once the driver uses the bit), because
+     * AmigaOS and MorphOS switch the bits per access (see
+     * voodoo3_update_lfb_swizzle()).  lfb_be32 starts true on big-endian
+     * targets.
+     *  - 16 bpp big-endian: bit 31 (AmigaOS 16-bit: 0xC0000000).  MorphOS
+     *    uses RGB16PC (little-endian) and only ever sets bit 30.
+     *  - 32 bpp big-endian: bit 30.  x86 Windows never sets it -> LE.
+     */
+    bool          lfb_be32;
+    bool          lfb_be16;   /* sticky: miscInit0 bit 31 has been used */
+    uint32_t      disp_gen;        /* bumped by display-affecting reg writes */
+    uint32_t      last_disp_gen;
 
     /* CLUT */
     uint32_t      pallook[VOODOO3_CLUT_SIZE];
@@ -575,11 +614,10 @@ struct Voodoo3State {
     voodoo3_blt_t   blt;
 
     /* Frame / buffer counters */
-    int             cmd_written, cmd_read;
+    int             cmd_written, cmd_read;   /* statistics only */
     int             tri_count;
     uint32_t        fbiPixelsIn, fbiChromaFail, fbiZFuncFail;
     uint32_t        fbiAFuncFail, fbiPixelsOut;
-    bool            voodoo_busy;
 
     /*
      * FIX 11: VMState shadow for params.fogTable[64].
@@ -600,23 +638,32 @@ struct Voodoo3State {
     uint8_t  fog_table_save[128];   /* packed fogTable shadow (pre_save / post_load) */
     uint32_t verts_save[4 * 14];    /* packed verts[4] shadow: 14 floats per vertex (stored as uint32 bitwise) */
 
-    /* --- FIFO command ring ----------------------------------------------- */
-#define V3_FIFO_SIZE 65536          /* entries, must be power of 2 */
-    uint32_t  fifo_cmd[V3_FIFO_SIZE];
-    uint32_t  fifo_val[V3_FIFO_SIZE];
-    uint32_t  fifo_wr, fifo_rd;
+    /*
+     * Texture-aperture and 3D-LFB writes are executed synchronously in the
+     * vCPU thread (see voodoo3_lfb3d_write / voodoo3_mmio_write).  That keeps
+     * them correctly ordered against triangle commands, which the previous
+     * MMIO FIFO did not do (the FIFO was only drained when a triangle was
+     * queued, and its wake-up signal was never waited on).
+     */
 
-    /* --- Triangle parameter ring buffer (one slot per render thread) ----- */
+    /* --- Triangle parameter ring buffer ---------------------------------- *
+     * Single producer (serialised by queue_lock), one consumer per render   *
+     * thread.  param_wr / param_rd[] are accessed with acquire/release       *
+     * atomics; render threads never take a lock while rasterising.           */
     voodoo3_params_t param_buf[PARAM_BUF_SIZE];
-    uint32_t         param_wr;      /* written by FIFO thread */
-    uint32_t         param_rd[MAX_RENDER_THREADS]; /* per-thread read pointer */
+    uint32_t         param_wr;      /* next slot to fill (producer)       */
+    uint32_t         param_rd[MAX_RENDER_THREADS]; /* per-thread read ptr */
 
-    /* --- Render threads -------------------------------------------------- */
+    /* --- Worker threads -------------------------------------------------- */
     QemuThread   render_thread[MAX_RENDER_THREADS];
-    QemuMutex    render_lock;
-    QemuCond     render_cond;       /* wakes all render threads */
-    QemuMutex    fifo_lock;
-    QemuCond     fifo_cond;         /* wakes FIFO worker */
+    QemuEvent    render_event[MAX_RENDER_THREADS]; /* "work available"    */
+    QemuEvent    render_space_event; /* ring slot freed / thread finished */
+    QemuMutex    queue_lock;         /* serialises triangle producers      */
+    QemuThread   fifo_thread;        /* CMDFIFO0/1 packet processor        */
+    QemuEvent    fifo_event;         /* "CMDFIFO has new data"             */
+    QemuEvent    fifo_idle_event;    /* FIFO thread went idle              */
+    bool         fifo_busy;          /* FIFO thread is processing          */
+    bool         threads_started;
     bool         render_stop;
     uint32_t     render_threads_count;
     /*
@@ -635,13 +682,25 @@ struct Voodoo3State {
     /* Device variant */
     uint32_t model;
     bool     is_agp, bilinear, dac_filter;
+    bool     lfb_tiling;            /* property: decode tiled LFB aperture */
 
     /* --- Texture subsystem (ported from 86Box voodoo_t) ----------------- */
 
-    /* Texture RAM: 4 MB per TMU (Voodoo 3 shares 8 MB SGRAM, split 4+4) */
+    /* Texture RAM: aliases fb_mem (Banshee/V3 unified SGRAM) */
     uint8_t             *tex_mem[2];
-    uint32_t             tex_mem_size;   /* bytes per TMU = V3_TEX_MEM_SIZE   */
+    uint32_t             tex_mem_size;   /* = fb_size                         */
     uint32_t             tex_mask;       /* tex_mem_size - 1                  */
+
+    /*
+     * SGRAM pages written behind the texture cache's back (CPU LFB writes,
+     * 2D engine, CMDFIFO packet 5).  Set atomically by any thread; consumed
+     * by the triangle producer before it looks up a texture.
+     */
+    unsigned long       *tex_dirty_pages;
+    bool                 tex_dirty_any;
+    /* SGRAM pages written by paths the display must pick up (tiled LFB) */
+    unsigned long       *disp_dirty_pages;
+    bool                 disp_dirty_any;
 
     /* Decoded texture cache (V3_TEX_CACHE_SIZE slots per TMU) */
     v3_tex_cache_entry_t tex_cache[2][V3_TEX_CACHE_SIZE];
@@ -649,6 +708,7 @@ struct Voodoo3State {
 
     /* ARGB palette (256 entries per TMU) used for PAL8 / APAL8 / APAL88 */
     uint32_t             tex_palette[2][256];
+    uint32_t             pal_gen[2];     /* bumped on every palette write */
 
     /* --- NCC (YIQ) table state (ported from 86Box nccTable / ncc_lookup) - */
     struct {
@@ -692,6 +752,7 @@ struct Voodoo3State {
     uint32_t             cmdfifo_end;         /* FIFO0 end address (computed) */
     uint32_t             cmdfifo_size;        /* raw cmdBaseSize0 value        */
     bool                 cmdfifo_enabled;     /* bit 8 of cmdBaseSize0         */
+    bool                 cmdfifo_no_holes;    /* bit 10: depth only via BUMP   */
     bool                 cmdfifo_in_agp;      /* bit 9 of cmdBaseSize0         */
     int                  cmdfifo_in_sub;      /* subroutine nesting depth      */
     uint32_t             cmdfifo_rp;          /* read pointer                  */
@@ -706,6 +767,7 @@ struct Voodoo3State {
     uint32_t             cmdfifo_end_2;
     uint32_t             cmdfifo_size_2;
     bool                 cmdfifo_enabled_2;
+    bool                 cmdfifo_no_holes_2;
     bool                 cmdfifo_in_agp_2;
     int                  cmdfifo_in_sub_2;
     uint32_t             cmdfifo_rp_2;
@@ -747,5 +809,77 @@ struct Voodoo3State {
 
 /* voodoo3_queue_triangle — submit a triangle to the render ring.
  * Defined as static in voodoo3.c but declared here for setup.c. */
+
+/* Pixel byte-order helpers (see lfb_be32 in Voodoo3State). */
+static inline bool v3_be16(const Voodoo3State *s)
+{
+    return s->lfb_be16;
+}
+static inline bool v3_be32(const Voodoo3State *s)
+{
+    return s->lfb_be32;
+}
+/*
+ * Byte rearrangement (k -> k ^ x) the chip's LFB swizzle applied to CPU
+ * writes of the visible screen's data.  16 bpp: only when the driver uses
+ * the word swizzle (AmigaOS 0xC0000000 -> x = 1); MorphOS writes RGB16PC
+ * with the swizzle off (x = 0) even if it enabled bit 30 earlier.
+ */
+static inline uint32_t v3_lfb_x(const Voodoo3State *s)
+{
+    if (s->pix_format == 1) {
+        return s->lfb_be16 ? ((s->lfb_be32 ? 3u : 0u) ^ 2u) : 0u;
+    }
+    return (s->lfb_be32 ? 3u : 0u) ^ (s->lfb_be16 ? 2u : 0u);
+}
+
+/* value to store host-natively so SGRAM gets the right byte order */
+static inline uint16_t v3_px16(const Voodoo3State *s, uint32_t v)
+{
+    return v3_be16(s) ? cpu_to_be16((uint16_t)v) : cpu_to_le16((uint16_t)v);
+}
+static inline uint32_t v3_px32(const Voodoo3State *s, uint32_t v)
+{
+    return v3_be32(s) ? cpu_to_be32(v) : cpu_to_le32(v);
+}
+static inline uint16_t v3_ld16(const Voodoo3State *s, const void *p)
+{
+    return v3_be16(s) ? lduw_be_p(p) : lduw_le_p(p);
+}
+static inline void v3_st16(const Voodoo3State *s, void *p, uint16_t v)
+{
+    if (v3_be16(s)) {
+        stw_be_p(p, v);
+    } else {
+        stw_le_p(p, v);
+    }
+}
+static inline uint32_t v3_ld32(const Voodoo3State *s, const void *p)
+{
+    return v3_be32(s) ? ldl_be_p(p) : ldl_le_p(p);
+}
+
+
+/*
+ * Record an engine write to SGRAM by address (display rows are derived from
+ * the desktop start/stride; texture cache entries are invalidated).  Marking
+ * by draw-buffer y, as before, only worked when the 3D colour buffer was the
+ * visible desktop at offset 0; MiniGL renders into the window area of the
+ * Workbench screen, so those rows were never redrawn (stripes).
+ */
+static inline void v3_mark_px(Voodoo3State *s, const void *ptr)
+{
+    unsigned long pg = (unsigned long)((const uint8_t *)ptr - s->fb_mem)
+                       >> V3_VRAM_PAGE_SHIFT;
+    if (!test_bit(pg, s->disp_dirty_pages)) {
+        set_bit_atomic(pg, s->disp_dirty_pages);
+        qatomic_set(&s->disp_dirty_any, true);
+    }
+    if (!test_bit(pg, s->tex_dirty_pages)) {
+        set_bit_atomic(pg, s->tex_dirty_pages);
+        qatomic_set(&s->tex_dirty_any, true);
+    }
+}
+
 
 #endif /* HW_DISPLAY_VOODOO3_INT_H */

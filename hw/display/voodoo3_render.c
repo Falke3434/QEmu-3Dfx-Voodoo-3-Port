@@ -41,6 +41,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/bswap.h"
 #include "hw/display/voodoo3_int.h"
 #include "hw/display/voodoo3_render.h"
 #include "hw/display/voodoo3_texture.h"
@@ -131,8 +132,11 @@
 #define TEXMODE_PASSTHROUGH 0x00
 #define TEXMODE_TCLAMPS     (1 << 6)
 #define TEXMODE_TCLAMPT     (1 << 7)
-#define TEXMODE_TMIRROR_S   (1 << 17)
-#define TEXMODE_TMIRROR_T   (1 << 18)
+/* Mirroring lives in tLOD, not textureMode (86Box LOD_TMIRROR_S/T).
+ * textureMode bits 17/18 are texture-combine bits and are set by most
+ * drivers, so every texture used to be mirrored. */
+#define TLOD_TMIRROR_S      (1u << 28)
+#define TLOD_TMIRROR_T      (1u << 29)
 
 /* CC selectors (fbzColorPath bits [12:10]) — from 86Box TC_MSELECT_* enum */
 #define CC_MSELECT_ZERO    0
@@ -429,9 +433,9 @@ static void v3_tmu_fetch(v3_state_t *st, const voodoo3_params_t *p,
     st->lod >>= 8;
 
     /* Mirror */
-    if (p->tmu[tmu].textureMode & TEXMODE_TMIRROR_S)
+    if (p->tmu[tmu].tLOD & TLOD_TMIRROR_S)
         if (s & 0x1000) s = ~s;
-    if (p->tmu[tmu].textureMode & TEXMODE_TMIRROR_T)
+    if (p->tmu[tmu].tLOD & TLOD_TMIRROR_T)
         if (t & 0x1000) t = ~t;
 
     if (bilinear && (p->tmu[tmu].textureMode & 6)) {
@@ -916,12 +920,16 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                     uint16_t test_d = (fbz & FBZ_DEPTH_SOURCE)
                                      ? (uint16_t)(p->zaColor & 0xffff)
                                      : (uint16_t)new_depth;
-                    if (!depth_test(depth_op, test_d, old_d))
+                    if (!depth_test(depth_op, test_d, old_d)) {
+                        s->fbiZFuncFail++;
                         goto skip_pixel;
+                    }
                 }
 
                 /* --- Read destination pixel --- */
-                uint16_t dst_raw = p->col_tiled ? fb_row[x_t] : fb_row[x];
+                /* Colour buffer is kept in CPU (big-endian) byte order, the
+                 * same convention the display and the 2D engine use. */
+                uint16_t dst_raw = v3_ld16(s, p->col_tiled ? &fb_row[x_t] : &fb_row[x]);
                 uint8_t  dest_r = (uint8_t)(((dst_raw >> 11) & 0x1f) * 255 / 31);
                 uint8_t  dest_g = (uint8_t)(((dst_raw >>  5) & 0x3f) * 255 / 63);
                 uint8_t  dest_b = (uint8_t)((dst_raw & 0x1f) * 255 / 31);
@@ -1222,16 +1230,10 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                 /* --- Write pixel --- */
                 if (rgb_wmask) {
                     uint16_t pix = (uint16_t)((src_r << 11) | (src_g << 5) | src_b);
-                    if (p->col_tiled) fb_row[x_t] = pix;
-                    else              fb_row[x]   = pix;
-
-                    /* Mark scanline dirty for display output
-                     * (mirrors 86Box dirty_line[] tracking in voodoo_half_triangle) */
-                    if (p->draw_offset == p->front_offset) {
-                        int _dy = screen_y;
-                        if (_dy >= 0 && _dy < V3_DIRTY_LINES)
-                            s->dirty_line[_dy] = 1;
-                    }
+                    uint16_t *dstp = p->col_tiled ? &fb_row[x_t] : &fb_row[x];
+                    v3_st16(s, dstp, pix);
+                    /* dirty by SGRAM address (display + texture cache) */
+                    v3_mark_px(s, dstp);
                 }
 
                 /* --- Write depth / alpha --- */
@@ -1459,7 +1461,8 @@ void voodoo3_triangle(Voodoo3State *s, const voodoo3_params_t *p, int odd_even)
 #define EXP5(v)  (((v) << 3) | ((v) >> 2))
 #define EXP6(v)  (((v) << 2) | ((v) >> 4))
 
-void voodoo3_fb_writel(Voodoo3State *s, uint32_t addr, uint32_t val)
+static void voodoo3_fb_write_common(Voodoo3State *s, uint32_t addr,
+                                    uint32_t val, bool half)
 {
     const voodoo3_params_t *p = &s->params;
     int      x, y;
@@ -1482,6 +1485,21 @@ void voodoo3_fb_writel(Voodoo3State *s, uint32_t addr, uint32_t val)
      * For dual-pixel formats (RGB565 / RGB555 / ARGB1555 / depth-only),
      * count=2 and addr is a 2-pixel-wide word; single-pixel formats set count=1.
      * ----------------------------------------------------------------------- */
+    /*
+     * 16-bit access (voodoo_fb_writew): only the 16-bit formats and pure
+     * depth are defined; one pixel in val[15:0].  86Box aborts on the other
+     * formats; we ignore the write.
+     */
+    if (half) {
+        switch (s->lfbMode & 0xfu) {
+        case 0: case 1: case 2: case 15:
+            val &= 0xffffu;
+            break;
+        default:
+            return;
+        }
+    }
+
     switch (s->lfbMode & 0xfu) {
 
     case 0: /* RGB565 — two 16-bit pixels packed into val */
@@ -1516,19 +1534,24 @@ void voodoo3_fb_writel(Voodoo3State *s, uint32_t addr, uint32_t val)
         write_mask = LFB_WRITE_COLOUR; count = 2;
         break;
 
-    case 4: /* ARGB8888 — one 32-bit pixel */
+    /*
+     * lfbMode format 4 = XRGB8888, 5 = ARGB8888 (86Box vid_voodoo_regs.h
+     * LFB_FORMAT_XRGB8888 = 4, LFB_FORMAT_ARGB8888 = 5).  The alpha handling
+     * of the two formats was swapped before.
+     */
+    case 4: /* XRGB8888 — one 32-bit pixel, alpha from zaColor */
+        col_b[0] =  (int)(val        & 0xffu);
+        col_g[0] =  (int)((val >>  8) & 0xffu);
+        col_r[0] =  (int)((val >> 16) & 0xffu);
+        write_mask = LFB_WRITE_COLOUR; count = 1;
+        addr >>= 1; /* 32-bit pixels use half the address space */
+        break;
+
+    case 5: /* ARGB8888 — one 32-bit pixel */
         col_b[0] =  (int)(val        & 0xffu);
         col_g[0] =  (int)((val >>  8) & 0xffu);
         col_r[0] =  (int)((val >> 16) & 0xffu);
         alpha_data[0] = (int)((val >> 24) & 0xffu);
-        write_mask = LFB_WRITE_COLOUR; count = 1;
-        addr >>= 1; /* ARGB8888 uses half the address space (2 bytes/pixel) */
-        break;
-
-    case 5: /* XRGB8888 — one 32-bit pixel, alpha ignored */
-        col_b[0] =  (int)(val        & 0xffu);
-        col_g[0] =  (int)((val >>  8) & 0xffu);
-        col_r[0] =  (int)((val >> 16) & 0xffu);
         write_mask = LFB_WRITE_COLOUR; count = 1;
         addr >>= 1;
         break;
@@ -1588,6 +1611,9 @@ void voodoo3_fb_writel(Voodoo3State *s, uint32_t addr, uint32_t val)
      * the caller has already shifted addr >>= 1 to convert the 32-bit pixel
      * address to a 16-bit one, so the decode below is uniform across formats.
      * ----------------------------------------------------------------------- */
+    if (half) {
+        count = 1;
+    }
     x = (int)(addr & 0xffeu);           /* byte X offset within row (always even) */
     y = (int)((addr >> 12) & 0x3ffu);  /* row index */
 
@@ -1608,9 +1634,7 @@ void voodoo3_fb_writel(Voodoo3State *s, uint32_t addr, uint32_t val)
     default:    fb_write_offset = p->front_offset; break;  /* front */
     }
 
-    /* Dirty-line tracking — front-buffer writes must update the display */
-    if (fb_write_offset == p->front_offset && y < V3_DIRTY_LINES)
-        s->dirty_line[y] = 1;
+    /* Dirty tracking is done per written pixel by address (v3_mark_px). */
 
     /* Address computation — tiled or linear (86Box col_tiled / aux_tiled) */
     if (p->col_tiled)
@@ -1719,7 +1743,7 @@ void voodoo3_fb_writel(Voodoo3State *s, uint32_t addr, uint32_t val)
             /* --- Alpha blend --- */
             if (blend_en) {
                 /* Read destination pixel for blend */
-                uint16_t dst_raw = *(const uint16_t *)(s->fb_mem +
+                uint16_t dst_raw = v3_ld16(s, s->fb_mem +
                                     ((write_addr) & (uint32_t)fb_mask));
                 uint8_t dest_r = (uint8_t)(((dst_raw >> 11) & 0x1fu) * 255u / 31u);
                 uint8_t dest_g = (uint8_t)(((dst_raw >>  5) & 0x3fu) * 255u / 63u);
@@ -1747,7 +1771,8 @@ void voodoo3_fb_writel(Voodoo3State *s, uint32_t addr, uint32_t val)
                         pr = wr >> 3; pg = wg >> 2; pb = wb >> 3;
                     }
                     uint16_t pix = (uint16_t)((pr << 11) | (pg << 5) | pb);
-                    *(uint16_t *)(s->fb_mem + ((write_addr) & (uint32_t)fb_mask)) = pix;
+                    v3_st16(s, s->fb_mem + ((write_addr) & (uint32_t)fb_mask), pix);
+                    v3_mark_px(s, s->fb_mem + ((write_addr) & (uint32_t)fb_mask));
                 }
             }
 
@@ -1775,9 +1800,9 @@ skip_fb_pixel:
                 int pr = col_r[c] >> 3;
                 int pg = col_g[c] >> 2;
                 int pb = col_b[c] >> 3;
-                *(uint16_t *)(s->fb_mem +
-                    ((write_addr) & (uint32_t)fb_mask)) =
-                    (uint16_t)((pr << 11) | (pg << 5) | pb);
+                v3_st16(s, s->fb_mem + ((write_addr) & (uint32_t)fb_mask),
+                         (uint16_t)((pr << 11) | (pg << 5) | pb));
+                v3_mark_px(s, s->fb_mem + ((write_addr) & (uint32_t)fb_mask));
             }
             if (write_mask & (LFB_WRITE_DEPTH | LFB_WRITE_BOTH)) {
                 *(uint16_t *)(s->fb_mem +
@@ -1794,3 +1819,29 @@ skip_fb_pixel:
 #undef LFB_WRITE_BOTH
 #undef EXP5
 #undef EXP6
+
+/*
+ * lfbMode write swaps (Voodoo/Glide SST_LFB_WRITE_SWAP16 = bit 11,
+ * SST_LFB_WRITE_BYTESWAP = bit 12).  Big-endian hosts of real Voodoo cards
+ * set these so 32-bit CPU stores arrive in the expected pixel order.  The
+ * two permutations commute, so the order of application is irrelevant.
+ */
+void voodoo3_fb_writel(Voodoo3State *s, uint32_t addr, uint32_t val)
+{
+    if (s->lfbMode & (1u << 12)) {
+        val = bswap32(val);
+    }
+    if (s->lfbMode & (1u << 11)) {
+        val = (val >> 16) | (val << 16);
+    }
+    voodoo3_fb_write_common(s, addr, val, false);
+}
+
+/* 16-bit LFB write — 86Box voodoo_fb_writew() */
+void voodoo3_fb_writew(Voodoo3State *s, uint32_t addr, uint16_t val)
+{
+    if (s->lfbMode & (1u << 12)) {
+        val = bswap16(val);
+    }
+    voodoo3_fb_write_common(s, addr, val, true);
+}

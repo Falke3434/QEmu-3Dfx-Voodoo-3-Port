@@ -1,3 +1,6 @@
 config VOODOO3
-    default y
-    depends on PCI_DEVICES
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select BITBANG_I2C
+    select DDC

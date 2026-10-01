@@ -32,6 +32,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
+#include "qemu/bitmap.h"
 #include "qemu/log.h"
 #include "hw/display/voodoo3_int.h"
 #include "hw/display/voodoo3_texture.h"
@@ -56,15 +58,18 @@
 #define TEX_ARGB_8888 15  /* GR_TEXFMT_ARGB_8888 — 32-bit, 4 bytes/texel (Voodoo3/Banshee) */
 
 /* tLOD bit fields */
+/* tLOD / textureMode bits — 86Box vid_voodoo_regs.h.  The previous values
+ * (LOD_ODD 1<<24, LOD_SPLIT 1<<23, TMULTIBASEADDR 1<<25, TRILINEAR 1<<2)
+ * were wrong: bit 2 of textureMode is the magnification filter, so every
+ * bilinear texture was treated as trilinear and its mip levels were taken
+ * from the wrong addresses. */
+#define LOD_ODD             (1 << 18)
+#define LOD_SPLIT           (1 << 19)
 #define LOD_S_IS_WIDER      (1 << 20)
-#define LOD_SPLIT           (1 << 23)
-#define LOD_ODD             (1 << 24)
-#define LOD_TMULTIBASEADDR  (1 << 25)
-#define LOD_TRILINEAR       (1 << 26)   /* = TEXTUREMODE_TRILINEAR */
-#define LOD_TMIRROR_S       (1 << 17)
-#define LOD_TMIRROR_T       (1 << 18)
-
-#define TEXTUREMODE_TRILINEAR (1 << 2)
+#define LOD_TMULTIBASEADDR  (1 << 24)
+#define LOD_TMIRROR_S       (1 << 28)
+#define LOD_TMIRROR_T       (1 << 29)
+#define TEXTUREMODE_TRILINEAR (1u << 30)
 #define TEXTUREMODE_NCC_SEL   (1 << 5)
 
 /* Pack RGBA bytes into a 32-bit ABGR word (86Box internal format) */
@@ -165,12 +170,15 @@ void voodoo3_recalc_tex(voodoo3_tex_params_t *tp, uint32_t tLOD,
             ((lod & 1) && (tLOD & LOD_ODD)) ||
             (!(lod & 1) && !(tLOD & LOD_ODD));
         if (store_this) {
+            /* 86Box voodoo_recalc_tex3(): unclamped (width>>lod)*(height>>lod),
+             * i.e. mip levels below 1x1 add nothing to the offset. */
+            uint32_t uw = (uint32_t)(width >> lod), uh = (uint32_t)(height >> lod);
             if (tformat == TEX_ARGB_8888)
-                offset += (uint32_t)(w * h * 4);
+                offset += uw * uh * 4;
             else if (tformat & 8)
-                offset += (uint32_t)(w * h * 2);
+                offset += uw * uh * 2;
             else
-                offset += (uint32_t)(w * h);
+                offset += uw * uh;
         }
     }
 
@@ -252,6 +260,18 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
     voodoo3_init_luts();
 
     uint8_t *tex_mem  = s->tex_mem[tmu];
+    /*
+     * SGRAM holds CPU-written data in CPU byte order; the chip saw it
+     * rearranged by the LFB swizzle (byte k at k ^ x).  Texels uploaded by
+     * the CPU through the frame buffer (MiniGL/Warp3D do this) must be read
+     * the way the TMU saw them.  Engine writes (texture aperture, CMDFIFO
+     * packet 5) are stored with the same rearrangement, so one rule fits.
+     */
+    const uint32_t sx = v3_lfb_x(s);
+#define TB(a)   (tex_mem[((uint32_t)(a) & tex_mask) ^ sx])
+#define T16(a)  ((uint16_t)(TB(a) | (TB((a) + 1) << 8)))
+#define T32(a)  ((uint32_t)TB(a) | ((uint32_t)TB((a) + 1) << 8) | \
+                 ((uint32_t)TB((a) + 2) << 16) | ((uint32_t)TB((a) + 3) << 24))
     uint32_t tex_mask = s->tex_mask;
     int      tformat  = tp->tformat;
 
@@ -283,37 +303,37 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
                 uint32_t out;
                 switch (tformat) {
                 case TEX_RGB332: {
-                    uint8_t d = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
+                    uint8_t d = TB(row_addr + (uint32_t)x);
                     out = MAKERGBA(rgb332_r[d], rgb332_g[d], rgb332_b[d], 0xff);
                     break; }
                 case TEX_Y4I2Q2: {
-                    uint8_t  d   = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
+                    uint8_t  d   = TB(row_addr + (uint32_t)x);
                     int      sel = (tp->textureMode & TEXTUREMODE_NCC_SEL) ? 1 : 0;
                     uint32_t c   = s->ncc_lookup[tmu][sel][d];
                     out = c;
                     break; }
                 case TEX_A8: {
-                    uint8_t d = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
+                    uint8_t d = TB(row_addr + (uint32_t)x);
                     out = MAKERGBA(d, d, d, d);
                     break; }
                 case TEX_I8: {
-                    uint8_t d = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
+                    uint8_t d = TB(row_addr + (uint32_t)x);
                     out = MAKERGBA(d, d, d, 0xff);
                     break; }
                 case TEX_AI8: {
-                    uint8_t d  = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
+                    uint8_t d  = TB(row_addr + (uint32_t)x);
                     uint8_t lo = (uint8_t)((d & 0x0f) | ((d & 0x0f) << 4));
                     uint8_t hi = (uint8_t)((d & 0xf0) | ((d & 0xf0) >> 4));
                     out = MAKERGBA(lo, lo, lo, hi);
                     break; }
                 case TEX_PAL8: {
-                    uint8_t  idx = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
+                    uint8_t  idx = TB(row_addr + (uint32_t)x);
                     uint32_t c   = s->tex_palette[tmu][idx];
                     out = MAKERGBA((c >> 16) & 0xff, (c >> 8) & 0xff,
                                     c & 0xff, 0xff);
                     break; }
                 case TEX_APAL8: {
-                    uint8_t  idx = tex_mem[(row_addr + (uint32_t)x) & tex_mask];
+                    uint8_t  idx = TB(row_addr + (uint32_t)x);
                     uint32_t c   = s->tex_palette[tmu][idx];
                     uint8_t  pr  = (c >> 16) & 0xff;
                     uint8_t  pg  = (c >>  8) & 0xff;
@@ -326,40 +346,40 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
                     break; }
                 case TEX_ARGB8332: {
                     uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    d = T16(row_addr + (uint32_t)(x * 2));
                     out = MAKERGBA(rgb332_r[d & 0xff], rgb332_g[d & 0xff],
                                    rgb332_b[d & 0xff], d >> 8);
                     break; }
                 case TEX_A8Y4I2Q2: {
                     uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    d = T16(row_addr + (uint32_t)(x * 2));
                     int      sel = (tp->textureMode & TEXTUREMODE_NCC_SEL) ? 1 : 0;
                     uint32_t c   = s->ncc_lookup[tmu][sel][d & 0xff];
                     out = (c & 0x00ffffffu) | ((uint32_t)(d >> 8) << 24);
                     break; }
                 case TEX_R5G6B5: {
                     uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    d = T16(row_addr + (uint32_t)(x * 2));
                     out = MAKERGBA(rgb565_r[d], rgb565_g[d], rgb565_b[d], 0xff);
                     break; }
                 case TEX_ARGB1555: {
                     uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    d = T16(row_addr + (uint32_t)(x * 2));
                     out = MAKERGBA(a1555_r[d], a1555_g[d], a1555_b[d], a1555_a[d]);
                     break; }
                 case TEX_ARGB4444: {
                     uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    d = T16(row_addr + (uint32_t)(x * 2));
                     out = MAKERGBA(a4444_r[d], a4444_g[d], a4444_b[d], a4444_a[d]);
                     break; }
                 case TEX_A8I8: {
                     uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    d = T16(row_addr + (uint32_t)(x * 2));
                     out = MAKERGBA(d & 0xff, d & 0xff, d & 0xff, d >> 8);
                     break; }
                 case TEX_APAL88: {
                     uint16_t d;
-                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 2)) & tex_mask], 2);
+                    d = T16(row_addr + (uint32_t)(x * 2));
                     uint32_t c   = s->tex_palette[tmu][d & 0xff];
                     out = MAKERGBA((c >> 16) & 0xff, (c >> 8) & 0xff,
                                     c & 0xff, d >> 8);
@@ -374,7 +394,7 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
                  */
                 case TEX_ARGB_8888: {
                     uint32_t d;
-                    memcpy(&d, &tex_mem[(row_addr + (uint32_t)(x * 4)) & tex_mask], 4);
+                    d = T32(row_addr + (uint32_t)(x * 4));
                     /* Wire layout: bits[31:24]=A, [23:16]=R, [15:8]=G, [7:0]=B */
                     out = MAKERGBA((d >> 16) & 0xff,   /* R */
                                    (d >>  8) & 0xff,   /* G */
@@ -389,218 +409,240 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
             }
         }
     }
+#undef TB
+#undef T16
+#undef T32
+}
+
+
+
+/* =========================================================================
+ * Dirty-page tracking for the texture cache
+ *
+ * Banshee/V3 textures live in the shared SGRAM, so any write to SGRAM can
+ * change a cached texture.  Writers only set a bit per 4 KiB page (cheap,
+ * lock-free); the producer that looks up textures consumes the bitmap and
+ * invalidates overlapping cache entries (86Box: texture_present[] +
+ * flush_texture_cache()).
+ * ========================================================================= */
+void voodoo3_vram_mark_dirty(Voodoo3State *s, uint32_t addr, uint32_t len)
+{
+    if (!len || !s->tex_dirty_pages) {
+        return;
+    }
+    uint32_t first = (addr & s->tex_mask) >> V3_VRAM_PAGE_SHIFT;
+    uint64_t last64 = ((uint64_t)(addr & s->tex_mask) + len - 1)
+                      >> V3_VRAM_PAGE_SHIFT;
+    uint32_t npages = s->tex_mem_size >> V3_VRAM_PAGE_SHIFT;
+    uint32_t last = last64 >= npages ? npages - 1 : (uint32_t)last64;
+
+    for (uint32_t pg = first; pg <= last; pg++) {
+        if (!test_bit(pg, s->tex_dirty_pages)) {
+            set_bit_atomic(pg, s->tex_dirty_pages);
+        }
+        if (!test_bit(pg, s->disp_dirty_pages)) {
+            set_bit_atomic(pg, s->disp_dirty_pages);
+        }
+    }
+    if (!qatomic_read(&s->tex_dirty_any)) {
+        qatomic_set(&s->tex_dirty_any, true);
+    }
+    if (!qatomic_read(&s->disp_dirty_any)) {
+        qatomic_set(&s->disp_dirty_any, true);
+    }
+}
+
+void voodoo3_flush_tex_if_dirty(Voodoo3State *s, uint32_t addr_fb)
+{
+    voodoo3_vram_mark_dirty(s, addr_fb, 4);
+}
+
+void voodoo3_tex_cache_flush_all(Voodoo3State *s)
+{
+    for (int tmu = 0; tmu < 2; tmu++) {
+        for (int c = 0; c < V3_TEX_CACHE_SIZE; c++) {
+            qatomic_set(&s->tex_cache[tmu][c].valid, false);
+        }
+    }
+}
+
+static bool tex_entry_overlaps(const v3_tex_cache_entry_t *e,
+                               const unsigned long *pages, uint32_t npages)
+{
+    uint32_t first = e->addr_start >> V3_VRAM_PAGE_SHIFT;
+    uint32_t last  = (e->addr_end ? e->addr_end - 1 : 0) >> V3_VRAM_PAGE_SHIFT;
+
+    if (last < first) {            /* wrapped around the end of SGRAM */
+        return find_next_bit(pages, npages, first) < npages ||
+               find_next_bit(pages, last + 1, 0) <= last;
+    }
+    if (last >= npages) {
+        last = npages - 1;
+    }
+    return find_next_bit(pages, last + 1, first) <= last;
+}
+
+static void tex_process_dirty(Voodoo3State *s)
+{
+    uint32_t npages = s->tex_mem_size >> V3_VRAM_PAGE_SHIFT;
+    unsigned long snap[BITS_TO_LONGS(V3_VRAM_PAGES)];
+
+    if (!qatomic_read(&s->tex_dirty_any)) {
+        return;
+    }
+    qatomic_set(&s->tex_dirty_any, false);
+    smp_mb();
+    bitmap_copy_and_clear_atomic(snap, s->tex_dirty_pages, npages);
+
+    for (int tmu = 0; tmu < 2; tmu++) {
+        for (int c = 0; c < V3_TEX_CACHE_SIZE; c++) {
+            v3_tex_cache_entry_t *e = &s->tex_cache[tmu][c];
+            if (e->valid && tex_entry_overlaps(e, snap, npages)) {
+                qatomic_set(&e->valid, false);
+            }
+        }
+    }
+}
+
+/* True when no queued/in-flight triangle still samples from this entry. */
+static bool tex_entry_idle(Voodoo3State *s, const v3_tex_cache_entry_t *e)
+{
+    for (uint32_t t = 0; t < s->render_threads_count; t++) {
+        if (qatomic_load_acquire(&e->refcount_r[t]) != e->refcount) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void tex_wire(voodoo3_params_t *p, int tmu, int slot,
+                     v3_tex_cache_entry_t *e, int lod_min, int lod_max)
+{
+    for (int lod = 0; lod <= V3_LOD_MAX; lod++) {
+        int ul = lod < lod_min ? lod_min : (lod > lod_max ? lod_max : lod);
+        p->tex_ptr[tmu][lod] = &e->data[texture_offset[ul]];
+    }
+    /* One reference per queued triangle; released by every render thread */
+    e->refcount++;
+    p->tex_slot[tmu] = (int8_t)slot;
 }
 
 /* =========================================================================
  * voodoo3_use_texture — look up or decode a texture; wire pointers
  *
- * Called from voodoo3_queue_triangle() before pushing to param ring.
- * Sets tp->decoded_data[tmu][lod] so the rasterizer can read texels.
+ * Called from voodoo3_queue_triangle() (under queue_lock) before the
+ * triangle is pushed to the param ring.
  * ========================================================================= */
 void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu)
 {
     voodoo3_tex_params_t *tp = &p->tex_params[tmu];
 
+    tex_process_dirty(s);
+
     int lod_min = (int)((tp->tLOD >> 2)  & 0xf);
     int lod_max = (int)((tp->tLOD >> 8)  & 0xf);
     if (lod_min > V3_LOD_MAX) lod_min = V3_LOD_MAX;
     if (lod_max > V3_LOD_MAX) lod_max = V3_LOD_MAX;
+    if (lod_max < lod_min) lod_max = lod_min;
 
     uint32_t cache_addr = tp->base;
-    uint32_t cache_lod  = tp->tLOD & 0xf00fffu;
+    /* LOD range/aspect plus odd/split/multibase layout bits (18..24) */
+    uint32_t cache_lod  = tp->tLOD & 0x01fc0fffu;
+    /* Texel format (bits 11:8) and NCC table select (bit 5) change decode */
+    uint32_t cache_mode = tp->textureMode & ((0xfu << 8) | TEXTUREMODE_NCC_SEL);
 
-    /*
-     * For NCC-format textures (TEX_Y4I2Q2, TEX_A8Y4I2Q2) the decoded pixel
-     * data depends on the nccTable registers, not just the raw SGRAM bytes.
-     * We track the current generation counter so that any nccTable write
-     * (which bumps ncc_gen[tmu]) forces a cache miss and re-decode.
-     * For non-NCC formats ncc_gen is always 0 in the cache entry (stored as
-     * 0) and s->ncc_gen is ignored, so there is no overhead.
-     */
     bool is_ncc = (tp->tformat == TEX_Y4I2Q2 || tp->tformat == TEX_A8Y4I2Q2);
+    bool is_pal = (tp->tformat == TEX_PAL8 || tp->tformat == TEX_APAL8 ||
+                   tp->tformat == TEX_APAL88);
     uint32_t cur_ncc_gen = is_ncc ? s->ncc_gen[tmu] : 0u;
+    uint32_t cur_pal_gen = is_pal ? s->pal_gen[tmu] : 0u;
 
     /* Search cache for a valid matching entry */
     for (int c = 0; c < V3_TEX_CACHE_SIZE; c++) {
         v3_tex_cache_entry_t *e = &s->tex_cache[tmu][c];
         if (e->valid && e->base == cache_addr && e->tLOD == cache_lod
-                && e->ncc_gen == cur_ncc_gen) {
-            /* Hit — wire per-LOD pointers via texture_offset[], clamped */
-            for (int lod = 0; lod <= V3_LOD_MAX; lod++) {
-                int ul = lod < lod_min ? lod_min
-                       : (lod > lod_max ? lod_max : lod);
-                p->tex_ptr[tmu][lod] = &e->data[texture_offset[ul]];
-            }
+                && e->textureMode == cache_mode
+                && e->ncc_gen == cur_ncc_gen && e->pal_gen == cur_pal_gen) {
+            tex_wire(p, tmu, c, e, lod_min, lod_max);
             return;
         }
     }
 
-    /* Cache miss — evict LRU slot (round-robin, same as 86Box) */
-    int slot = (int)(s->tex_lru[tmu] & (V3_TEX_CACHE_SIZE - 1));
-    s->tex_lru[tmu]++;
+    /*
+     * Cache miss — recycle the next slot (round-robin like 86Box) that no
+     * render thread is still sampling from.  If every slot is busy, wait
+     * for the render threads to drain (86Box
+     * voodoo_wait_for_render_thread_idle()).
+     */
+    int slot = -1;
+    for (int tries = 0; tries < V3_TEX_CACHE_SIZE; tries++) {
+        int cand = (int)(s->tex_lru[tmu]++ & (V3_TEX_CACHE_SIZE - 1));
+        if (tex_entry_idle(s, &s->tex_cache[tmu][cand])) {
+            slot = cand;
+            break;
+        }
+    }
+    if (slot < 0) {
+        voodoo3_wait_render_idle(s);
+        slot = (int)(s->tex_lru[tmu]++ & (V3_TEX_CACHE_SIZE - 1));
+    }
     v3_tex_cache_entry_t *e = &s->tex_cache[tmu][slot];
 
-    /* Warn if the base address looks uninitialized (driver hasn't uploaded texture yet) */
     if (cache_addr == 0) {
         qemu_log_mask(LOG_GUEST_ERROR,
             "voodoo3: use_texture tmu=%d: base=0 — texture not uploaded yet "
             "(tLOD=0x%08x tformat=%u); rendering may produce garbage\n",
             tmu, tp->tLOD, tp->tformat);
-    } else {
-        qemu_log_mask(LOG_UNIMP,
-            "voodoo3: tex cache miss tmu=%d slot=%d base=0x%08x "
-            "tLOD=0x%06x tformat=%u lod_min=%d lod_max=%d ncc=%d\n",
-            tmu, slot, cache_addr, cache_lod, tp->tformat,
-            lod_min, lod_max, is_ncc);
     }
 
-    e->valid   = true;
-    e->base    = cache_addr;
-    e->tLOD    = cache_lod;
-    e->ncc_gen = cur_ncc_gen;
+    e->valid       = false;
+    e->base        = cache_addr;
+    e->tLOD        = cache_lod;
+    e->textureMode = cache_mode;
+    e->ncc_gen     = cur_ncc_gen;
+    e->pal_gen     = cur_pal_gen;
+
+    /* SGRAM range covered by the decoded LODs (for dirty-page invalidation) */
+    uint32_t start = tp->tex_base[lod_min] & s->tex_mask;
+    uint32_t end   = tp->tex_end[lod_min] & s->tex_mask;
+    for (int lod = lod_min + 1; lod <= lod_max; lod++) {
+        uint32_t b = tp->tex_base[lod] & s->tex_mask;
+        uint32_t en = tp->tex_end[lod] & s->tex_mask;
+        if (b < start) start = b;
+        if (en > end) end = en;
+    }
+    e->addr_start = start;
+    e->addr_end   = end;
 
     decode_texture(s, e, tp, tmu, lod_min, lod_max);
+    e->valid = true;
 
-    /* Wire rasterizer pointers via texture_offset[] */
-    for (int lod = 0; lod <= V3_LOD_MAX; lod++) {
-        int ul = lod < lod_min ? lod_min : (lod > lod_max ? lod_max : lod);
-        p->tex_ptr[tmu][lod] = &e->data[texture_offset[ul]];
-    }
+    tex_wire(p, tmu, slot, e, lod_min, lod_max);
 }
 
 /* =========================================================================
- * voodoo3_tex_download — handle one FIFO_WRITEL_TEX write
+ * voodoo3_tex_download — handle one texture-aperture write (BAR0 0x600000+)
  *
  * Ported from 86Box voodoo_tex_writel() — Banshee/V3 linear path.
- * For Voodoo 3 the address is: (fifo_addr & 0x1ffffc) + tex_base[tmu][0]
+ * For Voodoo 3 the address is: (addr & 0x1ffffc) + tex_base[tmu][0]
+ * Executed synchronously in the vCPU thread.  Because Banshee/V3 texture
+ * memory is the shared SGRAM, the store goes straight into fb_mem and the
+ * affected page is marked dirty; the cache is invalidated lazily.
  * ========================================================================= */
 void voodoo3_tex_download(Voodoo3State *s, uint32_t fifo_addr, uint32_t val,
                           int tmu)
 {
     if (tmu < 0 || tmu > 1) return;
 
-    /* Banshee/V3 linear addressing (from voodoo_tex_writel Banshee branch) */
     uint32_t tex_base0 = s->params.tex_params[tmu].tex_base[0];
-    uint32_t addr      = (fifo_addr & 0x1ffffc) + tex_base0;
-    addr              &= s->tex_mask;
+    uint32_t addr      = ((fifo_addr & 0x1ffffc) + tex_base0) & s->tex_mask;
+    uint32_t waddr     = addr & ~3u;
 
-    /* Invalidate any cached texture that overlaps this address */
-    for (int c = 0; c < V3_TEX_CACHE_SIZE; c++) {
-        v3_tex_cache_entry_t *e = &s->tex_cache[tmu][c];
-        if (e->valid) {
-            /* Simple range check against LOD 0 */
-            uint32_t start = s->params.tex_params[tmu].tex_base[0] & s->tex_mask;
-            uint32_t end   = s->params.tex_params[tmu].tex_end [0] & s->tex_mask;
-            uint32_t masked = addr & ~0x3ffu;
-            if (masked >= (start & ~0x3ffu) && masked <= ((end + 0x3ff) & ~0x3ffu)) {
-                e->valid = false;
-            }
-        }
-        /* Also check the other TMU for Voodoo 3 shared SGRAM */
-        v3_tex_cache_entry_t *e2 = &s->tex_cache[tmu ^ 1][c];
-        if (e2->valid) {
-            uint32_t start2 = s->params.tex_params[tmu ^ 1].tex_base[0] & s->tex_mask;
-            uint32_t end2   = s->params.tex_params[tmu ^ 1].tex_end [0] & s->tex_mask;
-            uint32_t masked = addr & ~0x3ffu;
-            if (masked >= (start2 & ~0x3ffu) && masked <= ((end2 + 0x3ff) & ~0x3ffu)) {
-                e2->valid = false;
-            }
-        }
-    }
-
-    /* Write 4 bytes to texture RAM */
-    uint32_t waddr = addr & ~3u;
     if (waddr + 4 <= s->tex_mem_size) {
-        memcpy(s->tex_mem[tmu] + waddr, &val, 4);
-    }
-}
-
-/* =========================================================================
- * voodoo3_flush_tex_if_dirty — invalidate texture cache for a VRAM address
- *
- * Ported from 86Box flush_texture_cache() in vid_voodoo_texture.c and the
- * texture_present[] check in voodoo_tex_writel() / banshee_linear_write().
- *
- * Called when guest code writes directly to VRAM (PKT5 dst=0/1 in either
- * CMDFIFO) at an address that may overlap a cached texture.  86Box tracks
- * this with a texture_present[] dirty-bit array (TEX_DIRTY_SHIFT = 10,
- * so one bit per 1 KB of texture memory) and calls flush_texture_cache()
- * when a dirty bit is set.
- *
- * QEMU does not carry the texture_present[] array (the QEMU cache uses a
- * smaller LRU table).  Instead we replicate the same "is the write address
- * inside any live cache entry?" logic directly, invalidating every entry
- * that overlaps the written 1 KB-aligned block.  This is strictly correct:
- * it may evict more entries than 86Box (no missed invalidation is possible),
- * but in practice VRAM LFB writes almost never land inside a live texture.
- *
- * addr_fb  — raw VRAM byte address of the write (already masked to fb_size)
- *
- * Must be called WITHOUT the render_lock held (it does not need to wait for
- * render threads because the FIFO is processed serially before any triangle
- * is dispatched that could use the texture).
- * ========================================================================= */
-void voodoo3_flush_tex_if_dirty(Voodoo3State *s, uint32_t addr_fb)
-{
-    /*
-     * 86Box TEX_DIRTY_SHIFT = 10 → granularity = 1 KB.
-     * We align the incoming address to 1 KB and check both TMUs.
-     */
-    uint32_t dirty_block = addr_fb & ~0x3ffu;   /* 1 KB-aligned */
-
-    for (int tmu = 0; tmu < 2; tmu++) {
-        for (int c = 0; c < V3_TEX_CACHE_SIZE; c++) {
-            v3_tex_cache_entry_t *e = &s->tex_cache[tmu][c];
-            if (!e->valid) continue;
-
-            /*
-             * Walk LODs 0..V3_LOD_MAX and check if dirty_block falls inside
-             * any LOD's VRAM range.  We use the same addr_start/addr_end
-             * approach as 86Box flush_texture_cache():
-             *   addr_start_masked = tex_base[lod] & tex_mask & ~0x3ff
-             *   addr_end_masked   = ((tex_end[lod] & tex_mask) + 0x3ff) & ~0x3ff
-             *
-             * For QEMU we only have LOD 0 base/end stored directly in the
-             * cache entry (e->base = tex_base[0]).  For higher LODs the
-             * base address is >= tex_base[0] and end <= tex_end[lod_max].
-             * A conservative check: invalidate if dirty_block is within
-             *   [tex_base[0] & tex_mask & ~0x3ff,
-             *    (tex_base[0] + V3_TEX_MEM_SIZE) & tex_mask & ~0x3ff)
-             * which is always a superset of all LODs.  This matches the
-             * intent of 86Box's loop over d=0..3 (quadrant checks).
-             */
-            uint32_t base_masked = (e->base) & s->tex_mask & ~0x3ffu;
-            /*
-             * Upper bound: the cached texture spans from base up to at most
-             * one full V3_TEX_MEM_SIZE window.  In practice textures are
-             * much smaller; the extra false-positive evictions are harmless.
-             */
-            uint32_t end_masked  = (base_masked + s->tex_mem_size - 1u)
-                                   & s->tex_mask & ~0x3ffu;
-
-            bool overlaps;
-            if (end_masked >= base_masked) {
-                overlaps = (dirty_block >= base_masked &&
-                            dirty_block <= end_masked);
-            } else {
-                /* Wrap-around case */
-                overlaps = (dirty_block >= base_masked ||
-                            dirty_block <= end_masked);
-            }
-
-            if (overlaps) {
-                /*
-                 * 86Box checks refcount vs refcount_r[] here and calls
-                 * voodoo_wait_for_render_thread_idle() if the texture is
-                 * in use by a render thread.  In QEMU the FIFO thread and
-                 * render threads are serialised via render_lock + render_cond:
-                 * FIFO processing only happens when render threads are idle
-                 * (they sleep in voodoo3_render_thread waiting for param_wr
-                 * to advance).  So no extra wait is needed here.
-                 */
-                e->valid = false;
-            }
+        uint32_t sx = v3_lfb_x(s);
+        for (int k = 0; k < 4; k++) {
+            s->tex_mem[tmu][(waddr + k) ^ sx] = (uint8_t)(val >> (8 * k));
         }
+        voodoo3_vram_mark_dirty(s, waddr, 4);
     }
 }
-

@@ -33,5 +33,7 @@ void voodoo3_triangle_setup(struct Voodoo3State *s);
  * val  = 32-bit pixel data as written by the guest
  */
 void voodoo3_fb_writel(struct Voodoo3State *s, uint32_t addr, uint32_t val);
+/* 16-bit LFB write (one pixel / one depth value) */
+void voodoo3_fb_writew(struct Voodoo3State *s, uint32_t addr, uint16_t val);
 
 #endif /* HW_DISPLAY_VOODOO3_RENDER_H */

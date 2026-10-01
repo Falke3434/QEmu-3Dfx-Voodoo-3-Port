@@ -43,6 +43,12 @@ void voodoo3_do_swap_if_pending(Voodoo3State *s);
 /* Dirty-line-aware display blit — only redraws changed scanlines */
 void voodoo3_update_display_dirty(Voodoo3State *s);
 
+/* Build the RGB565 -> XRGB8888 lookup table (idempotent) */
+void voodoo3_init_rgb565_lut(void);
+
+/* Turn dirty SGRAM pages / cursor changes into dirty scanlines */
+void voodoo3_display_apply_dirty(Voodoo3State *s);
+
 /* Hardware cursor compositing — call after voodoo3_update_display_dirty() */
 void voodoo3_draw_cursor(Voodoo3State *s,
                          uint8_t *dst_base, int dst_bpp, int dst_pitch,

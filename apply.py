@@ -14,8 +14,8 @@ Usage:
 What this does:
   1. Copies hw/display/voodoo3*.c and *.h into hw/display/
   2. Copies include/hw/display/voodoo3.h into include/hw/display/
-  3. Prepends one block to hw/display/Kconfig
-  4. Prepends one block to hw/display/meson.build
+  3. Appends one block to hw/display/Kconfig
+  4. Appends one block to hw/display/meson.build
 
 That is ALL. No machine patches. No .mak changes.
 The device is then available as -device voodoo3 on any PCI-capable guest.
@@ -37,7 +37,7 @@ def cp(src_rel, dst_rel):
     shutil.copy2(src, dst)
     print(f"  COPY  {dst_rel}")
 
-def prepend(fragment_rel, target_rel, marker):
+def append_once(fragment_rel, target_rel, marker):
     """Append fragment to target if marker not already present."""
     frag = open(os.path.join(PATCH_ROOT, fragment_rel)).read()
     target = os.path.join(ROOT, target_rel)
@@ -64,8 +64,8 @@ for f in ["voodoo3.c", "voodoo3_render.c", "voodoo3_texture.c",
 cp("include/hw/display/voodoo3.h", "include/hw/display/voodoo3.h")
 
 print("\n=== Patching build system ===")
-prepend("hw/display/Kconfig.fragment",    "hw/display/Kconfig",    "VOODOO3")
-prepend("hw/display/meson.build.fragment","hw/display/meson.build","voodoo3.c")
+append_once("hw/display/Kconfig.fragment",    "hw/display/Kconfig",    "config VOODOO3")
+append_once("hw/display/meson.build.fragment","hw/display/meson.build","voodoo3.c")
 
 print("""
 === Done ===
@@ -76,21 +76,26 @@ Rebuild QEMU (delete build dir first after Kconfig changes):
   ../configure --target-list=ppc-softmmu,x86_64-softmmu
   make -j$(nproc)
 
-Usage examples:
+Usage examples (AmigaOS 4.1 guests):
 
-  # x86 PC with Voodoo 3 3000
-  qemu-system-x86_64 -device voodoo3,model=3 [...]
+  # Pegasos2
+  qemu-system-ppc -M pegasos2 -vga none -device voodoo3,model=3 [...]
 
-  # PPC AmigaOne / Pegasos2 with AmigaOS 4.1 FE
-  qemu-system-ppc -M pegasos2 -vga none \\
-      -device voodoo3,model=3,big-endian-framebuffer=on [...]
+  # AmigaOne XE
+  qemu-system-ppc -M amigaone -vga none -device voodoo3,model=3 [...]
 
-  # Banshee variant
-  qemu-system-x86_64 -device voodoo3,model=0 [...]
+  # Sam460ex (PCI slot)
+  qemu-system-ppc -M sam460ex -device voodoo3,model=3 [...]
+
+Note: frame buffers are interpreted big-endian (PPC byte order); x86
+guests are currently not supported by the display path.
 
 Properties:
   model=0..4        Banshee(0), V3-1000(1), V3-2000(2), V3-3000(3), V3-3500(4)
-  big-endian-framebuffer=on   Required for PPC guests (AmigaOne, Pegasos2)
-  render-threads=N  Number of render threads (default: 2)
+  agp=on/off        AGP instead of PCI identity (default: off)
+  render-threads=N  1, 2 or 4 rasterizer threads (default: 2)
   bilinear=on/off   Bilinear texture filtering (default: on)
+  dac-filter=on/off Voodoo "16-bit filter" emulation (default: off)
+  lfb-tiling=on/off Decode CPU accesses to the tiled LFB aperture
+                    (default: on; turn off to get the old behaviour)
 """)

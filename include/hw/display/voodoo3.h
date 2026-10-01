@@ -26,13 +26,16 @@ DECLARE_INSTANCE_CHECKER(Voodoo3State, VOODOO3_PCI, TYPE_VOODOO3_PCI)
 #define VOODOO3_MODEL_V3_3000    3u
 #define VOODOO3_MODEL_V3_3500TV  4u
 
+/*
+ * Note: there is no "big-endian-framebuffer" property; the display path
+ * always interprets 16/32-bpp frame buffers in big-endian (PPC) order.
+ */
 static inline DeviceState *
-voodoo3_create(PCIBus *bus, uint32_t model, bool is_agp, bool big_endian_fb)
+voodoo3_create(PCIBus *bus, uint32_t model, bool is_agp)
 {
     DeviceState *dev = qdev_new(TYPE_VOODOO3_PCI);
     qdev_prop_set_uint32(dev, "model", model);
     qdev_prop_set_bit(dev,   "agp",   is_agp);
-    qdev_prop_set_bit(dev,   "big-endian-framebuffer", big_endian_fb);
     pci_realize_and_unref(PCI_DEVICE(dev), bus, &error_fatal);
     return dev;
 }

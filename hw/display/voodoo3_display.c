@@ -21,6 +21,8 @@
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
 #include "qemu/bswap.h"
+#include "qemu/atomic.h"
+#include "qemu/bitmap.h"
 
 /*
  * Dither tables are now provided by voodoo3_dither_tables.c, which contains
@@ -100,8 +102,8 @@ void voodoo3_update_ncc(Voodoo3State *s, int tmu)
  *
  * Ported from 86Box voodoo_fastfill() in vid_voodoo_blitter.c.
  * ========================================================================= */
-#define FBZ_RGB_WMASK   (1 << 10)
-#define FBZ_DEPTH_WMASK (1 << 12)
+#define FBZ_RGB_WMASK   (1 << 9)   /* 86Box: was 1 << 10 */
+#define FBZ_DEPTH_WMASK (1 << 10)  /* 86Box: was 1 << 12 */
 #define FBZ_Y_ORIGIN    (1 << 17)
 
 void voodoo3_fastfill(Voodoo3State *s)
@@ -118,8 +120,11 @@ void voodoo3_fastfill(Voodoo3State *s)
         high_y = p->clipHighY;
     }
 
+    /* 86Box voodoo_fastfill(): bounded only by the clip rectangle — the
+     * target is usually an off-screen back buffer, so clamping to the
+     * visible screen height (as before) dropped fills. */
     if (low_y < 0) low_y = 0;
-    if (high_y > s->screen_height) high_y = s->screen_height;
+    if (high_y > 2048) high_y = 2048;
 
     /* --- Colour buffer fill --- */
     if (p->fbzMode & FBZ_RGB_WMASK) {
@@ -139,9 +144,13 @@ void voodoo3_fastfill(Voodoo3State *s)
          * acceptable for 8bpp (fastfill with palette index from LSB of
          * color1).
          */
-        if (s->pix_format == 3) {
+        /* The 3D colour buffer is always RGB565 (86Box writes 16-bit
+         * unconditionally).  The desktop format used here before made 3D
+         * clears write 32-bit pixels whenever the Workbench ran in 32 bpp. */
+        if (0) {
             /* 32bpp fill */
-            uint32_t col32 = 0xff000000u | (p->color1 & 0x00ffffffu);
+            /* SGRAM holds pixels in CPU (big-endian) byte order */
+            uint32_t col32 = v3_px32(s, 0xff000000u | (p->color1 & 0x00ffffffu));
 
             for (int y = low_y; y < high_y; y++) {
                 uint32_t *row;
@@ -163,25 +172,30 @@ void voodoo3_fastfill(Voodoo3State *s)
                     }
                 }
 
-                if (p->draw_offset == p->front_offset && y < V3_DIRTY_LINES)
-                    s->dirty_line[y] = 1;
+                voodoo3_vram_mark_dirty(s, (uint32_t)((uint8_t *)row - s->fb_mem),
+                    p->col_tiled ? (uint32_t)(p->clipRight >> 6) * 4096u + 128u
+                                 : (uint32_t)p->clipRight * 4u);
             }
         } else {
             /* 16bpp (RGB565) and 8bpp fill — original path */
             uint8_t r = (uint8_t)(((p->color1 >> 16) & 0xff) >> 3);
             uint8_t g = (uint8_t)(((p->color1 >>  8) & 0xff) >> 2);
             uint8_t b = (uint8_t)( (p->color1        & 0xff) >> 3);
-            uint16_t col = (uint16_t)((r << 11) | (g << 5) | b);
+            uint16_t col = v3_px16(s, (uint16_t)((r << 11) | (g << 5) | b));
 
             for (int y = low_y; y < high_y; y++) {
                 uint16_t *row;
-                if (p->col_tiled)
-                    row = (uint16_t *)(s->fb_mem + p->draw_offset
-                          + (size_t)(y >> 5) * p->row_width
-                          + (size_t)(y & 31) * 128);
-                else
-                    row = (uint16_t *)(s->fb_mem + p->draw_offset
-                          + (size_t)y * p->row_width);
+                size_t roff = p->col_tiled
+                    ? (size_t)p->draw_offset + (size_t)(y >> 5) * p->row_width
+                      + (size_t)(y & 31) * 128
+                    : (size_t)p->draw_offset + (size_t)y * p->row_width;
+                size_t span = p->col_tiled
+                    ? (size_t)(p->clipRight >> 6) * 4096u + 128u
+                    : (size_t)p->clipRight * 2u;
+                if (roff + span > s->fb_size) {
+                    break;                         /* stay inside SGRAM */
+                }
+                row = (uint16_t *)(s->fb_mem + roff);
 
                 for (int x = p->clipLeft; x < p->clipRight; x++) {
                     if (p->col_tiled) {
@@ -192,9 +206,10 @@ void voodoo3_fastfill(Voodoo3State *s)
                     }
                 }
 
-                /* Mark dirty if drawing to front buffer */
-                if (p->draw_offset == p->front_offset && y < V3_DIRTY_LINES)
-                    s->dirty_line[y] = 1;
+                /* dirty by SGRAM address (display + texture cache) */
+                voodoo3_vram_mark_dirty(s, (uint32_t)roff,
+                    p->col_tiled ? (uint32_t)(p->clipRight >> 6) * 4096u + 128u
+                                 : (uint32_t)p->clipRight * 2u);
             }
         }
     }
@@ -205,13 +220,17 @@ void voodoo3_fastfill(Voodoo3State *s)
 
         for (int y = low_y; y < high_y; y++) {
             uint16_t *row;
-            if (p->aux_tiled)
-                row = (uint16_t *)(s->fb_mem + p->aux_offset
-                      + (size_t)(y >> 5) * p->aux_row_width
-                      + (size_t)(y & 31) * 128);
-            else
-                row = (uint16_t *)(s->fb_mem + p->aux_offset
-                      + (size_t)y * p->aux_row_width);
+            size_t aoff = p->aux_tiled
+                ? (size_t)p->aux_offset + (size_t)(y >> 5) * p->aux_row_width
+                  + (size_t)(y & 31) * 128
+                : (size_t)p->aux_offset + (size_t)y * p->aux_row_width;
+            size_t aspan = p->aux_tiled
+                ? (size_t)(p->clipRight >> 6) * 4096u + 128u
+                : (size_t)p->clipRight * 2u;
+            if (aoff + aspan > s->fb_size) {
+                break;                             /* stay inside SGRAM */
+            }
+            row = (uint16_t *)(s->fb_mem + aoff);
 
             for (int x = p->clipLeft; x < p->clipRight; x++) {
                 if (p->aux_tiled) {
@@ -235,11 +254,27 @@ void voodoo3_fastfill(Voodoo3State *s)
  * ========================================================================= */
 void voodoo3_swap_buffer(Voodoo3State *s, uint32_t val)
 {
+    /*
+     * Banshee/Voodoo3 (86Box vid_voodoo_reg.c, swapbufferCMD for
+     * VOODOO_BANSHEE): the swap shows leftOverlayBuf through the video
+     * OVERLAY.  It never moves the desktop.  The old code flipped
+     * vidDesktopStartAddr to the 3D draw buffer, so a windowed Warp3D
+     * program (CoW3D, MiniGL) briefly turned the whole Workbench into its
+     * 640-pixel back buffer on every frame (stripes / doubled screen).
+     */
+    s->frame_count++;
+    if (!(val & 1)) {
+        s->overlay_addr = s->leftOverlayBuf;
+        s->params.front_offset = s->leftOverlayBuf;
+        if (s->vidProcCfg & VIDPROCCFG_OVERLAY_ENABLE) {
+            memset(s->dirty_line, 1, sizeof(s->dirty_line));
+        }
+        return;
+    }
     s->swap_interval = (int)((val >> 1) & 0xff);
-    s->swap_offset   = s->params.draw_offset;
+    s->swap_offset   = s->leftOverlayBuf;
     s->swap_pending  = true;
     s->retrace_count = 0;
-    s->frame_count++;
 }
 
 /* Called from vblank timer — perform the actual flip if interval elapsed */
@@ -250,19 +285,14 @@ void voodoo3_do_swap_if_pending(Voodoo3State *s)
     s->retrace_count++;
     if (s->retrace_count <= s->swap_interval) return;
 
-    /* Perform buffer flip */
+    /* Perform buffer flip (overlay only, see voodoo3_swap_buffer) */
     s->params.front_offset = s->swap_offset;
+    s->overlay_addr        = s->swap_offset;
     s->swap_pending        = false;
     s->retrace_count       = 0;
-    s->desktop_start       = s->swap_offset;
-    /*
-     * After a 3D swap the display scanout starts at the new front buffer.
-     * Keep desktop_stride in sync with the current row_width so the display
-     * blit uses the correct scanline pitch.  If row_width is 0 (not yet set
-     * by colBufferStride), fall back to desktop_stride.
-     */
-    if (s->params.row_width == 0)
-        s->params.row_width = s->desktop_stride;
+    if (!(s->vidProcCfg & VIDPROCCFG_OVERLAY_ENABLE)) {
+        return;
+    }
 
     /* Mark all lines dirty so they are redrawn */
     memset(s->dirty_line, 1, sizeof(s->dirty_line));
@@ -279,6 +309,126 @@ void voodoo3_do_swap_if_pending(Voodoo3State *s)
  *
  * This is the QEMU equivalent of 86Box's dirty_line[] + svga_doblit().
  * ========================================================================= */
+/* RGB565 -> XRGB8888 (0xffRRGGBB), 256 KiB, built once */
+static uint32_t v3_rgb565_lut[65536];
+
+void voodoo3_init_rgb565_lut(void)
+{
+    static bool done;
+    if (done) {
+        return;
+    }
+    for (uint32_t i = 0; i < 65536; i++) {
+        uint32_t r = (i >> 11) & 0x1f; r = (r << 3) | (r >> 2);
+        uint32_t g = (i >>  5) & 0x3f; g = (g << 2) | (g >> 4);
+        uint32_t b =  i        & 0x1f; b = (b << 3) | (b >> 2);
+        v3_rgb565_lut[i] = 0xff000000u | (r << 16) | (g << 8) | b;
+    }
+    done = true;
+}
+
+/*
+ * voodoo3_display_apply_dirty — translate dirty SGRAM pages (CPU writes to
+ * BAR1, tiled-aperture writes, 2D engine) into dirty scanlines of the
+ * visible frame buffer, and redraw rows touched by cursor changes.
+ * Called from the display refresh (main thread, BQL held).
+ */
+void voodoo3_display_apply_dirty(Voodoo3State *s)
+{
+    int h = s->screen_height;
+    if (h > V3_DIRTY_LINES) h = V3_DIRTY_LINES;
+
+    /* ---- hardware cursor: redraw old and new rows on any change ---- */
+    bool cur_vis = s->cursor_ena && s->cur_loc_valid;
+    if (cur_vis) {
+        voodoo3_cursor_reload(s);   /* pick up pattern changes made in VRAM */
+    }
+    if (cur_vis != s->last_cur_vis || s->cur_x != s->last_cur_x ||
+        s->cur_y != s->last_cur_y || s->cur_yoff != s->last_cur_yoff ||
+        s->cur_c0 != s->last_cur_c0 || s->cur_c1 != s->last_cur_c1 ||
+        s->vidProcCfg != s->last_vidproccfg ||
+        memcmp(s->cursor_buf, s->last_cursor_buf, sizeof(s->cursor_buf))) {
+        for (int pass = 0; pass < 2; pass++) {
+            int y0 = pass ? s->cur_y : s->last_cur_y;
+            for (int y = y0; y < y0 + 64; y++) {
+                if (y >= 0 && y < h) {
+                    qatomic_set(&s->dirty_line[y], 1);
+                }
+            }
+        }
+        s->last_cur_vis  = cur_vis;
+        s->last_cur_x    = s->cur_x;
+        s->last_cur_y    = s->cur_y;
+        s->last_cur_yoff = s->cur_yoff;
+        s->last_cur_c0   = s->cur_c0;
+        s->last_cur_c1   = s->cur_c1;
+        s->last_vidproccfg = s->vidProcCfg;
+        memcpy(s->last_cursor_buf, s->cursor_buf, sizeof(s->cursor_buf));
+    }
+
+    /* ---- palette / video-register change => full redraw ---- */
+    uint32_t gen = qatomic_read(&s->disp_gen);
+    if (gen != s->last_disp_gen) {
+        s->last_disp_gen = gen;
+        memset(s->dirty_line, 1, sizeof(s->dirty_line));
+    }
+
+    /* ---- geometry change => full redraw ---- */
+    if (s->desktop_start != s->last_front_offset ||
+        s->desktop_stride != s->last_row_width ||
+        s->desktop_tiled != s->last_col_tiled ||
+        s->pix_format != s->last_pix_format) {
+        s->last_front_offset = s->desktop_start;
+        s->last_row_width    = s->desktop_stride;
+        s->last_col_tiled    = s->desktop_tiled;
+        s->last_pix_format   = s->pix_format;
+        memset(s->dirty_line, 1, sizeof(s->dirty_line));
+    }
+
+    if (!qatomic_read(&s->disp_dirty_any)) {
+        return;
+    }
+    qatomic_set(&s->disp_dirty_any, false);
+    smp_mb();
+
+    uint32_t npages = s->fb_size >> V3_VRAM_PAGE_SHIFT;
+    unsigned long snap[BITS_TO_LONGS(V3_VRAM_PAGES)];
+    bitmap_copy_and_clear_atomic(snap, s->disp_dirty_pages, npages);
+
+    /* Overlay surfaces can live anywhere: any write => full redraw */
+    if (s->vidProcCfg & VIDPROCCFG_OVERLAY_ENABLE) {
+        memset(s->dirty_line, 1, sizeof(s->dirty_line));
+        return;
+    }
+
+    uint32_t front = s->desktop_start;
+    uint32_t rw    = s->desktop_stride ? s->desktop_stride : 1;
+    unsigned long pg = find_next_bit(snap, npages, 0);
+
+    while (pg < npages) {
+        uint64_t a0 = (uint64_t)pg << V3_VRAM_PAGE_SHIFT;
+        uint64_t a1 = a0 + (1u << V3_VRAM_PAGE_SHIFT) - 1;
+        if (a1 >= front) {
+            uint64_t r0 = a0 > front ? a0 - front : 0;
+            uint64_t r1 = a1 - front;
+            int y0, y1;
+            if (s->desktop_tiled) {
+                /* row_width = bytes per 32-line band */
+                y0 = (int)(r0 / rw) * 32;
+                y1 = (int)(r1 / rw) * 32 + 31;
+            } else {
+                y0 = (int)(r0 / rw);
+                y1 = (int)(r1 / rw);
+            }
+            if (y0 < h) {
+                if (y1 >= h) y1 = h - 1;
+                memset(&s->dirty_line[y0], 1, (size_t)(y1 - y0 + 1));
+            }
+        }
+        pg = find_next_bit(snap, npages, pg + 1);
+    }
+}
+
 void voodoo3_update_display_dirty(Voodoo3State *s)
 {
     if (!s->display_enabled || s->screen_width <= 0 || s->screen_height <= 0)
@@ -316,24 +466,17 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
     int dirty_lo = h, dirty_hi = -1;
 
     /*
-     * Hold render_lock for the entire blit pass.
-     *
-     * The render threads (real POSIX threads) write dirty_line[] and fb_mem
-     * while holding render_lock.  Without this lock the vblank-timer path
-     * (main thread, no render_lock) would race those writes — reading a
-     * partially-rendered scanline or a stale dirty flag — which is undefined
-     * behaviour under C11 and can produce torn frames in practice.
-     *
-     * dpy_gfx_update() is intentionally called AFTER the unlock (see below):
-     * it sends to the display backend (SDL event queue etc.) and must not be
-     * called with render_lock held, to avoid a lock-order inversion with the
-     * SDL deadlock we already guard against via the BH resize mechanism.
+     * No lock: render threads write fb_mem and dirty_line[] concurrently.
+     * dirty_line[y] is cleared *before* the row is converted, so a pixel
+     * written during the conversion re-marks the row and is picked up on
+     * the next refresh (at worst one frame late, never lost).
      */
-    qemu_mutex_lock(&s->render_lock);
+    voodoo3_init_rgb565_lut();
 
     for (int y = 0; y < h && y < V3_DIRTY_LINES; y++) {
-        if (!s->dirty_line[y]) continue;
-        s->dirty_line[y] = 0;
+        if (!qatomic_read(&s->dirty_line[y])) continue;
+        qatomic_set(&s->dirty_line[y], 0);
+        smp_mb();
 
         uint8_t *dst_row = dst_base + (size_t)y * dst_pitch;
 
@@ -360,24 +503,28 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
          *   tiled:     num_tile_cols * 128 * 32
          */
 
-        if (!s->params.col_tiled) {
+        if (!s->desktop_tiled) {
             /* ---- Non-tiled: linear scanline ---- */
-            const uint8_t *src_row = s->fb_mem + s->params.front_offset
-                                   + (size_t)y * s->params.row_width;
+            const uint8_t *src_row = s->fb_mem + s->desktop_start
+                                   + (size_t)y * s->desktop_stride;
 
             switch (s->pix_format) {
             case 0: /* 8bpp — palette lookup */
             {
                 const uint8_t *src = src_row;
+                /* vidProcCfg bit 12 selects the upper CLUT (86Box
+                 * VIDPROCCFG_DESKTOP_CLUT_SEL) */
+                const uint32_t *clut = s->pallook +
+                    ((s->vidProcCfg & VIDPROCCFG_DESKTOP_CLUT_SEL) ? 256 : 0);
                 if (dst_bpp == 4) {
                     uint32_t *dst = (uint32_t *)dst_row;
                     for (int x = 0; x < w; x++) {
-                        dst[x] = 0xff000000u | s->pallook[src[x]];
+                        dst[x] = 0xff000000u | clut[src[x]];
                     }
                 } else if (dst_bpp == 3) {
                     uint8_t *dst = dst_row;
                     for (int x = 0; x < w; x++) {
-                        uint32_t c = s->pallook[src[x]];
+                        uint32_t c = clut[src[x]];
                         dst[x*3+0] =  c        & 0xff;
                         dst[x*3+1] = (c >>  8) & 0xff;
                         dst[x*3+2] = (c >> 16) & 0xff;
@@ -390,23 +537,21 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                 const uint16_t *src = (const uint16_t *)src_row;
                 if (dst_bpp == 4) {
                     uint32_t *dst = (uint32_t *)dst_row;
+                    /*
+                     * Big-endian RGB565 (as written by the PPC guest) via a
+                     * 64K lookup table.  lduw_be_p() makes the result
+                     * independent of the host byte order (bswap16() on a
+                     * host-native load was only correct on LE hosts).
+                     */
                     for (int x = 0; x < w; x++) {
-                        uint16_t px = bswap16(src[x]);
-                        uint32_t r  = ((px >> 11) & 0x1f); r = (r << 3) | (r >> 2);
-                        uint32_t g  = ((px >>  5) & 0x3f); g = (g << 2) | (g >> 4);
-                        uint32_t b  =  (px        & 0x1f); b = (b << 3) | (b >> 2);
-                        /*
-                         * QEMU DisplaySurface is PIXMAN_x8r8g8b8 (little-endian):
-                         * word = 0x00RRGGBB.  Use rgb_to_pixel32() not bgr variant.
-                         */
-                        dst[x] = rgb_to_pixel32(r, g, b);
+                        dst[x] = v3_rgb565_lut[v3_ld16(s, &src[x])];
                     }
                 } else if (dst_bpp == 2) {
                     memcpy(dst_row, src, (size_t)w * 2);
                 } else {
                     uint8_t *dst = dst_row;
                     for (int x = 0; x < w; x++) {
-                        uint16_t px = src[x];
+                        uint16_t px = lduw_le_p(&src[x]);
                         uint32_t r  = (((px >> 11) & 0x1f) * 255 / 31);
                         uint32_t g  = (((px >>  5) & 0x3f) * 255 / 63);
                         uint32_t b  = ((px & 0x1f) * 255 / 31);
@@ -437,31 +582,18 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                 const uint32_t *src = (const uint32_t *)src_row;
                 if (dst_bpp == 4) {
                     /*
-                     * FIX 4: dst and dst_row alias the same buffer (dst_row
-                     * is the DisplaySurface scanline; dst = (uint32_t *)dst_row).
-                     * The bswap32 loop already writes directly into dst_row, so
-                     * the memcpy(dst_row, dst, w*4) that followed was a no-op
-                     * self-copy and has been removed.
-                     *
-                     * bswap32: the Voodoo3 SGRAM stores pixels in little-endian
-                     * byte order on the host, but a big-endian PPC guest writes
-                     * them in network byte order.  QEMU's DEVICE_LITTLE_ENDIAN
-                     * MemoryRegion swaps every 32-bit word on BE hosts, so by
-                     * the time we read fb_mem the bytes are already host-native.
-                     * We therefore do NOT swap on LE hosts; on BE hosts
-                     * (TARGET_WORDS_BIGENDIAN) the guest wrote in BE and QEMU
-                     * already compensated, so again no swap is needed here.
-                     * The bswap32 was incorrectly applied unconditionally —
-                     * replaced with a plain copy for the common 4-bpp path.
+                     * 32-bpp pixels are stored big-endian (ARGB byte order,
+                     * as written by the PPC guest through the RAM-backed
+                     * BAR1).  ldl_be_p() yields 0xAARRGGBB on every host.
                      */
-					uint32_t *dst = (uint32_t *)dst_row;
+                    uint32_t *dst = (uint32_t *)dst_row;
                     for (int x = 0; x < w; x++) {
-                        dst[x] = bswap32(src[x]);
+                        dst[x] = v3_ld32(s, &src[x]);
                     }
                 } else if (dst_bpp == 3) {
                     uint8_t *dst = dst_row;
                     for (int x = 0; x < w; x++) {
-                        uint32_t px = src[x];
+                        uint32_t px = ldl_le_p(&src[x]);
                         dst[x*3+0] =  px        & 0xff;
                         dst[x*3+1] = (px >>  8) & 0xff;
                         dst[x*3+2] = (px >> 16) & 0xff;
@@ -495,11 +627,11 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
             int pix_per_strip = 128 / src_bpp;
 
             /* Row-group base: which band of 32 rows we are in */
-            size_t row_group_base = (size_t)(y >> 5) * s->params.row_width;
+            size_t row_group_base = (size_t)(y >> 5) * s->desktop_stride;
             /* Within-strip row offset (128 bytes per row within the strip) */
             size_t within_row    = (size_t)(y & 31) * 128;
 
-            const uint8_t *fb_base = s->fb_mem + s->params.front_offset
+            const uint8_t *fb_base = s->fb_mem + s->desktop_start
                                    + row_group_base + within_row;
 
             uint8_t *dst8 = dst_row;
@@ -517,12 +649,12 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                 uint32_t r, g, b, out;
                 switch (s->pix_format) {
                 case 0: /* 8bpp palette */
-                    out = 0xff000000u | s->pallook[px_ptr[0]];
+                    out = 0xff000000u | s->pallook[px_ptr[0] +
+                        ((s->vidProcCfg & VIDPROCCFG_DESKTOP_CLUT_SEL) ? 256 : 0)];
                     break;
                 case 1: /* RGB565 */
                 {
-                    uint16_t px;
-                    memcpy(&px, px_ptr, 2);
+                    uint16_t px = v3_ld16(s, px_ptr);   /* same order as linear */
                     r = (px >> 11) & 0x1f; r = (r << 3) | (r >> 2);
                     g = (px >>  5) & 0x3f; g = (g << 2) | (g >> 4);
                     b =  px        & 0x1f; b = (b << 3) | (b >> 2);
@@ -534,8 +666,7 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                     out = 0xff000000u | (r << 16) | (g << 8) | b;
                     break;
                 default: /* RGB32 */
-                    memcpy(&out, px_ptr, 4);
-                    out = bswap32(out) | 0xff000000u;
+                    out = v3_ld32(s, px_ptr) | 0xff000000u;
                     break;
                 }
 
@@ -657,21 +788,8 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                             w, dirty_lo, dirty_hi);
     }
 
-    qemu_mutex_unlock(&s->render_lock);
-
     if (dirty_lo <= dirty_hi) {
-        /*
-         * dpy_gfx_update() is called here, OUTSIDE render_lock.
-         *
-         * Under -display sdl it posts to the SDL event queue which can block
-         * waiting for the main event loop.  Calling it with render_lock held
-         * would create a lock-order inversion: the render thread holds
-         * render_lock and can wake up here via a cond_broadcast, while the
-         * SDL event loop might itself be trying to acquire render_lock through
-         * a display callback — resulting in deadlock.  Releasing the lock
-         * first is safe because the surface data has already been fully written
-         * and dirty_line[] cleared inside the lock above.
-         */
+        /* Push the updated rows to the UI backend */
         qemu_console_update(s->con, 0, dirty_lo, w, dirty_hi - dirty_lo + 1);
     }
 }
@@ -1064,7 +1182,8 @@ void voodoo3_overlay_draw(Voodoo3State *s,
      * We use ov_pitch as both the VRAM base stride and the line pitch.
      * The actual start address comes from the start coordinate relative
      * to the desktop start, consistent with 86Box behaviour. */
-    uint32_t ov_base = s->desktop_start;   /* overlay shares VRAM with desktop */
+    /* 86Box: overlay.addr = leftOverlayBuf (set by swapbufferCMD) */
+    uint32_t ov_base = s->overlay_addr;
 
     uint32_t filter = s->vidProcCfg & VIDPROCCFG_FILTER_MODE_MASK;
     bool h_scale    = !!(s->vidProcCfg & VIDPROCCFG_H_SCALE_ENABLE);
