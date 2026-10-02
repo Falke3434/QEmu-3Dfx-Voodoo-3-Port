@@ -31,6 +31,7 @@
 #include "hw/display/voodoo3_texture.h"  /* voodoo3_tex_params_t etc.  */
 #include "hw/display/voodoo3_render.h"    /* voodoo3_triangle, voodoo3_triangle_setup */
 #include "hw/display/voodoo3_display.h"  /* V3_DIRTY_LINES             */
+#include "hw/display/vga_int.h"          /* legacy VGA core (optional)  */
 
 /* Floating-point/integer union used in reg decode and setup */
 typedef union { uint32_t i; float f; } fi_t;
@@ -684,6 +685,22 @@ struct Voodoo3State {
     bool     is_agp, bilinear, dac_filter;
     bool     lfb_tiling;            /* property: decode tiled LFB aperture */
 
+    /*
+     * Legacy VGA (property "legacy-vga", default off).  When on, QEMU's VGA
+     * core provides text/planar/256-colour modes at the fixed PC addresses
+     * (ports 0x3B0-0x3DF, memory 0xA0000-0xBFFFF) and is shown while the
+     * video processor is disabled (vidProcCfg bit 0 = 0), i.e. before a
+     * native driver takes over.  Needed for the video BIOS on x86 hosts.
+     * With the property off nothing of this is created.
+     */
+    bool          legacy_vga;
+    bool          debug_trace;      /* property "debug": v3dbg tracing    */
+    int64_t       last_kick_sync_ns;
+    bool          vga_shown;        /* last refresh came from the VGA core */
+    int           vga_leave_cnt;    /* refreshes with the desktop enabled  */
+    VGACommonState vga;
+    MemoryRegion  vga_ports;        /* 0x3B0-0x3DF in PCI I/O space        */
+
     /* --- Texture subsystem (ported from 86Box voodoo_t) ----------------- */
 
     /* Texture RAM: aliases fb_mem (Banshee/V3 unified SGRAM) */
@@ -830,7 +847,10 @@ static inline uint32_t v3_lfb_x(const Voodoo3State *s)
     if (s->pix_format == 1) {
         return s->lfb_be16 ? ((s->lfb_be32 ? 3u : 0u) ^ 2u) : 0u;
     }
-    return (s->lfb_be32 ? 3u : 0u) ^ (s->lfb_be16 ? 2u : 0u);
+    /* 8/24/32 bpp: only the byte swizzle applies.  lfb_be16 is sticky from
+     * an earlier 16-bit mode (AmigaOS 0xC0000000) and must not turn the
+     * 32-bit rearrangement (x = 3) into x = 1. */
+    return s->lfb_be32 ? 3u : 0u;
 }
 
 /* value to store host-natively so SGRAM gets the right byte order */

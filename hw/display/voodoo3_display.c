@@ -481,6 +481,28 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
         uint8_t *dst_row = dst_base + (size_t)y * dst_pitch;
 
         /*
+         * Bounds: during a mode change the driver writes screen size,
+         * stride and start address one after another; an intermediate
+         * combination can point past the end of SGRAM.  Reading there
+         * crashed QEMU (seen with the Windows XP driver).  Show such rows
+         * black instead.
+         */
+        {
+            int      sbpp = s->pix_format == 3 ? 4 : s->pix_format == 2 ? 3 :
+                            s->pix_format == 1 ? 2 : 1;
+            uint64_t end  = s->desktop_tiled
+                ? (uint64_t)s->desktop_start + (uint64_t)(y >> 5) * s->desktop_stride
+                  + (uint64_t)(y & 31) * 128u
+                  + ((uint64_t)((w * sbpp) >> 7) + 1) * 4096u
+                : (uint64_t)s->desktop_start + (uint64_t)y * s->desktop_stride
+                  + (uint64_t)w * sbpp;
+            if (end > s->fb_size) {
+                memset(dst_row, 0, (size_t)w * dst_bpp);
+                continue;
+            }
+        }
+
+        /*
          * Tiled framebuffer layout (Banshee/Voodoo3):
          *
          * The framebuffer is divided into 128-byte × 32-row tile strips.

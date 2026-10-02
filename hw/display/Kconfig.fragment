@@ -4,3 +4,4 @@ config VOODOO3
     depends on PCI
     select BITBANG_I2C
     select DDC
+    select VGA

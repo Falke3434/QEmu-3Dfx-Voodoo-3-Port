@@ -864,6 +864,33 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
         if (st->xdir > 0 && x2 < x) goto next_line;
         if (st->xdir < 0 && x2 > x) goto next_line;
 
+        /*
+         * Bounds: clip coordinates are 12 bit and strides up to 16 KB, so a
+         * bad register combination (or a driver probing) can address far
+         * beyond the 16 MB SGRAM.  The row pointers below were used without
+         * any check -> host memory corruption / QEMU crash.  Skip rows that
+         * do not fit, for the colour and the depth/alpha buffer.
+         */
+        {
+            int      max_x = (x > x2) ? x : x2;
+            uint64_t cspan = p->col_tiled ? ((uint64_t)(max_x >> 6) + 1) * 4096u
+                                          : ((uint64_t)max_x + 1) * 2u;
+            uint64_t aspan = p->aux_tiled ? ((uint64_t)(max_x >> 6) + 1) * 4096u
+                                          : ((uint64_t)max_x + 1) * 2u;
+            uint64_t coff  = p->col_tiled
+                ? (uint64_t)p->draw_offset + (uint64_t)(screen_y >> 5) * p->row_width
+                  + (uint64_t)(screen_y & 31) * 128u
+                : (uint64_t)p->draw_offset + (uint64_t)screen_y * p->row_width;
+            uint64_t aoff  = p->aux_tiled
+                ? (uint64_t)p->aux_offset + (uint64_t)(screen_y >> 5) * p->aux_row_width
+                  + (uint64_t)(screen_y & 31) * 128u
+                : (uint64_t)p->aux_offset + (uint64_t)screen_y * p->aux_row_width;
+            if (screen_y < 0 || max_x < 0 ||
+                coff + cspan > s->fb_size || aoff + aspan > s->fb_size) {
+                goto next_line;
+            }
+        }
+
         /* Compute row pointers into SGRAM */
         if (p->col_tiled)
             fb_row  = (uint16_t *)(s->fb_mem + p->draw_offset
@@ -880,6 +907,7 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                       + (size_t)screen_y * p->aux_row_width);
 
         /* Scanline pixel loop */
+        const uint32_t pix_span = (uint32_t)(abs(x2 - x) + 1);  /* before x advances */
         do {
             /* Tiled x-offset */
             int x_t = (x & 63) | ((x >> 6) * 128 * 32 / 2);
@@ -1244,7 +1272,7 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                     else              aux_row[x]   = dval;
                 }
 
-                s->fbiPixelsOut++;
+                qatomic_inc(&s->fbiPixelsOut);
             }
 
 skip_pixel:
@@ -1270,7 +1298,9 @@ skip_pixel:
             x += st->xdir;
         } while (x != x2 + st->xdir);
 
-        s->fbiPixelsIn += (abs(x2 - x) + 1);
+        /* 86Box: fbiPixelsIn += pixels of the span (the old code evaluated
+         * this after the loop, when x had already reached x2, i.e. 2/row) */
+        qatomic_add(&s->fbiPixelsIn, pix_span);
 
 next_line:
         /* Step to next scanline */
