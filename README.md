@@ -9,7 +9,7 @@ Main targets: AmigaOS 4.1 and MorphOS on Pegasos2, AmigaOne and Sam460ex
 | Guest | 2D | 3D | Notes |
 |---|---|---|---|
 | AmigaOS 4.1 (Pegasos2, AmigaOne, Sam460) | ✅ 8/16/32 bit | ✅ Warp3D, MiniGL, CoW3D (GLQuake textures WIP) | voodoo3diag: all tests pass |
-| MorphOS 3.19 (Pegasos2) | ✅ 8/16/24/32 bit | not tested | start without ROM |
+| MorphOS 3.19 (Pegasos2) | ✅ 16/24 bit | not tested | start without ROM |
 | Windows XP (x86) | ✅ 3dfx driver, 1024x768x32 | not tested | `legacy-vga=on` |
 | Linux / WinPE (x86) | ✅ | – | `legacy-vga=on` |
 

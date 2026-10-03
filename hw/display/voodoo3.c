@@ -1996,7 +1996,14 @@ static void voodoo3_ext_write(Voodoo3State *s, uint32_t addr, uint32_t val)
             s->vga.dac_8bit = (val >> 2) & 1;     /* VGA DAC 6/8 bit */
         }
         break;
-    case Init_vgaInit1:    s->vgaInit1  = val; break;
+    case Init_vgaInit1:
+        s->vgaInit1  = val;
+        /* 86Box: bit 20 = packed chain-4, bits 9:0 / 19:10 = write / read
+         * bank (32 KB units) of the 0xA0000 window into SGRAM */
+        if (s->legacy_vga) {
+            memory_region_set_enabled(&s->vga_bank_mr, (val & (1u << 20)) != 0);
+        }
+        break;
 
     case PLL_pllCtrl0:
         s->pllCtrl0 = val;
@@ -6765,6 +6772,23 @@ static void voodoo3_lfb_tiled_reposition(Voodoo3State *s)
  * VGA I/O write helper — ported from 86Box banshee_out() + svga_out().
  * addr is the full VGA port address (0x3b0..0x3df).
  */
+/*
+ * VGA DAC width (vgaInit0 bit 2: 1 = 8 bit, 0 = 6 bit as on a standard VGA).
+ * The palette (pallook) holds 8-bit components.  In 6-bit mode values
+ * written through port 0x3C9 are 0..63 and must be expanded (86Box
+ * video_6to8): stored raw they showed the whole screen at a quarter of the
+ * brightness (Amithlon, DOS programs).  dacData (0x54) writes are always
+ * 8 bit and are not affected.
+ */
+static inline uint8_t voodoo3_dac_6to8(Voodoo3State *s, uint8_t v)
+{
+    if (s->vgaInit0 & (1u << 2)) {
+        return v;
+    }
+    v &= 0x3f;
+    return (uint8_t)((v << 2) | (v >> 4));
+}
+
 static void voodoo3_vga_out(Voodoo3State *s, uint16_t addr, uint8_t val)
 {
     /* Legacy VGA core gets every VGA register write as well; the port keeps
@@ -6876,9 +6900,9 @@ static void voodoo3_vga_out(Voodoo3State *s, uint16_t addr, uint8_t val)
                 s->pallook[s->dacAddr] =
                     /* VGA order: first write = red, then green, blue
                      * (86Box svga_out; the read path already returns R,G,B) */
-                    ((uint32_t)s->dac_rgb_buf[0] << 16) |
-                    ((uint32_t)s->dac_rgb_buf[1] <<  8) |
-                     (uint32_t)s->dac_rgb_buf[2];
+                    ((uint32_t)voodoo3_dac_6to8(s, s->dac_rgb_buf[0]) << 16) |
+                    ((uint32_t)voodoo3_dac_6to8(s, s->dac_rgb_buf[1]) <<  8) |
+                     (uint32_t)voodoo3_dac_6to8(s, s->dac_rgb_buf[2]);
             }
             s->dacAddr = (s->dacAddr + 1) & 0xff;
             s->dac_write_addr = (uint8_t)s->dacAddr;
@@ -7029,6 +7053,9 @@ static uint8_t voodoo3_vga_in_port(Voodoo3State *s, uint16_t addr)
         case 0: byte = (uint8_t)((colour >> 16) & 0xff); break;  /* R */
         case 1: byte = (uint8_t)((colour >>  8) & 0xff); break;  /* G */
         default:byte = (uint8_t)( colour        & 0xff); break;  /* B */
+        }
+        if (!(s->vgaInit0 & (1u << 2))) {
+            byte >>= 2;                       /* 6-bit DAC: report 0..63 */
         }
         s->dac_rgb_idx++;
         if (s->dac_rgb_idx == 3) {
@@ -7295,6 +7322,49 @@ static const GraphicHwOps voodoo3_gfx_ops = {
     .gfx_update  = voodoo3_update_display,
     .invalidate  = voodoo3_invalidate_display,
     .text_update = voodoo3_text_update,
+};
+
+/*
+ * Banked VGA window (legacy-vga=on, vgaInit1 bit 20 "packed chain 4"):
+ * 0xA0000-0xAFFFF maps linearly into SGRAM at the read/write bank selected
+ * in vgaInit1 (32 KB granularity), as on the real chip (86Box: the SVGA
+ * memory *is* the Voodoo memory).  The video BIOS sizes the memory and the
+ * VESA banked modes draw through this window.  Without it the BIOS saw
+ * QEMU's separate 1 MB VGA memory, reported too little video memory
+ * (Amithlon: "testscreen could not be opened ... lack of free video
+ * memory" for 640x480x32) and banked VESA drawing went nowhere.
+ */
+static uint64_t voodoo3_vga_bank_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Voodoo3State *s = VOODOO3_PCI(opaque);
+    uint32_t base = ((s->vgaInit1 >> 10) & 0x3ffu) << 15;
+    uint64_t v = 0;
+    for (unsigned i = 0; i < size; i++) {
+        uint32_t off = (base + (uint32_t)addr + i) & (s->fb_size - 1);
+        v |= (uint64_t)s->fb_mem[off] << (8 * i);
+    }
+    return v;
+}
+
+static void voodoo3_vga_bank_write(void *opaque, hwaddr addr, uint64_t val,
+                                   unsigned size)
+{
+    Voodoo3State *s = VOODOO3_PCI(opaque);
+    uint32_t base = (s->vgaInit1 & 0x3ffu) << 15;
+    uint32_t off0 = (base + (uint32_t)addr) & (s->fb_size - 1);
+    for (unsigned i = 0; i < size; i++) {
+        uint32_t off = (base + (uint32_t)addr + i) & (s->fb_size - 1);
+        s->fb_mem[off] = (uint8_t)(val >> (8 * i));
+    }
+    voodoo3_vram_mark_dirty(s, off0, size);
+}
+
+static const MemoryRegionOps voodoo3_vga_bank_ops = {
+    .read  = voodoo3_vga_bank_read,
+    .write = voodoo3_vga_bank_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl  = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 /* Fixed VGA ports 0x3B0-0x3DF (legacy-vga=on): routed through the port's
@@ -8379,6 +8449,9 @@ static void voodoo3_reset_state(Voodoo3State *s)
      */
     s->lfb_be32 = target_big_endian();
     s->lfb_be16 = false;
+    if (s->legacy_vga) {
+        memory_region_set_enabled(&s->vga_bank_mr, false);
+    }
     /* Render threads are idle here (see voodoo3_reset_state entry) */
     qatomic_set(&s->param_wr, 0);
     for (int i = 0; i < MAX_RENDER_THREADS; i++) qatomic_set(&s->param_rd[i], 0);
@@ -8662,6 +8735,12 @@ static void voodoo3_pci_realize(PCIDevice *pci_dev, Error **errp)
                               "voodoo3-vga-ports", 0x30);
         memory_region_add_subregion_overlap(pci_address_space_io(pci_dev), 0x3b0,
                                             &s->vga_ports, 1);
+        /* banked window into SGRAM, above the VGA core's legacy window */
+        memory_region_init_io(&s->vga_bank_mr, OBJECT(s), &voodoo3_vga_bank_ops, s,
+                              "voodoo3-vga-bank", 0x10000);
+        memory_region_add_subregion_overlap(pci_address_space(pci_dev), 0xa0000,
+                                            &s->vga_bank_mr, 3);
+        memory_region_set_enabled(&s->vga_bank_mr, false);
     }
 
     /* -----------------------------------------------------------------------
@@ -8895,6 +8974,9 @@ static int voodoo3_texstate_post_load(void *opaque, int version_id)
     Voodoo3State *s = opaque;
     voodoo3_tex_cache_flush_all(s);
     voodoo3_update_lfb_swizzle(s);
+    if (s->legacy_vga) {
+        memory_region_set_enabled(&s->vga_bank_mr, (s->vgaInit1 & (1u << 20)) != 0);
+    }
     s->ncc_dirty[0] = s->ncc_dirty[1] = 1;
     s->full_redraw = true;
     voodoo3_lfb_tiled_reposition(s);

@@ -700,6 +700,7 @@ struct Voodoo3State {
     int           vga_leave_cnt;    /* refreshes with the desktop enabled  */
     VGACommonState vga;
     MemoryRegion  vga_ports;        /* 0x3B0-0x3DF in PCI I/O space        */
+    MemoryRegion  vga_bank_mr;      /* 0xA0000 banked window into SGRAM    */
 
     /* --- Texture subsystem (ported from 86Box voodoo_t) ----------------- */
 
