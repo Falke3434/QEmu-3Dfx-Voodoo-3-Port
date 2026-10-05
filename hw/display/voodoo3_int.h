@@ -195,13 +195,32 @@ typedef struct voodoo3_params_t {
      * detail_bias[tmu]  = tDetail[13:8]  — LOD subtrahend (0..63)
      * detail_scale[tmu] = tDetail[16:14] — left-shift amount (0..7)
      *
-     * Used in TC_MSELECT_DETAIL / TCA_MSELECT_DETAIL colour-path cases:
+     * Used in tc_mselect / tca_mselect = 4 (detail) of the TMU combine unit:
      *   factor = clamp((detail_bias - lod) << detail_scale, 0, detail_max)
      */
     int detail_max[2];
     int detail_bias[2];
     int detail_scale[2];
 } voodoo3_params_t;
+
+/*
+ * Does TMU0's combine unit read the output of TMU1 (texture unit upstream of
+ * it)?  Only when it does not discard the "other" input completely: RGB and
+ * alpha zero_other both set (the usual "TMU0 samples its own texture" setup,
+ * textureMode & 0x00201000 == 0x00201000) and neither mselect picks the
+ * other TMU's alpha.  Used both to decide whether a texture has to be bound
+ * for TMU1 (voodoo3_queue_triangle) and whether TMU1 has to be sampled
+ * (rasterizer); the two must agree.
+ */
+static inline bool voodoo3_tmu1_needed(uint32_t tm0)
+{
+    bool tc_zero_other  = !!(tm0 & (1u << 12));
+    bool tca_zero_other = !!(tm0 & (1u << 21));
+    unsigned tc_msel    = (tm0 >> 14) & 7;
+    unsigned tca_msel   = (tm0 >> 23) & 7;
+
+    return !tc_zero_other || !tca_zero_other || tc_msel == 2 || tca_msel == 2;
+}
 
 /* =========================================================================
  * Setup vertex (for sBeginTriCMD / sDrawTriCMD path)
@@ -723,6 +742,10 @@ struct Voodoo3State {
     /* Decoded texture cache (V3_TEX_CACHE_SIZE slots per TMU) */
     v3_tex_cache_entry_t tex_cache[2][V3_TEX_CACHE_SIZE];
     uint32_t             tex_lru[2];     /* simple eviction counter           */
+    uint32_t             tex_epoch;      /* bumped whenever the guest may have
+                                          * written texture memory (kick, direct
+                                          * register path); cache entries are
+                                          * re-verified once per epoch        */
 
     /* ARGB palette (256 entries per TMU) used for PAL8 / APAL8 / APAL88 */
     uint32_t             tex_palette[2][256];

@@ -34,6 +34,7 @@
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
 #include "qemu/bitmap.h"
+#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "hw/display/voodoo3_int.h"
 #include "hw/display/voodoo3_texture.h"
@@ -416,6 +417,53 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
 
 
 
+
+/* =========================================================================
+ * Source-content hash of the SGRAM bytes a cache entry was decoded from.
+ * Cheap enough to run once per cache entry and epoch (LOD range only).
+ * ========================================================================= */
+static uint64_t tex_hash_bytes(const uint8_t *mem, uint32_t mem_mask,
+                               uint32_t start, uint32_t len, uint64_t h)
+{
+    const uint64_t K = 0x9E3779B97F4A7C15ull;
+    uint32_t size = mem_mask + 1;
+
+    start &= mem_mask;
+    while (len) {
+        uint32_t n = size - start;      /* bytes until the end of SGRAM */
+        if (n > len) {
+            n = len;
+        }
+        const uint8_t *p = mem + start;
+        uint32_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            h = (h ^ ldq_le_p(p + i)) * K;
+            h ^= h >> 29;
+        }
+        for (; i < n; i++) {
+            h = (h ^ p[i]) * K;
+            h ^= h >> 29;
+        }
+        len  -= n;
+        start = (start + n) & mem_mask;
+    }
+    return h;
+}
+
+static uint64_t tex_source_hash(Voodoo3State *s, const voodoo3_tex_params_t *tp,
+                                int tmu, int lod_min, int lod_max)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+
+    for (int lod = lod_min; lod <= lod_max; lod++) {
+        uint32_t b   = tp->tex_base[lod];
+        uint32_t len = tp->tex_end[lod] - tp->tex_base[lod];
+        h = tex_hash_bytes(s->tex_mem[tmu], s->tex_mask, b, len, h);
+        h ^= (uint64_t)lod << 56;
+    }
+    return h;
+}
+
 /* =========================================================================
  * Dirty-page tracking for the texture cache
  *
@@ -557,12 +605,38 @@ void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu)
     uint32_t cur_ncc_gen = is_ncc ? s->ncc_gen[tmu] : 0u;
     uint32_t cur_pal_gen = is_pal ? s->pal_gen[tmu] : 0u;
 
+    /*
+     * Epoch is read BEFORE hashing the source so a guest write that lands
+     * while we verify forces another verification next time.
+     */
+    const uint32_t cur_epoch = qatomic_read(&s->tex_epoch);
+    const uint32_t cur_sx    = v3_lfb_x(s);
+
     /* Search cache for a valid matching entry */
     for (int c = 0; c < V3_TEX_CACHE_SIZE; c++) {
         v3_tex_cache_entry_t *e = &s->tex_cache[tmu][c];
         if (e->valid && e->base == cache_addr && e->tLOD == cache_lod
-                && e->textureMode == cache_mode
+                && e->textureMode == cache_mode && e->sx == cur_sx
                 && e->ncc_gen == cur_ncc_gen && e->pal_gen == cur_pal_gen) {
+            if (e->verified_epoch != cur_epoch) {
+                uint64_t hnow = tex_source_hash(s, tp, tmu, lod_min, lod_max);
+                if (hnow != e->src_hash) {
+                    /* SGRAM changed under the cached texture without the
+                     * dirty log having reported it yet: drop and re-decode */
+                    static int stale_log_left = 200;
+                    if (stale_log_left > 0 && qemu_loglevel_mask(LOG_UNIMP)) {
+                        stale_log_left--;
+                        qemu_log_mask(LOG_UNIMP,
+                            "v3dbg: TEXSTALE tmu=%d base=0x%x fmt=%u "
+                            "tLOD=0x%08x hash %016" PRIx64 " -> %016" PRIx64 "\n",
+                            tmu, (unsigned)cache_addr, (unsigned)tp->tformat,
+                            (unsigned)tp->tLOD, e->src_hash, hnow);
+                    }
+                    qatomic_set(&e->valid, false);
+                    continue;
+                }
+                e->verified_epoch = cur_epoch;
+            }
             tex_wire(p, tmu, c, e, lod_min, lod_max);
             return;
         }
@@ -596,6 +670,9 @@ void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu)
     }
 
     e->valid       = false;
+    e->sx          = cur_sx;
+    e->verified_epoch = cur_epoch;
+    e->src_hash    = tex_source_hash(s, tp, tmu, lod_min, lod_max);
     e->base        = cache_addr;
     e->tLOD        = cache_lod;
     e->textureMode = cache_mode;
@@ -616,6 +693,40 @@ void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu)
 
     decode_texture(s, e, tp, tmu, lod_min, lod_max);
     e->valid = true;
+
+    {
+        /* Diagnostic (-d unimp): what did the decoder produce? */
+        static int tex_log_left = 400;
+        static uint64_t last_logged_hash;
+        static uint32_t last_logged_base = ~0u;
+        /* identical re-decodes (same base + same source) used up the old
+         * 120-line budget within the first frames; log changes only */
+        bool log_it = !(e->src_hash == last_logged_hash &&
+                        tp->base == last_logged_base);
+        if (tex_log_left > 0 && log_it && qemu_loglevel_mask(LOG_UNIMP)) {
+            tex_log_left--;
+            last_logged_hash = e->src_hash;
+            last_logged_base = tp->base;
+            const uint32_t *d = &e->data[texture_offset[lod_min]];
+            int w = tp->tex_w_mask[lod_min] + 1;
+            int h = tp->tex_h_mask[lod_min] + 1;
+            int nz = 0, nz_rows = 0;
+            for (int y = 0; y < h; y++) {
+                int row_nz = 0;
+                for (int x = 0; x < w; x++) {
+                    if (d[y * w + x] & 0x00ffffffu) { nz++; row_nz++; }
+                }
+                if (row_nz) { nz_rows++; }
+            }
+            qemu_log_mask(LOG_UNIMP,
+                "v3dbg: TEXDEC tmu=%d fmt=%u base=0x%x %dx%d lod=%d..%d "
+                "tLOD=0x%08x sx=%u nonzero=%d/%d rows_nz=%d/%d "
+                "t0=%08x t1=%08x t2=%08x t3=%08x src=%016" PRIx64 "\n",
+                tmu, (unsigned)tp->tformat, (unsigned)tp->base, w, h, lod_min, lod_max,
+                (unsigned)tp->tLOD, (unsigned)v3_lfb_x(s), nz, w * h, nz_rows, h,
+                d[0], d[1], d[2], d[3], e->src_hash);
+        }
+    }
 
     tex_wire(p, tmu, slot, e, lod_min, lod_max);
 }

@@ -138,41 +138,27 @@
 #define TLOD_TMIRROR_S      (1u << 28)
 #define TLOD_TMIRROR_T      (1u << 29)
 
-/* CC selectors (fbzColorPath bits [12:10]) — from 86Box TC_MSELECT_* enum */
+/* CC selectors (fbzColorPath bits [12:10]) — 86Box CC_MSELECT_* */
 #define CC_MSELECT_ZERO    0
 #define CC_MSELECT_CLOCAL  1
 #define CC_MSELECT_AOTHER  2
 #define CC_MSELECT_ALOCAL  3
+#define CC_MSELECT_TEX     4    /* texture alpha */
+#define CC_MSELECT_TEXRGB  5    /* texture RGB (Voodoo2 and later) */
 /*
- * CC_MSELECT_DETAIL (4) and CC_MSELECT_LOD_FRAC (5):
- * Added from 86Box TC_MSELECT_DETAIL / TC_MSELECT_LOD_FRAC.
- * The original port had CC_MSELECT_TEX=4 and CC_MSELECT_TEXRGB=5 at these
- * positions, which is wrong — Glide/hardware has no "tex-alpha" mselect in
- * the CC path at value 4; that slot is detail texture.
- * CC_MSELECT_TEX / CC_MSELECT_TEXRGB are kept as aliases for code paths
- * that were already using the wrong names so they still compile, but the
- * active switch cases use the correct names.
+ * Detail-texture and LOD-fraction blend factors exist only in the TMU
+ * combine unit (textureMode tc_mselect 4 / 5, see v3_tmu_combine).  An
+ * earlier revision of this file moved them into the fbzColorPath selectors,
+ * which made "multiply by texture alpha" / "multiply by texture RGB"
+ * unusable in the colour combine unit.
  */
-#define CC_MSELECT_DETAIL    4
-#define CC_MSELECT_LOD_FRAC  5
-/* Legacy aliases (wrong encoding but kept so existing callers compile) */
-#define CC_MSELECT_TEX     CC_MSELECT_DETAIL
-#define CC_MSELECT_TEXRGB  CC_MSELECT_LOD_FRAC
 
-/* CCA selectors (fbzColorPath bits [21:19]) — from 86Box TCA_MSELECT_* enum */
+/* CCA selectors (fbzColorPath bits [21:19]) — 86Box CCA_MSELECT_* */
 #define CCA_MSELECT_ZERO     0
 #define CCA_MSELECT_ALOCAL   1
 #define CCA_MSELECT_AOTHER   2
 #define CCA_MSELECT_ALOCAL2  3
-/*
- * CCA_MSELECT_DETAIL (4) and CCA_MSELECT_LOD_FRAC (5):
- * Added from 86Box TCA_MSELECT_DETAIL / TCA_MSELECT_LOD_FRAC.
- * The original port had CCA_MSELECT_TEX=4, which is wrong.
- */
-#define CCA_MSELECT_DETAIL    4
-#define CCA_MSELECT_LOD_FRAC  5
-/* Legacy alias */
-#define CCA_MSELECT_TEX  CCA_MSELECT_DETAIL
+#define CCA_MSELECT_TEX      4  /* texture alpha */
 
 /* CC_ADD */
 #define CC_ADD_ZERO   0
@@ -304,6 +290,7 @@ typedef struct {
 
     /* LOD */
     int     lod, lod_min[2], lod_max[2], lod_frac[2];
+    int     lod_int[2];   /* integer LOD actually sampled by each TMU */
 
     /* Texture samples (from tex_read) */
     int     tex_r[2], tex_g[2], tex_b[2], tex_a[2];
@@ -406,13 +393,10 @@ static inline void tex_read_bilinear(v3_state_t *st,
 static void v3_tmu_fetch(v3_state_t *st, const voodoo3_params_t *p,
                          int tmu, bool bilinear)
 {
-    int     w_mask = st->tex_w_mask[tmu] ? *st->tex_w_mask[tmu] : 0xff;
-    int     h_mask = st->tex_h_mask[tmu] ? *st->tex_h_mask[tmu] : 0xff;
-    int     shift  = st->tex_shift[tmu]  ? *st->tex_shift[tmu]  : 8;
+    int     w_mask, h_mask, shift, tex_lod_val;
     int64_t tmuw   = tmu ? st->tmu1_w : st->tmu0_w;
     int64_t tmus   = tmu ? st->tmu1_s : st->tmu0_s;
     int64_t tmut   = tmu ? st->tmu1_t : st->tmu0_t;
-    int     tex_lod_val = st->tex_lod[tmu] ? *st->tex_lod[tmu] : 0;
     int     s, t;
 
     if (p->tmu[tmu].textureMode & TEXMODE_PERSP_CORR) {
@@ -431,6 +415,26 @@ static void v3_tmu_fetch(v3_state_t *st, const voodoo3_params_t *p,
     if (st->lod > st->lod_max[tmu]) st->lod = st->lod_max[tmu];
     st->lod_frac[tmu] = st->lod & 0xff;
     st->lod >>= 8;
+    st->lod_int[tmu]  = st->lod;
+
+    /*
+     * Mask / row shift / mip index are per-LOD arrays (86Box:
+     * state->tex_w_mask[tmu][state->lod] ...).  They used to be read from
+     * element 0, i.e. always the LOD-0 geometry (256x256, shift 8): a
+     * 64x64 texture sampled at LOD 2 was addressed with a 256 texel row
+     * stride and LOD-0 coordinate scale, so only the first rows showed
+     * anything and the rest read zeros (MiniGL texturesurf: one rainbow
+     * strip, one dim strip, the sheet in between black).
+     */
+    {
+        int li = st->lod;
+        if (li < 0) li = 0;
+        if (li > V3_LOD_MAX + 1) li = V3_LOD_MAX + 1;
+        w_mask      = st->tex_w_mask[tmu] ? st->tex_w_mask[tmu][li] : 0xff;
+        h_mask      = st->tex_h_mask[tmu] ? st->tex_h_mask[tmu][li] : 0xff;
+        shift       = st->tex_shift[tmu]  ? st->tex_shift[tmu][li]  : 8;
+        tex_lod_val = st->tex_lod[tmu]    ? st->tex_lod[tmu][li]    : 0;
+    }
 
     /* Mirror */
     if (p->tmu[tmu].tLOD & TLOD_TMIRROR_S)
@@ -442,11 +446,119 @@ static void v3_tmu_fetch(v3_state_t *st, const voodoo3_params_t *p,
         s -= 1 << (3 + tex_lod_val);
         t -= 1 << (3 + tex_lod_val);
         tex_read_bilinear(st, s >> tex_lod_val, t >> tex_lod_val,
-                          tex_lod_val, w_mask, h_mask, shift - tex_lod_val, tmu);
+                          tex_lod_val, w_mask, h_mask, shift, tmu);
     } else {
         tex_read(st, s >> (4 + tex_lod_val), t >> (4 + tex_lod_val),
                  w_mask, h_mask, shift, tmu);
     }
+}
+
+/* =========================================================================
+ * TMU colour/alpha combine unit (textureMode bits 12..29)
+ *
+ * Every TMU runs   out = ((zero_other ? 0 : other) - (sub_clocal ? local : 0))
+ *                        * blend_factor + add(local colour / alpha)
+ * where "local" is the TMU's own texel and "other" is the output of the TMU
+ * upstream of it (TMU1 -> TMU0 -> colour combine unit; TMU1 has no upstream,
+ * its "other" is 0).  Bit layout (86Box TC_* / TCA_*, 3dfx register spec):
+ *
+ *   12 tc_zero_other    13 tc_sub_clocal   16:14 tc_mselect
+ *   17 tc_reverse_blend 18 tc_add_clocal   19 tc_add_alocal   20 tc_invert
+ *   21 tca_zero_other   22 tca_sub_clocal  25:23 tca_mselect
+ *   26 tca_reverse_blend 27 tca_add_clocal 28 tca_add_alocal  29 tca_invert
+ *   30 trilinear
+ *
+ * mselect: 0 zero, 1 Clocal, 2 Aother, 3 Alocal, 4 detail, 5 LOD fraction.
+ *
+ * The old code only looked at five of these bits to decide "TMU0 only /
+ * TMU1 only", never combined the two TMUs, and mistook the multitexture
+ * modulate setup (mselect = Clocal, everything else clear) for pass-through,
+ * so GLQuake's lightmap (TMU0) was never applied.
+ * ========================================================================= */
+#define TM_TC_ZERO_OTHER(m)   (!!((m) & (1u << 12)))
+#define TM_TC_SUB_CLOCAL(m)   (!!((m) & (1u << 13)))
+#define TM_TC_MSELECT(m)      (((m) >> 14) & 7)
+#define TM_TC_REVERSE(m)      (!!((m) & (1u << 17)))
+#define TM_TC_ADD_CLOCAL(m)   (!!((m) & (1u << 18)))
+#define TM_TC_ADD_ALOCAL(m)   (!!((m) & (1u << 19)))
+#define TM_TC_INVERT(m)       (!!((m) & (1u << 20)))
+#define TM_TCA_ZERO_OTHER(m)  (!!((m) & (1u << 21)))
+#define TM_TCA_SUB_CLOCAL(m)  (!!((m) & (1u << 22)))
+#define TM_TCA_MSELECT(m)     (((m) >> 23) & 7)
+#define TM_TCA_REVERSE(m)     (!!((m) & (1u << 26)))
+#define TM_TCA_ADD_CLOCAL(m)  (!!((m) & (1u << 27)))
+#define TM_TCA_ADD_ALOCAL(m)  (!!((m) & (1u << 28)))
+#define TM_TCA_INVERT(m)      (!!((m) & (1u << 29)))
+
+/* Combine the texel just fetched for `tmu` (st->tex_*[tmu]) with the output
+ * of the upstream TMU; the result replaces st->tex_*[tmu]. */
+static inline void v3_tmu_combine(v3_state_t *st, const voodoo3_params_t *p,
+                                  int tmu, int o_r, int o_g, int o_b, int o_a)
+{
+    const uint32_t tm  = p->tmu[tmu].textureMode;
+    const int l_r = st->tex_r[tmu], l_g = st->tex_g[tmu];
+    const int l_b = st->tex_b[tmu], l_a = st->tex_a[tmu];
+
+    /* Trilinear: on odd LODs the blend direction is inverted (86Box) */
+    const bool tri_odd = (tm & TEXMODE_TRILINEAR) && (st->lod_int[tmu] & 1);
+
+    /* ---- colour ---- */
+    int c_r = TM_TC_ZERO_OTHER(tm) ? 0 : o_r;
+    int c_g = TM_TC_ZERO_OTHER(tm) ? 0 : o_g;
+    int c_b = TM_TC_ZERO_OTHER(tm) ? 0 : o_b;
+    if (TM_TC_SUB_CLOCAL(tm)) { c_r -= l_r; c_g -= l_g; c_b -= l_b; }
+
+    int m_r, m_g, m_b;
+    switch (TM_TC_MSELECT(tm)) {
+    case 1:  m_r = l_r; m_g = l_g; m_b = l_b;        break;
+    case 2:  m_r = m_g = m_b = o_a;                  break;
+    case 3:  m_r = m_g = m_b = l_a;                  break;
+    case 4: {
+        int f = (p->detail_bias[tmu] - st->lod_int[tmu]) << p->detail_scale[tmu];
+        if (f < 0)                    f = 0;
+        if (f > p->detail_max[tmu])   f = p->detail_max[tmu];
+        m_r = m_g = m_b = f;                         break;
+    }
+    case 5:  m_r = m_g = m_b = st->lod_frac[tmu];    break;
+    default: m_r = m_g = m_b = 0;                    break;
+    }
+    if (!(TM_TC_REVERSE(tm) ^ tri_odd)) { m_r ^= 0xff; m_g ^= 0xff; m_b ^= 0xff; }
+    c_r = (c_r * (m_r + 1)) >> 8;
+    c_g = (c_g * (m_g + 1)) >> 8;
+    c_b = (c_b * (m_b + 1)) >> 8;
+
+    if (TM_TC_ADD_CLOCAL(tm)) { c_r += l_r; c_g += l_g; c_b += l_b; }
+    if (TM_TC_ADD_ALOCAL(tm)) { c_r += l_a; c_g += l_a; c_b += l_a; }
+    c_r = CLAMP(c_r); c_g = CLAMP(c_g); c_b = CLAMP(c_b);
+    if (TM_TC_INVERT(tm)) { c_r ^= 0xff; c_g ^= 0xff; c_b ^= 0xff; }
+
+    /* ---- alpha ---- */
+    int a = TM_TCA_ZERO_OTHER(tm) ? 0 : o_a;
+    if (TM_TCA_SUB_CLOCAL(tm)) a -= l_a;
+
+    int m_a;
+    switch (TM_TCA_MSELECT(tm)) {
+    case 1:
+    case 3:  m_a = l_a;                              break;
+    case 2:  m_a = o_a;                              break;
+    case 4: {
+        int f = (p->detail_bias[tmu] - st->lod_int[tmu]) << p->detail_scale[tmu];
+        if (f < 0)                    f = 0;
+        if (f > p->detail_max[tmu])   f = p->detail_max[tmu];
+        m_a = f;                                     break;
+    }
+    case 5:  m_a = st->lod_frac[tmu];                break;
+    default: m_a = 0;                                break;
+    }
+    if (!(TM_TCA_REVERSE(tm) ^ tri_odd)) m_a ^= 0xff;
+    a = (a * (m_a + 1)) >> 8;
+
+    if (TM_TCA_ADD_CLOCAL(tm) || TM_TCA_ADD_ALOCAL(tm)) a += l_a;
+    a = CLAMP(a);
+    if (TM_TCA_INVERT(tm)) a ^= 0xff;
+
+    st->tex_r[tmu] = c_r; st->tex_g[tmu] = c_g;
+    st->tex_b[tmu] = c_b; st->tex_a[tmu] = a;
 }
 
 /* =========================================================================
@@ -476,14 +588,29 @@ static inline void alpha_blend(int *r, int *g, int *b, int src_a,
                                 int colbfog_r, int colbfog_g, int colbfog_b)
 {
     /*
-     * Ported from 86Box ALPHA_BLEND macro (vid_voodoo_render.h).
+     * alphaMode RGB blend factors (Voodoo/Banshee/Voodoo3 register spec,
+     * Glide GR_BLEND_*, 86Box AFUNC_*):
      *
-     * Cases 0-5 use a scalar factor (sf_r=sf_g=sf_b).
-     * Cases 6 (AOM_COLOR) and 2 (A_COLOR) need per-channel factors
-     * because the factor is derived from src or dst colour components.
-     * Case 0xf: ASATURATE for src, ACOLORBEFOREFOG for dst.
+     *   0x0 AZERO            0
+     *   0x1 ASRC_ALPHA       source alpha
+     *   0x2 A_COLOR          source factor: DESTINATION colour (per channel)
+     *                        dest   factor: SOURCE colour      (per channel)
+     *   0x3 ADST_ALPHA       destination alpha
+     *   0x4 AONE             1
+     *   0x5 AOM_ASRC_ALPHA   1 - source alpha
+     *   0x6 AOM_COLOR        1 - (the colour of A_COLOR above)
+     *   0x7 AOM_ADST_ALPHA   1 - destination alpha
+     *   0xf ASATURATE        source factor: min(src alpha, 1 - dst alpha)
+     *       ACOLORBEFOREFOG  dest   factor: colour before fog
      *
-     * Result: src = src*src_factor/256, dst = dst*dst_factor/256, out = src+dst.
+     * The previous table used an invented ordering (1 = ONE, 2 = SRC_ALPHA,
+     * 3 = 1 - SRC_ALPHA ...).  The usual GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA
+     * (src 1, dst 5) therefore became "src * 1 + dst * (1 - dst_alpha)" with
+     * dst_alpha = 0xff, i.e. a plain overwrite: the fully transparent texels
+     * of font / sprite textures were painted opaque (GLQuake console: pink
+     * boxes behind every glyph, palette index 255 = RGB 159,91,83).
+     *
+     * Result: out = (src * (sf + 1) + dst * (df + 1)) >> 8   (86Box)
      */
     int src_fn = (int)ALPHA_SRC_FUNC(alphaMode);
     int dst_fn = (int)ALPHA_DST_FUNC(alphaMode);
@@ -491,40 +618,36 @@ static inline void alpha_blend(int *r, int *g, int *b, int src_a,
     int sf_r, sf_g, sf_b;
 
     switch (src_fn) {
-    case 0:  sf_r = sf_g = sf_b = 0;              break;
-    case 1:  sf_r = sf_g = sf_b = 0xff;            break;
-    case 2:  sf_r = sf_g = sf_b = src_a;           break;
-    case 3:  sf_r = sf_g = sf_b = 0xff - src_a;    break;
-    case 4:  sf_r = sf_g = sf_b = dst_a;           break;
-    case 5:  sf_r = sf_g = sf_b = 0xff - dst_a;    break;
-    case 6:  /* A_COLOR — per-channel: factor = dst_rgb */
-        sf_r = dst_r; sf_g = dst_g; sf_b = dst_b; break;
-    case 7:  /* AOM_COLOR — per-channel: factor = 1 - dst_rgb */
-        sf_r = 0xff - dst_r; sf_g = 0xff - dst_g; sf_b = 0xff - dst_b; break;
+    case 0x0: sf_r = sf_g = sf_b = 0;               break;
+    case 0x1: sf_r = sf_g = sf_b = src_a;           break;
+    case 0x2: sf_r = dst_r; sf_g = dst_g; sf_b = dst_b; break;
+    case 0x3: sf_r = sf_g = sf_b = dst_a;           break;
+    case 0x4: sf_r = sf_g = sf_b = 0xff;            break;
+    case 0x5: sf_r = sf_g = sf_b = 0xff - src_a;    break;
+    case 0x6: sf_r = 0xff - dst_r; sf_g = 0xff - dst_g; sf_b = 0xff - dst_b; break;
+    case 0x7: sf_r = sf_g = sf_b = 0xff - dst_a;    break;
     case 0xf: {
-        /* ASATURATE: factor = min(src_a, 255-dst_a) */
+        /* ASATURATE: factor = min(src_a, 255 - dst_a) */
         int _a = src_a < (0xff - dst_a) ? src_a : (0xff - dst_a);
         sf_r = sf_g = sf_b = _a; break;
     }
-    default: sf_r = sf_g = sf_b = 0xff; break;
+    default:  sf_r = sf_g = sf_b = 0xff;            break;
     }
 
     int df_r, df_g, df_b;
 
     switch (dst_fn) {
-    case 0:  df_r = df_g = df_b = 0;              break;
-    case 1:  df_r = df_g = df_b = 0xff;            break;
-    case 2:  df_r = df_g = df_b = src_a;           break;
-    case 3:  df_r = df_g = df_b = 0xff - src_a;    break;
-    case 4:  df_r = df_g = df_b = dst_a;           break;
-    case 5:  df_r = df_g = df_b = 0xff - dst_a;    break;
-    case 6:  /* A_COLOR — per-channel: factor = src_rgb */
-        df_r = *r; df_g = *g; df_b = *b; break;
-    case 7:  /* AOM_COLOR — per-channel: factor = 1 - src_rgb */
-        df_r = 0xff - *r; df_g = 0xff - *g; df_b = 0xff - *b; break;
+    case 0x0: df_r = df_g = df_b = 0;               break;
+    case 0x1: df_r = df_g = df_b = src_a;           break;
+    case 0x2: df_r = *r; df_g = *g; df_b = *b;      break;
+    case 0x3: df_r = df_g = df_b = dst_a;           break;
+    case 0x4: df_r = df_g = df_b = 0xff;            break;
+    case 0x5: df_r = df_g = df_b = 0xff - src_a;    break;
+    case 0x6: df_r = 0xff - *r; df_g = 0xff - *g; df_b = 0xff - *b; break;
+    case 0x7: df_r = df_g = df_b = 0xff - dst_a;    break;
     case 0xf: /* ACOLORBEFOREFOG: factor = pre-fog src colour */
         df_r = colbfog_r; df_g = colbfog_g; df_b = colbfog_b; break;
-    default: df_r = df_g = df_b = 0; break;
+    default:  df_r = df_g = df_b = 0;               break;
     }
 
     *r = CLAMP(((*r * (sf_r + 1) + dst_r * (df_r + 1)) >> 8));
@@ -966,23 +1089,21 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                     dest_a = p->aux_tiled ? (uint8_t)aux_row[x_t]
                                           : (uint8_t)aux_row[x];
 
-                /* --- Texture fetch --- */
+                /* --- Texture fetch + TMU combine (TMU1 -> TMU0) --- */
                 if (tex_en) {
-                    uint32_t tm0 = p->tmu[0].textureMode;
-                    uint32_t tm1 = p->tmu[1].textureMode;
-                    if ((tm0 & TEXMODE_LOCAL_MASK) == TEXMODE_LOCAL) {
-                        v3_tmu_fetch(st, p, 0, bilinear);
-                    } else if ((tm0 & TEXMODE_LOCAL_MASK) == TEXMODE_PASSTHROUGH) {
+                    const uint32_t tm0 = p->tmu[0].textureMode;
+                    if (voodoo3_tmu1_needed(tm0)) {
                         v3_tmu_fetch(st, p, 1, bilinear);
-                        st->tex_r[0] = st->tex_r[1];
-                        st->tex_g[0] = st->tex_g[1];
-                        st->tex_b[0] = st->tex_b[1];
-                        st->tex_a[0] = st->tex_a[1];
+                        /* TMU1 has no upstream TMU: its "other" input is 0 */
+                        v3_tmu_combine(st, p, 1, 0, 0, 0, 0);
+                        v3_tmu_fetch(st, p, 0, bilinear);
+                        v3_tmu_combine(st, p, 0, st->tex_r[1], st->tex_g[1],
+                                       st->tex_b[1], st->tex_a[1]);
                     } else {
-                        v3_tmu_fetch(st, p, 1, bilinear);
+                        /* TMU0 ignores TMU1: sample TMU0 only */
                         v3_tmu_fetch(st, p, 0, bilinear);
+                        v3_tmu_combine(st, p, 0, 0, 0, 0, 0);
                     }
-                    (void)tm1;
                 }
 
                 /* --- Colour selection (clocal / cother) --- */
@@ -1062,27 +1183,10 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                 /* Multiplier select */
                 int msel_r, msel_g, msel_b, msel_a;
 
-                /*
-                 * Trilinear mipmap: when TEXMODE_TRILINEAR is set and the
-                 * integer LOD is odd, the blend direction of the multiplier
-                 * is inverted for this TMU0 stage.
-                 * Ported from 86Box voodoo_render.c lines 544–550:
-                 *   if ((textureMode[0] & TEXTUREMODE_TRILINEAR) && (lod & 1))
-                 *       c_reverse = tc_reverse_blend;   // inverted
-                 *   else
-                 *       c_reverse = !tc_reverse_blend;  // normal
-                 * In 86Box "tc_reverse_blend" is the raw fbzColorPath bit, and
-                 * the pixel loop uses c_reverse (not the raw bit) for the XOR.
-                 * We replicate that by computing eff_cc_rev_blend here.
-                 */
+                /* Trilinear blend-direction inversion lives in the TMU combine
+                 * unit (v3_tmu_combine); fbzColorPath bits are used as is. */
                 int eff_cc_rev_blend  = cc_rev_blend;
                 int eff_cca_rev_blend = cca_rev_blend;
-                if (tex_en &&
-                    (p->tmu[0].textureMode & TEXMODE_TRILINEAR) &&
-                    (st->lod & 1)) {
-                    eff_cc_rev_blend  = !eff_cc_rev_blend;
-                    eff_cca_rev_blend = !eff_cca_rev_blend;
-                }
 
                 switch (cc_mselect) {
                 case CC_MSELECT_ZERO:
@@ -1097,30 +1201,13 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                 case CC_MSELECT_ALOCAL:
                     msel_r = msel_g = msel_b = alocal;
                     break;
-                case CC_MSELECT_DETAIL: {
-                    /*
-                     * Detail-texture blend factor.
-                     * Ported from 86Box TC_MSELECT_DETAIL case
-                     * (voodoo_render.c lines 473–477):
-                     *   factor = (detail_bias[tmu] - lod) << detail_scale[tmu]
-                     *   factor = clamp(factor, 0, detail_max[tmu])
-                     * lod here is the integer LOD after the >>8 shift in
-                     * v3_tmu_fetch (st->lod is already the integer part).
-                     */
-                    int f = (p->detail_bias[0] - st->lod) << p->detail_scale[0];
-                    if (f < 0)                   f = 0;
-                    if (f > p->detail_max[0])    f = p->detail_max[0];
-                    msel_r = msel_g = msel_b = f;
+                case CC_MSELECT_TEX:
+                    /* fbzColorPath cc_mselect 4: texture alpha */
+                    msel_r = msel_g = msel_b = st->tex_a[0];
                     break;
-                }
-                case CC_MSELECT_LOD_FRAC:
-                    /*
-                     * LOD fractional part as blend factor.
-                     * Ported from 86Box TC_MSELECT_LOD_FRAC case
-                     * (voodoo_render.c line 479):
-                     *   factor = lod_frac[tmu]
-                     */
-                    msel_r = msel_g = msel_b = st->lod_frac[0];
+                case CC_MSELECT_TEXRGB:
+                    /* fbzColorPath cc_mselect 5: texture RGB (Voodoo2+) */
+                    msel_r = st->tex_r[0]; msel_g = st->tex_g[0]; msel_b = st->tex_b[0];
                     break;
                 default:
                     msel_r = msel_g = msel_b = 0;
@@ -1137,21 +1224,9 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                 case CCA_MSELECT_AOTHER:
                     msel_a = aother;
                     break;
-                case CCA_MSELECT_DETAIL: {
-                    /*
-                     * Detail-texture alpha blend factor.
-                     * Ported from 86Box TCA_MSELECT_DETAIL case
-                     * (voodoo_render.c lines 522–525).
-                     */
-                    int f = (p->detail_bias[0] - st->lod) << p->detail_scale[0];
-                    if (f < 0)                   f = 0;
-                    if (f > p->detail_max[0])    f = p->detail_max[0];
-                    msel_a = f;
-                    break;
-                }
-                case CCA_MSELECT_LOD_FRAC:
-                    /* Ported from 86Box TCA_MSELECT_LOD_FRAC (line 527). */
-                    msel_a = st->lod_frac[0];
+                case CCA_MSELECT_TEX:
+                    /* fbzColorPath cca_mselect 4: texture alpha */
+                    msel_a = st->tex_a[0];
                     break;
                 default:
                     msel_a = 0;

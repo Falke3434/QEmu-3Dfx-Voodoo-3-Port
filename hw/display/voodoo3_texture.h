@@ -76,6 +76,20 @@ typedef struct {
     uint32_t pal_gen;  /* s->pal_gen[tmu] at decode time — palette change detection */
     uint32_t addr_start, addr_end; /* SGRAM byte range covered by all LODs */
     /*
+     * Content verification.  86Box flushes the texture cache synchronously
+     * on every CPU write into texture memory (texture_present[] /
+     * flush_texture_cache()).  In QEMU the CPU writes to BAR1 are plain RAM
+     * stores that are only noticed later through the dirty log, so a cache
+     * hit could still return a texture whose SGRAM source was already
+     * overwritten (AmigaOS Warp3D re-uploads different textures to the same
+     * SGRAM slot, which gives identical base/tLOD/mode keys).  src_hash is a
+     * hash of the source bytes of the decoded LODs; verified_epoch is the
+     * s->tex_epoch value at which it was last compared.
+     */
+    uint64_t src_hash;
+    uint32_t verified_epoch;
+    uint32_t sx;       /* v3_lfb_x() used for decoding */
+    /*
      * Reference counting (86Box refcount / refcount_r[]):
      * refcount is bumped by the producer each time a queued triangle uses
      * this entry; each render thread bumps its own refcount_r[] when it

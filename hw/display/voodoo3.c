@@ -281,6 +281,7 @@ static V3DbgBudget v3b_blt     = { 1000, "2d-launch"  };
 static V3DbgBudget v3b_3d      = {  500, "3d-reg"     };
 static V3DbgBudget v3b_status  = {  300, "status"     };
 static V3DbgBudget v3b_tri     = {   60, "triangle"   };
+static V3DbgBudget v3b_ttri    = {  800, "tex-triangle" };
 static V3DbgBudget v3b_desk    = {  200, "desktop-start" };
 static V3DbgBudget v3b_swap    = {  100, "swap"       };
 static V3DbgBudget v3b_scr     = {  400, "2d-to-screen" };
@@ -557,6 +558,58 @@ static void v3dbg_3d_write(Voodoo3State *s, uint32_t addr, uint32_t val)
 
 static void v3dbg_triangle(Voodoo3State *s, const voodoo3_params_t *p)
 {
+    /* Separate budget for textured triangles so that texture demos are
+     * still visible after the first 60 (untextured) triangles. */
+    /*
+     * Log a textured triangle only when its texture setup differs from the
+     * previous one (plus every 64th), so the budget covers many distinct
+     * textures instead of 200 triangles of the first demo.
+     */
+    static uint64_t ttri_key[5];
+    static unsigned ttri_n;
+    bool ttri_new = false;
+    if (p->fbzColorPath & (1u << 27)) {
+        uint64_t k[5] = {
+            ((uint64_t)p->tex_params[0].base << 32) | p->tex_params[0].tLOD,
+            ((uint64_t)p->tex_params[1].base << 32) | p->tex_params[1].tLOD,
+            ((uint64_t)p->tmu[0].textureMode << 32) | p->tmu[1].textureMode,
+            p->fbzColorPath, p->alphaMode
+        };
+        ttri_new = memcmp(k, ttri_key, sizeof(k)) != 0 || (++ttri_n & 63) == 0;
+        memcpy(ttri_key, k, sizeof(k));
+    }
+    if (ttri_new && v3dbg_take(&v3b_ttri)) {
+        {
+            int lmin = (int)((p->tex_params[0].tLOD >> 2) & 0xf);
+            if (lmin > 8) lmin = 8;
+            V3DBG("TTEX tmu0 lodmin=%d lodmax=%d aspect=%u wider=%d w=%d h=%d "
+                  "basemin=0x%x multibase=%d | tmu1 mode=0x%08x tLOD=0x%08x "
+                  "base=0x%x | fbzMode=0x%08x",
+                  lmin, (int)((p->tex_params[0].tLOD >> 8) & 0xf),
+                  (unsigned)((p->tex_params[0].tLOD >> 21) & 3),
+                  !!(p->tex_params[0].tLOD & (1u << 20)),
+                  p->tex_params[0].tex_w_mask[lmin] + 1,
+                  p->tex_params[0].tex_h_mask[lmin] + 1,
+                  (unsigned)p->tex_params[0].tex_base[lmin],
+                  !!(p->tex_params[0].tLOD & (1u << 24)),
+                  p->tmu[1].textureMode, p->tex_params[1].tLOD,
+                  (unsigned)p->tex_params[1].base, p->fbzMode);
+        }
+        V3DBG("TTRI A=(%.1f,%.1f) B=(%.1f,%.1f) C=(%.1f,%.1f) colorPath=0x%08x "
+              "alphaMode=0x%08x texMode0=0x%08x texMode1=0x%08x "
+              "tLOD0=0x%08x fmt0=%u base0=0x%x | tmu0 S=%lld T=%lld W=%lld "
+              "dSdX=%lld dTdX=%lld dWdX=%lld",
+              p->vertexAx / 16.0, p->vertexAy / 16.0,
+              p->vertexBx / 16.0, p->vertexBy / 16.0,
+              p->vertexCx / 16.0, p->vertexCy / 16.0,
+              p->fbzColorPath, p->alphaMode,
+              p->tmu[0].textureMode, p->tmu[1].textureMode,
+              p->tex_params[0].tLOD, (unsigned)p->tex_params[0].tformat,
+              (unsigned)p->tex_params[0].base,
+              (long long)p->tmu[0].startS, (long long)p->tmu[0].startT,
+              (long long)p->tmu[0].startW, (long long)p->tmu[0].dSdX,
+              (long long)p->tmu[0].dTdX, (long long)p->tmu[0].dWdX);
+    }
     if (v3dbg_take(&v3b_tri)) {
         V3DBG("TRI  A=(%.1f,%.1f) B=(%.1f,%.1f) C=(%.1f,%.1f) draw=0x%06x "
               "stride=%u tiled=%d aux=0x%06x clip=%d..%d/%d..%d fbzMode=0x%08x "
@@ -1311,7 +1364,8 @@ static inline bool voodoo3_is_swz_reg(hwaddr addr)
 #define SETUPMODE_S0_T0         (1 << 5)
 #define SETUPMODE_W1            (1 << 6)
 #define SETUPMODE_S1_T1         (1 << 7)
-#define SETUPMODE_STRIP_MODE    (1 << 8)
+/* sSetupMode[19:16] = packet-3 header bits [25:22] (smode << 16) */
+#define SETUPMODE_STRIP_MODE    (1 << 16)
 
 
 /* =========================================================================
@@ -1335,8 +1389,13 @@ static bool voodoo3_render_pending(Voodoo3State *s)
 
 static bool voodoo3_cmdfifo_pending(Voodoo3State *s)
 {
-    return qatomic_read(&s->cmdfifo_depth_rd)   != qatomic_read(&s->cmdfifo_depth_wr)
-        || qatomic_read(&s->cmdfifo_depth_rd_2) != qatomic_read(&s->cmdfifo_depth_wr_2);
+    /* A disabled ring executes nothing, so words left in it are not "pending"
+     * (otherwise the status register reports busy forever once the driver
+     * has switched the FIFO off with data still queued). */
+    return (qatomic_read(&s->cmdfifo_enabled) &&
+            qatomic_read(&s->cmdfifo_depth_rd) != qatomic_read(&s->cmdfifo_depth_wr))
+        || (qatomic_read(&s->cmdfifo_enabled_2) &&
+            qatomic_read(&s->cmdfifo_depth_rd_2) != qatomic_read(&s->cmdfifo_depth_wr_2));
 }
 
 /*
@@ -1412,8 +1471,12 @@ static bool voodoo3_in_vblank(Voodoo3State *s)
 static uint32_t voodoo3_status_raw(Voodoo3State *s)
 {
     uint32_t ret = 0;
-    bool cmdfifo0 = qatomic_read(&s->cmdfifo_depth_rd) != qatomic_read(&s->cmdfifo_depth_wr);
-    bool cmdfifo1 = qatomic_read(&s->cmdfifo_depth_rd_2) != qatomic_read(&s->cmdfifo_depth_wr_2);
+    /* only an *enabled* ring can be busy: a disabled one never drains, and
+     * reporting it busy made the AmigaOS Warp3D/MiniGL reset loop spin forever */
+    bool cmdfifo0 = qatomic_read(&s->cmdfifo_enabled) &&
+                    qatomic_read(&s->cmdfifo_depth_rd) != qatomic_read(&s->cmdfifo_depth_wr);
+    bool cmdfifo1 = qatomic_read(&s->cmdfifo_enabled_2) &&
+                    qatomic_read(&s->cmdfifo_depth_rd_2) != qatomic_read(&s->cmdfifo_depth_wr_2);
     bool busy     = cmdfifo0 || cmdfifo1
                  || qatomic_read(&s->fifo_busy)
                  || voodoo3_render_pending(s);
@@ -1493,8 +1556,8 @@ void voodoo3_queue_triangle(Voodoo3State *s, voodoo3_params_t *p)
     p->tex_slot[0] = p->tex_slot[1] = -1;
     if (p->fbzColorPath & (1u << 27)) {   /* FBZCP_TEXTURE_ENABLED */
         voodoo3_use_texture(s, p, 0);
-        /* TMU1 only when not in passthrough mode (86Box dual_tmus check) */
-        if ((p->tmu[0].textureMode & 0x00643000u) != 0x00241000u)
+        /* TMU1 only when TMU0's combine unit reads TMU1's output */
+        if (voodoo3_tmu1_needed(p->tmu[0].textureMode))
             voodoo3_use_texture(s, p, 1);
     }
 
@@ -3404,8 +3467,8 @@ static void voodoo3_3d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
              * Bits [13:8]  = detail_bias  — LOD subtrahend (0..63)
              * Bits [16:14] = detail_scale — left-shift for factor (0..7)
              *
-             * Used by CC_MSELECT_DETAIL / CCA_MSELECT_DETAIL in the
-             * colour-combine path (voodoo3_render.c).
+             * Used by tc_mselect / tca_mselect = 4 (detail) of the TMU
+             * combine unit (v3_tmu_combine in voodoo3_render.c).
              */
             if (chip & 0x2) {
                 s->params.detail_max[0]   = (int)(val & 0xffu);
@@ -5859,6 +5922,40 @@ static void voodoo3_2d_reg_write(Voodoo3State *s, uint32_t addr, uint32_t val)
 #define AGP_GRAPHICS_STRIDE 0x10
 #define AGP_MOVE_CMD        0x14
 
+/*
+ * The driver switches CMDFIFO0 off (cmdBaseSize0 bit 8 = 0) as part of its
+ * engine-reset / timeout recovery, often while thousands of words are still
+ * queued (seen with MiniGL texturesurf: rd=4948 wr=13904).  Let the FIFO
+ * thread finish what it can (bounded), then stop it and drop the remainder
+ * so depth_rd == depth_wr and the chip reads as idle.
+ */
+static void voodoo3_cmdfifo0_disable(Voodoo3State *s)
+{
+    if (s->threads_started) {
+        int64_t deadline = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 200 * SCALE_MS;
+
+        voodoo3_kick_fifo(s);
+        while (qatomic_read(&s->cmdfifo_depth_rd) != qatomic_read(&s->cmdfifo_depth_wr) &&
+               qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < deadline) {
+            qemu_event_set(&s->fifo_event);
+            g_usleep(200);
+        }
+        qatomic_set(&s->cmdfifo_enabled, false);
+        qemu_event_set(&s->fifo_event);   /* releases a thread waiting for data */
+        while (qatomic_read(&s->fifo_busy)) {
+            qemu_event_reset(&s->fifo_idle_event);
+            if (!qatomic_read(&s->fifo_busy)) {
+                break;
+            }
+            qemu_event_wait(&s->fifo_idle_event);
+        }
+        voodoo3_wait_render_idle(s);
+    }
+    qatomic_set(&s->cmdfifo_depth_rd, qatomic_read(&s->cmdfifo_depth_wr));
+    s->cmdfifo_holecount = 0;
+    s->cmdfifo_in_sub    = 0;
+}
+
 static uint32_t voodoo3_cmd_read(Voodoo3State *s, uint32_t local)
 {
     switch (local) {
@@ -5947,6 +6044,9 @@ static void voodoo3_cmd_write(Voodoo3State *s, uint32_t local, uint32_t val)
         voodoo3_cmdfifo_reposition(s);
         break;
     case CMDFIFO_SIZE0:
+        if (s->cmdfifo_enabled && !(val & 0x100u)) {
+            voodoo3_cmdfifo0_disable(s);
+        }
         s->cmdfifo_size    = val;
         s->cmdfifo_end     = s->cmdfifo_base +
                              (((val & 0xffu) + 1u) << 12);

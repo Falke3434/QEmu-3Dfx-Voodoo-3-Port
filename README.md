@@ -115,6 +115,12 @@ include/hw/display/
 - CMDFIFO: BUMP and hole modes, waits for data, swizzle-aware
 - Fastfill, swap via overlay (leftOverlayBuf), separate desktop/3D stride
 - Texture fixes: palette/NCC tables, swizzle, tLOD/textureMode bits, mirror
+- Alpha blend: factor encoding now matches the register spec / Glide
+  (1 = SRC_ALPHA, 2 = A_COLOR, 3 = DST_ALPHA, 4 = ONE, 5 = 1-SRC_ALPHA, ...);
+  fixes opaque boxes behind transparent font/sprite texels (GLQuake console)
+- Dual-TMU: real TMU1 -> TMU0 combine unit (textureMode bits 12..29), so
+  multitexture/lightmap modulate works; TMU1 only sampled when TMU0 uses it
+- fbzColorPath cc_mselect 4/5 = texture alpha / texture RGB again
 - Pixel counters fbiPixelsIn/Out
 
 **Core**

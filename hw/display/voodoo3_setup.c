@@ -30,10 +30,10 @@
 #define SETUPMODE_S0_T0         (1 << 5)
 #define SETUPMODE_W1            (1 << 6)
 #define SETUPMODE_S1_T1         (1 << 7)
-#define SETUPMODE_STRIP_MODE    (1 << 8)
-#define SETUPMODE_CULLING_ENABLE    (1 << 9)
-#define SETUPMODE_CULLING_SIGN      (1 << 10)
-#define SETUPMODE_DISABLE_PINGPONG  (1 << 11)
+#define SETUPMODE_STRIP_MODE    (1 << 16)
+#define SETUPMODE_CULLING_ENABLE    (1 << 17)
+#define SETUPMODE_CULLING_SIGN      (1 << 18)
+#define SETUPMODE_DISABLE_PINGPONG  (1 << 19)
 
 /*
  * voodoo3_triangle_setup — convert the three floating-point setup vertices
