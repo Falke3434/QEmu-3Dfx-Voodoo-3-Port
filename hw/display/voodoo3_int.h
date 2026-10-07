@@ -1,10 +1,10 @@
 /*
- * QEMU 3Dfx Voodoo 3 — Internal device structure header
+ * QEMU 3Dfx Voodoo 3 — internal device structure header
  *
  * Shared between voodoo3.c, voodoo3_render.c, voodoo3_texture.c,
  * voodoo3_display.c, and voodoo3_setup.c.
  *
- * Copyright (C) 2026 <your name here>
+ * QEMU port: https://github.com/Falke3434/QEmu-3Dfx-Voodoo-3-Port
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -31,6 +31,7 @@
 #include "hw/display/voodoo3_texture.h"  /* voodoo3_tex_params_t etc.  */
 #include "hw/display/voodoo3_render.h"    /* voodoo3_triangle, voodoo3_triangle_setup */
 #include "hw/display/voodoo3_display.h"  /* V3_DIRTY_LINES             */
+#include "hw/display/voodoo3_gaps.h"     /* gap tracker (voodoo3_note_gap) */
 #include "hw/display/vga_int.h"          /* legacy VGA core (optional)  */
 
 /* Floating-point/integer union used in reg decode and setup */
@@ -118,7 +119,7 @@ typedef struct voodoo3_tmu_params_t {
  * Triangle parameter set — equivalent to 86Box voodoo_params_t
  * ========================================================================= */
 typedef struct voodoo3_params_t {
-    /* Vertex positions (4.12 fixed-point, signed 16-bit) */
+    /* Vertex positions (12.4 fixed-point, signed 16-bit) */
     int32_t  vertexAx, vertexAy;
     int32_t  vertexBx, vertexBy;
     int32_t  vertexCx, vertexCy;
@@ -163,8 +164,7 @@ typedef struct voodoo3_params_t {
     int      col_tiled, aux_tiled;
     /* Raw register values for colBufferStride / auxBufferStride readback.
      * row_width / aux_row_width are transformed (tiled * 128 * 32) and
-     * cannot be reconstructed, so we keep the original write value here.
-     * FIX: voodoo3diag Module 22 -- colBufferStride readback was 0. */
+     * cannot be reconstructed, so we keep the original write value here. */
     uint32_t col_stride_raw, aux_stride_raw;
 
     /* Stats */
@@ -277,13 +277,10 @@ typedef struct voodoo3_blt_t {
     /* ---- Decoded geometry (updated by reg writes) ---- */
     int      dstX, dstY, srcX, srcY;
     int      old_srcX;          /* saved srcX at launch (86Box) */
-    int      dstW, dstH, srcW, srcH;     /* dstSizeX/Y, srcSizeX/Y */
     int      dstSizeX, dstSizeY;
     int      srcSizeX, srcSizeY;
-    uint32_t dstStride;         /* dst_stride in bytes (computed) */
-    uint32_t srcStride;         /* src_stride in bytes (computed) */
-    uint32_t dst_stride;        /* same as dstStride (86Box naming) */
-    uint32_t src_stride;        /* same as srcStride (86Box naming) */
+    uint32_t dst_stride;        /* destination stride in bytes (computed) */
+    uint32_t src_stride;        /* source stride in bytes (computed) */
     int      dstBpp, srcBpp;
     int      src_bpp;           /* source bits-per-pixel (86Box blt.src_bpp) */
 
@@ -317,7 +314,6 @@ typedef struct voodoo3_blt_t {
 
     /* ---- Bresenham error terms (decoded from bresError0/1) ---- */
     int      bres_error_0;      /* Y stretch error accumulator */
-    int      bres_error_1;      /* X stretch error accumulator (unused) */
 
     /* ---- Line drawing state (86Box banshee_blt line_*) ---- */
     int      line_rep_cnt;      /* lineStyle[7:0]:  pixel repeat count */
@@ -340,12 +336,6 @@ typedef struct voodoo3_blt_t {
 struct Voodoo3State {
     PCIDevice   parent_obj;         /* MUST be first */
 
-    /*
-     * Note: legacy VGA (ports 0x3B0-0x3DF on the PCI I/O space and the
-     * 0xA0000 window) is NOT emulated; VGA registers are only reachable
-     * through the BAR2 I/O proxy.  An unused VGACommonState used to live
-     * here; it was never initialised and has been removed.
-     */
 
     /* BARs */
     MemoryRegion mmio, io;
@@ -400,8 +390,6 @@ struct Voodoo3State {
     QEMUBH       *resize_bh;
     int           resize_pending_w;
     int           resize_pending_h;
-    bool          driver_active;    /* true once driver has set VIDPROC_ENABLE=1;
-                                     * disables VGA-fallback in vidProcCfg handler */
     int           pix_format;
 
     /* SGRAM */
@@ -422,12 +410,9 @@ struct Voodoo3State {
     int           cur_yoff;     /* sprite rows skipped when cursor clips above screen top */
     uint32_t      cur_c0, cur_c1;
     /*
-     * Shadow copy of the cursor bitmap, kept in host byte order.
-     * 64 rows × 16 bytes = 1024 bytes.
-     * Populated by voodoo3_lfb_write() when the write address falls within
-     * [cur_pat_addr, cur_pat_addr+1024).  This avoids reading directly from
-     * fb_mem where 32-bit writes from a big-endian CPU have been byte-swapped
-     * by QEMU's DEVICE_LITTLE_ENDIAN memory region, corrupting the 1bpp mask.
+     * Copy of the cursor bitmap (64 rows x 16 bytes), in the byte order the
+     * chip sees.  Reloaded from SGRAM by voodoo3_cursor_reload() (pattern
+     * address change, display refresh), undoing the LFB swizzle.
      *
      * Default (reset): plane0=0xFF, plane1=0x00 per row = fully transparent
      * in Windows AND/XOR mode (p0=1,p1=0 → skip).  This prevents a coloured
@@ -446,10 +431,9 @@ struct Voodoo3State {
     uint32_t      leftOverlayBuf;  /* SST 0x250: buffer to show on swap      */
     uint32_t      overlay_addr;    /* current overlay scan-out address       */
     bool          ext_from_io;     /* ext write arrives via BAR2 (bytes)     */
-    uint32_t      chromaRange;     /* SST 0x138 (stored; range test not yet used) */
+    uint32_t      chromaRange;     /* SST 0x138 (stored only, range test not implemented) */
     bool          dac_pend;        /* BAR0 dacData write not yet committed   */
     uint32_t      dac_pend_val;
-    int64_t       last_full_refresh_ms;
     /*
      * Pixel byte order in SGRAM (port convention: SGRAM holds pixels the way
      * the CPU wrote them).  Derived from the LFB swizzle bits in miscInit0:
@@ -530,7 +514,6 @@ struct Voodoo3State {
         int      size_x,  size_y;              /* display size (pixels) */
         int      overlay_bytes;               /* source row width in bytes */
         /* Vertical sub-pixel accumulator (20.12 fixed-point source Y) */
-        int32_t  src_y;
         /* Pixel format: OVERLAY_FMT_565 / YUYV422 / UYVY422 */
         int      pix_fmt;
         /* Enable flag (vidProcCfg bit 8) */
@@ -544,10 +527,11 @@ struct Voodoo3State {
      * banshee_in() / banshee_out() and svga_in() / svga_out().
      *
      * The Banshee/V3 exposes standard VGA I/O ports 0x3b0..0x3df via two paths:
-     *   1. Physical I/O ports 0x3c0..0x3df — registered with io_sethandler()
-     *      in 86Box; in QEMU this maps to BAR2 offsets 0xb0..0xdf.
-     *   2. BAR0 IO-remap window (offset 0xb0..0xdf), forwarded by
-     *      banshee_ext_out/in() → banshee_out/in() → svga_out/in().
+     *   1. BAR2 I/O offsets 0xb0..0xdf (and with legacy-vga=on the fixed
+     *      PC ports 0x3b0..0x3df).
+     *   2. BAR0 IO-remap window offsets 0xb0..0xdf, reads and writes
+     *      routed to voodoo3_vga_in/out() as in 86Box (banshee_ext_out/in()
+     *      -> svga_out/in()).
      *
      * misc_out: Miscellaneous Output Register (0x3c2 write / 0x3cc read).
      *   bit 0 = I/O address select (0=3Bx, 1=3Dx)
@@ -576,10 +560,8 @@ struct Voodoo3State {
      * dac_rgb_buf[3]: partial RGB triplet buffer for DAC writes.
      * dac_state: 0=write mode, 3=read mode (matches 86Box svga->dac_state).
      *
-     * Note: CRTC registers reuse the existing crtc_ctrl[64] array.
-     *   The ext path (0xd4/0xd5 via BAR0/BAR2) and the VGA path (0x3d4/0x3d5)
-     *   both read/write the same crtc_ctrl[] — identical to 86Box where
-     *   banshee_ext_outl(crtcCtrl) and banshee_out(0x3d4/0x3d5) both touch svga->crtc[].
+     * CRTC registers live in crtc_ctrl[64]; the VGA path (0x3d4/0x3d5) and
+     *   BAR0 writes to offsets 0xd4/0xd5 use the same array.
      */
     uint8_t  misc_out;             /* Misc Output Register              */
     uint8_t  feat_reg;             /* Feature Control Register          */
@@ -600,15 +582,8 @@ struct Voodoo3State {
     /* Generic register scratch (for misc unmapped regs) */
     uint32_t regs[512];
 
-    /* Banshee CRTC / DAC indexed-register scratch (ext offsets 0xc0–0xda).
-     * 64 CRTC ctrl entries (index via 0xd4, value via 0xd5) and
-     * 64 frequency entries (index via 0xc4, value via 0xc5). */
-    uint8_t  crtc_ctrl[64];     /* written via Ext_crtcCtrlIdx/Val pair  */
-    uint8_t  crtc_freq[64];     /* written via Ext_crtcDoubleRate/Val     */
-    uint8_t  dac_reset[64];     /* written via Ext_dacResetIdx/Val        */
-    uint32_t crtc_idx;          /* current crtcCtrl index                 */
-    uint32_t crtc_freq_idx;     /* current crtcFreq index                 */
-    uint32_t dac_reset_idx;     /* current dacReset index                 */
+    uint8_t  crtc_ctrl[64];     /* CRTC registers (0x3d4/0x3d5)           */
+    uint32_t crtc_idx;          /* current CRTC index                     */
     uint32_t vidSerialParallelPort;
 
     /* --- 3D state -------------------------------------------------------- */
@@ -634,13 +609,21 @@ struct Voodoo3State {
     voodoo3_blt_t   blt;
 
     /* Frame / buffer counters */
-    int             cmd_written, cmd_read;   /* statistics only */
+    int             cmd_read;       /* triangle commands seen (statistics) */
     int             tri_count;
     uint32_t        fbiPixelsIn, fbiChromaFail, fbiZFuncFail;
     uint32_t        fbiAFuncFail, fbiPixelsOut;
 
     /*
-     * FIX 11: VMState shadow for params.fogTable[64].
+     * Gap tracker: how often the guest asked for something the model does
+     * not implement, per kind and per offending value.  Updated with
+     * qatomic_* from any thread; read through the "gaps" QOM property.
+     * See voodoo3_gaps.h.  Diagnostic only, not migrated.
+     */
+    uint32_t gap_count[V3_GAP_MAX][V3_GAP_SLOTS];
+
+    /*
+     * VMState shadow for params.fogTable[64].
      *
      * params.fogTable is declared as `struct { uint8_t fog, dfog; }[64]`
      * — an array of anonymous structs.  VMSTATE_ macros cannot address
@@ -649,8 +632,8 @@ struct Voodoo3State {
      * fog63,dfog63 — identical byte layout to the C struct on all
      * platforms since {uint8_t,uint8_t} has no padding).
      *
-     * voodoo3_pre_save_3dstate()  copies params.fogTable → fog_table_save.
-     * voodoo3_post_load_3dstate() copies fog_table_save → params.fogTable.
+     * voodoo3_3dstate_pre_save()  copies params.fogTable → fog_table_save.
+     * voodoo3_3dstate_post_load() copies fog_table_save → params.fogTable.
      *
      * The verts[4] setup-vertex array is similarly mirrored as a flat
      * float array for the same reason (struct-of-floats without padding).
@@ -660,10 +643,8 @@ struct Voodoo3State {
 
     /*
      * Texture-aperture and 3D-LFB writes are executed synchronously in the
-     * vCPU thread (see voodoo3_lfb3d_write / voodoo3_mmio_write).  That keeps
-     * them correctly ordered against triangle commands, which the previous
-     * MMIO FIFO did not do (the FIFO was only drained when a triangle was
-     * queued, and its wake-up signal was never waited on).
+     * calling thread (see voodoo3_lfb3d_write / voodoo3_mmio_write), which
+     * keeps them ordered against triangle commands.
      */
 
     /* --- Triangle parameter ring buffer ---------------------------------- *
@@ -695,14 +676,15 @@ struct Voodoo3State {
      *   2 threads: mask=1 → thread 0 = even lines, thread 1 = odd lines
      *   4 threads: mask=3 → thread T = every 4th line starting at T
      *
-     * Ported from 86Box voodoo->odd_even_mask (vid_voodoo_common.h line 398).
+     * Ported from 86Box voodoo->odd_even_mask (vid_voodoo_common.h).
      */
     uint32_t     odd_even_mask;
 
     /* Device variant */
     uint32_t model;
     bool     is_agp, bilinear, dac_filter;
-    bool     lfb_tiling;            /* property: decode tiled LFB aperture */
+    OnOffAuto lfb_tiling;           /* property: decode tiled LFB aperture
+                                     * (auto: while the desktop is tiled) */
 
     /*
      * Legacy VGA (property "legacy-vga", default off).  When on, QEMU's VGA
@@ -742,10 +724,12 @@ struct Voodoo3State {
     /* Decoded texture cache (V3_TEX_CACHE_SIZE slots per TMU) */
     v3_tex_cache_entry_t tex_cache[2][V3_TEX_CACHE_SIZE];
     uint32_t             tex_lru[2];     /* simple eviction counter           */
-    uint32_t             tex_epoch;      /* bumped whenever the guest may have
-                                          * written texture memory (kick, direct
-                                          * register path); cache entries are
-                                          * re-verified once per epoch        */
+    uint32_t             tex_epoch;      /* meant to be bumped whenever the
+                                          * guest may have written texture
+                                          * memory; cache hits re-verify their
+                                          * source hash once per epoch.  Not
+                                          * advanced anywhere yet (open item
+                                          * in voodoo3-port-analyse.md)     */
 
     /* ARGB palette (256 entries per TMU) used for PAL8 / APAL8 / APAL88 */
     uint32_t             tex_palette[2][256];
@@ -764,6 +748,8 @@ struct Voodoo3State {
 
     /* --- Buffer swap state (ported from 86Box swap_pending etc.) -------- */
     bool                 swap_pending;
+    int                  swap_count;     /* swapPending writes not yet
+                                          * retired (status bits 30:28) */
     int                  swap_interval;   /* vblanks to wait              */
     uint32_t             swap_offset;     /* draw_offset to flip to       */
     int                  retrace_count;   /* vblanks since swap requested */
@@ -821,12 +807,9 @@ struct Voodoo3State {
     /* --- VGA IRQ state -------------------------------------------------- */
     bool                 vblank_irq_pending; /* set by vblank cb, cleared by ISR */
 
-    /* Diagnostic: counts status register reads after mode-set */
-    uint32_t             status_read_count;
-
     /* --- PLL / pixel clock state ---------------------------------------- *
      * pixel_clock_hz: current pixel clock frequency in Hz, computed from    *
-     *   pllCtrl0 by voodoo3_pll_recalc().  Used to derive the vblank timer  *
+     *   pllCtrl0 by voodoo3_pll_calc_freq().  Used to derive the vblank timer  *
      *   period so the emulated refresh rate tracks the programmed PLL.       *
      *                                                                        *
      * vblank_period_ns: nanoseconds per frame = (htotal * vtotal) /          *
@@ -846,10 +829,8 @@ struct Voodoo3State {
     int64_t              vblank_period_ns;  /* ns per frame, 0 = use default  */
 };
 
-/* Internal function declared in voodoo3.c, used by voodoo3_setup.c */
 
-/* voodoo3_queue_triangle — submit a triangle to the render ring.
- * Defined as static in voodoo3.c but declared here for setup.c. */
+/* (voodoo3_queue_triangle() is declared near the top of this file) */
 
 /* Pixel byte-order helpers (see lfb_be32 in Voodoo3State). */
 static inline bool v3_be16(const Voodoo3State *s)
@@ -906,10 +887,7 @@ static inline uint32_t v3_ld32(const Voodoo3State *s, const void *p)
 
 /*
  * Record an engine write to SGRAM by address (display rows are derived from
- * the desktop start/stride; texture cache entries are invalidated).  Marking
- * by draw-buffer y, as before, only worked when the 3D colour buffer was the
- * visible desktop at offset 0; MiniGL renders into the window area of the
- * Workbench screen, so those rows were never redrawn (stripes).
+ * the desktop start/stride; texture cache entries are invalidated).
  */
 static inline void v3_mark_px(Voodoo3State *s, const void *ptr)
 {

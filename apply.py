@@ -1,101 +1,107 @@
 #!/usr/bin/env python3
-"""
-apply.py — integrate the Voodoo 3 PCI device into a QEMU source tree.
-
-Usage:
-    1. Extract this archive somewhere, e.g. C:/qemu-voodoo3-final\
-    2. cd into your QEMU repository root
-    3. Run: python3 C:/qemu-voodoo3-final\apply.py
-
-   Or on Windows with MSYS2:
-    cd C:/msys64/home/falke/qemu
-    python3 /c/qemu-voodoo3-final/apply.py
-
-What this does:
-  1. Copies hw/display/voodoo3*.c and *.h into hw/display/
-  2. Copies include/hw/display/voodoo3.h into include/hw/display/
-  3. Appends one block to hw/display/Kconfig
-  4. Appends one block to hw/display/meson.build
-
-That is ALL. No machine patches. No .mak changes.
-The device is then available as -device voodoo3 on any PCI-capable guest.
-"""
-
-import os, sys, shutil
+import os
+import shutil
+import sys
 
 ROOT = os.getcwd()
 HERE = os.path.dirname(os.path.abspath(__file__))
-PATCH_ROOT = HERE   # files are in subdirs next to apply.py
 
-def cp(src_rel, dst_rel):
-    src = os.path.join(PATCH_ROOT, src_rel)
-    dst = os.path.join(ROOT, dst_rel)
+FILES = [
+    "hw/display/voodoo3.c",
+    "hw/display/voodoo3_render.c",
+    "hw/display/voodoo3_texture.c",
+    "hw/display/voodoo3_display.c",
+    "hw/display/voodoo3_setup.c",
+    "hw/display/voodoo3_dither_tables.c",
+    "hw/display/voodoo3_render.h",
+    "hw/display/voodoo3_texture.h",
+    "hw/display/voodoo3_display.h",
+    "hw/display/voodoo3_int.h",
+    "hw/display/voodoo3_gaps.h",
+    "hw/display/voodoo3_dither_tables.h",
+    "include/hw/display/voodoo3.h",
+]
+
+PATCHES = [
+    ("hw/display/Kconfig.fragment", "hw/display/Kconfig", "config VOODOO3"),
+    ("hw/display/meson.build.fragment", "hw/display/meson.build", "voodoo3.c"),
+]
+
+
+def copy_file(rel):
+    src = os.path.join(HERE, rel)
+    dst = os.path.join(ROOT, rel)
     if not os.path.exists(src):
-        print(f"  MISSING source: {src_rel}")
-        return
+        print(f"  MISSING {rel}")
+        return False
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copy2(src, dst)
-    print(f"  COPY  {dst_rel}")
+    print(f"  COPY    {rel}")
+    return True
 
-def append_once(fragment_rel, target_rel, marker):
-    """Append fragment to target if marker not already present."""
-    frag = open(os.path.join(PATCH_ROOT, fragment_rel)).read()
-    target = os.path.join(ROOT, target_rel)
-    if not os.path.exists(target):
-        print(f"  SKIP  {target_rel} (not found)")
-        return
-    existing = open(target).read()
-    if marker in existing:
-        print(f"  SKIP  {target_rel} (already patched)")
-        return
-    # Append to end - safer than prepend, cannot break existing Kconfig structure
-    with open(target, 'a') as f:
-        f.write("\n" + frag)
-    print(f"  PATCH {target_rel}")
 
-print("=== Copying device files ===")
-for f in ["voodoo3.c", "voodoo3_render.c", "voodoo3_texture.c",
-          "voodoo3_display.c", "voodoo3_setup.c",
-          "voodoo3_render.h", "voodoo3_texture.h",
-          "voodoo3_display.h", "voodoo3_int.h",
-          "voodoo3_dither_tables.c", "voodoo3_dither_tables.h"]:
-    cp(f"hw/display/{f}", f"hw/display/{f}")
+def append_once(fragment, target, marker):
+    path = os.path.join(ROOT, target)
+    if not os.path.exists(path):
+        print(f"  SKIP    {target} (not found)")
+        return False
+    with open(path) as f:
+        if marker in f.read():
+            print(f"  SKIP    {target} (already patched)")
+            return True
+    with open(os.path.join(HERE, fragment)) as f:
+        text = f.read()
+    with open(path, "a") as f:
+        f.write("\n" + text)
+    print(f"  PATCH   {target}")
+    return True
 
-cp("include/hw/display/voodoo3.h", "include/hw/display/voodoo3.h")
 
-print("\n=== Patching build system ===")
-append_once("hw/display/Kconfig.fragment",    "hw/display/Kconfig",    "config VOODOO3")
-append_once("hw/display/meson.build.fragment","hw/display/meson.build","voodoo3.c")
-
-print("""
+def main():
+    if not os.path.isfile(os.path.join(ROOT, "hw/display/meson.build")):
+        print("Run apply.py from the root of a QEMU source tree.")
+        return 1
+    print("=== Copying device files ===")
+    ok = all([copy_file(f) for f in FILES])
+    print("\n=== Patching build system ===")
+    ok = all([append_once(*p) for p in PATCHES]) and ok
+    print("""
 === Done ===
 
-Rebuild QEMU (delete build dir first after Kconfig changes):
+Rebuild QEMU (delete the build directory after Kconfig changes):
 
   rm -rf build && mkdir build && cd build
   ../configure --target-list=ppc-softmmu,x86_64-softmmu
   make -j$(nproc)
 
-Usage examples (AmigaOS 4.1 guests):
+Examples:
 
-  # Pegasos2
-  qemu-system-ppc -M pegasos2 -vga none -device voodoo3,model=3 [...]
+  # AmigaOS 4.1 (Pegasos2 / AmigaOne / Sam460ex)
+  qemu-system-ppc -M pegasos2 -vga none \\
+      -device voodoo3,model=3,romfile=roms/V3_3000_PCI_SD_2.15.06.rom [...]
 
-  # AmigaOne XE
-  qemu-system-ppc -M amigaone -vga none -device voodoo3,model=3 [...]
+  # MorphOS (no ROM)
+  qemu-system-ppc -M pegasos2 -vga none -device voodoo3,model=3,romfile="" [...]
 
-  # Sam460ex (PCI slot)
-  qemu-system-ppc -M sam460ex -device voodoo3,model=3 [...]
-
-Note: frame buffers are interpreted big-endian (PPC byte order); x86
-guests are currently not supported by the display path.
+  # x86 with the Voodoo3 video BIOS
+  qemu-system-x86_64 -M pc -vga none \\
+      -device voodoo3,model=3,legacy-vga=on,romfile=roms/3k12sd.rom [...]
 
 Properties:
-  model=0..4        Banshee(0), V3-1000(1), V3-2000(2), V3-3000(3), V3-3500(4)
-  agp=on/off        AGP instead of PCI identity (default: off)
-  render-threads=N  1, 2 or 4 rasterizer threads (default: 2)
-  bilinear=on/off   Bilinear texture filtering (default: on)
-  dac-filter=on/off Voodoo "16-bit filter" emulation (default: off)
-  lfb-tiling=on/off Decode CPU accesses to the tiled LFB aperture
-                    (default: on; turn off to get the old behaviour)
+  model=0..4          Banshee(0), V3-1000(1), V3-2000(2), V3-3000(3), V3-3500(4)
+  render-threads=1..4 rasterizer threads (default 2)
+  bilinear=on/off     bilinear texture filtering (default on)
+  dac-filter=on/off   DAC output filter (default off)
+  agp=on/off          AGP identity (default off)
+  lfb-tiling=auto/on/off  decode the tiled LFB aperture (default auto)
+  legacy-vga=on/off   VGA core at the PC addresses (default off)
+  debug=on/off        v3dbg trace with -d unimp (default off)
 """)
+    if not ok:
+        print("Some steps failed, see above.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

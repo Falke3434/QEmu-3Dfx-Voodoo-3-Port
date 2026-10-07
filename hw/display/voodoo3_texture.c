@@ -1,10 +1,10 @@
 /*
- * QEMU 3Dfx Voodoo 3 — Texture Subsystem
+ * QEMU 3Dfx Voodoo 3 — texture subsystem
  *
  * Ported from 86Box vid_voodoo_texture.c
  * Original author: Sarah Walker <https://pcem-emulator.co.uk/>
  * Copyright (C) 2008-2024 Sarah Walker and 86Box contributors
- * Copyright (C) 2026 <your name here>
+ * QEMU port: https://github.com/Falke3434/QEmu-3Dfx-Voodoo-3-Port
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
@@ -16,18 +16,22 @@
  *                            Ported from voodoo_recalc_tex3() which is used
  *                            for Voodoo 3 (type >= VOODOO_BANSHEE).
  *
- *  voodoo3_tex_download()  — decode raw FIFO_WRITEL_TEX writes into the
- *                            texture RAM and invalidate affected cache slots.
+ *  voodoo3_tex_download()  — one write to the texture aperture of BAR0:
+ *                            stored in SGRAM, page marked dirty.
  *                            Ported from voodoo_tex_writel().
  *
  *  voodoo3_use_texture()   — look up or decode a texture into the cache and
- *                            return a pointer array for the rasterizer.
+ *                            wire the pointers into the triangle parameters.
  *                            Ported from voodoo_use_texture().
  *
- * Texture formats decoded (all 86Box TEX_* values):
+ *  Dirty-page tracking and the source hash that keep the cache coherent
+ *  with SGRAM written by the CPU, the 2D engine and the 3D engine.
+ *
+ * Texture formats decoded (86Box TEX_* values):
  *   TEX_RGB332, TEX_Y4I2Q2, TEX_A8, TEX_I8, TEX_AI8,
  *   TEX_PAL8, TEX_APAL8, TEX_ARGB8332, TEX_A8Y4I2Q2,
- *   TEX_R5G6B5, TEX_ARGB1555, TEX_ARGB4444, TEX_A8I8, TEX_APAL88
+ *   TEX_R5G6B5, TEX_ARGB1555, TEX_ARGB4444, TEX_A8I8, TEX_APAL88,
+ *   plus code 15 as ARGB8888 (reserved in the register spec, see below).
  * -------------------------------------------------------------------------
  */
 
@@ -56,20 +60,13 @@
 #define TEX_ARGB4444  12
 #define TEX_A8I8      13
 #define TEX_APAL88    14
-#define TEX_ARGB_8888 15  /* GR_TEXFMT_ARGB_8888 — 32-bit, 4 bytes/texel (Voodoo3/Banshee) */
+#define TEX_ARGB_8888 15  /* reserved in the register spec, not in 86Box */
 
-/* tLOD bit fields */
-/* tLOD / textureMode bits — 86Box vid_voodoo_regs.h.  The previous values
- * (LOD_ODD 1<<24, LOD_SPLIT 1<<23, TMULTIBASEADDR 1<<25, TRILINEAR 1<<2)
- * were wrong: bit 2 of textureMode is the magnification filter, so every
- * bilinear texture was treated as trilinear and its mip levels were taken
- * from the wrong addresses. */
+/* tLOD / textureMode bits (86Box vid_voodoo_regs.h) */
 #define LOD_ODD             (1 << 18)
 #define LOD_SPLIT           (1 << 19)
 #define LOD_S_IS_WIDER      (1 << 20)
 #define LOD_TMULTIBASEADDR  (1 << 24)
-#define LOD_TMIRROR_S       (1 << 28)
-#define LOD_TMIRROR_T       (1 << 29)
 #define TEXTUREMODE_TRILINEAR (1u << 30)
 #define TEXTUREMODE_NCC_SEL   (1 << 5)
 
@@ -275,6 +272,7 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
                  ((uint32_t)TB((a) + 2) << 16) | ((uint32_t)TB((a) + 3) << 24))
     uint32_t tex_mask = s->tex_mask;
     int      tformat  = tp->tformat;
+    bool     bad_fmt  = false;   /* gap tracker: reported once, after the loops */
 
     lod_min = MIN(lod_min, V3_LOD_MAX);
     lod_max = MIN(lod_max, V3_LOD_MAX);
@@ -386,12 +384,10 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
                                     c & 0xff, d >> 8);
                     break; }
                 /*
-                 * TEX_ARGB_8888 (tformat=15) — 32-bit ARGB, 4 bytes per texel.
-                 * GR_TEXFMT_ARGB_8888 in the Glide3 / Voodoo3 register spec.
-                 * Memory layout: [A][R][G][B] little-endian (BGRA in byte order).
-                 * 86Box does not implement this format (fatal() on unknown format);
-                 * it is used by Warp3D/AmigaOS4 drivers for high-quality textures.
-                 * Ported from the SST-1 hardware spec and Glide3 source.
+                 * tformat 15: "Reserved" in the Voodoo3 register spec and
+                 * not implemented by 86Box.  Decoded here as 32-bit ARGB
+                 * (4 bytes per texel, A in bits 31:24); whether real
+                 * hardware does anything with it is unverified.
                  */
                 case TEX_ARGB_8888: {
                     uint32_t d;
@@ -404,11 +400,16 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
                     break; }
                 default:
                     out = 0xff808080u;
+                    bad_fmt = true;
                     break;
                 }
                 dst_row[x] = out;
             }
         }
+    }
+    if (bad_fmt) {
+        /* unknown format code: the texture was decoded as flat grey */
+        voodoo3_note_gap(s, V3_GAP_TEX_FORMAT, (unsigned)tformat & 0xfu);
     }
 #undef TB
 #undef T16
@@ -420,7 +421,10 @@ static void decode_texture(Voodoo3State *s, v3_tex_cache_entry_t *entry,
 
 /* =========================================================================
  * Source-content hash of the SGRAM bytes a cache entry was decoded from.
- * Cheap enough to run once per cache entry and epoch (LOD range only).
+ * Compared on a cache hit when s->tex_epoch has moved since the last
+ * check (LOD range only).  Note: tex_epoch is currently never advanced,
+ * so on hits the comparison does not run (open item in
+ * voodoo3-port-analyse.md); coherence relies on the dirty pages alone.
  * ========================================================================= */
 static uint64_t tex_hash_bytes(const uint8_t *mem, uint32_t mem_mask,
                                uint32_t start, uint32_t len, uint64_t h)
@@ -606,8 +610,9 @@ void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu)
     uint32_t cur_pal_gen = is_pal ? s->pal_gen[tmu] : 0u;
 
     /*
-     * Epoch is read BEFORE hashing the source so a guest write that lands
-     * while we verify forces another verification next time.
+     * Epoch is read before hashing the source, so a guest write that lands
+     * during the check forces another check next time (once the epoch is
+     * advanced, see tex_source_hash()).
      */
     const uint32_t cur_epoch = qatomic_read(&s->tex_epoch);
     const uint32_t cur_sx    = v3_lfb_x(s);
@@ -699,8 +704,8 @@ void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu)
         static int tex_log_left = 400;
         static uint64_t last_logged_hash;
         static uint32_t last_logged_base = ~0u;
-        /* identical re-decodes (same base + same source) used up the old
-         * 120-line budget within the first frames; log changes only */
+        /* log only when base or source changed (re-decodes of the same
+         * texture would use up the budget) */
         bool log_it = !(e->src_hash == last_logged_hash &&
                         tp->base == last_logged_base);
         if (tex_log_left > 0 && log_it && qemu_loglevel_mask(LOG_UNIMP)) {
@@ -736,7 +741,7 @@ void voodoo3_use_texture(Voodoo3State *s, voodoo3_params_t *p, int tmu)
  *
  * Ported from 86Box voodoo_tex_writel() — Banshee/V3 linear path.
  * For Voodoo 3 the address is: (addr & 0x1ffffc) + tex_base[tmu][0]
- * Executed synchronously in the vCPU thread.  Because Banshee/V3 texture
+ * Executed synchronously in the calling thread (vCPU or CMDFIFO).  Because Banshee/V3 texture
  * memory is the shared SGRAM, the store goes straight into fb_mem and the
  * affected page is marked dirty; the cache is invalidated lazily.
  * ========================================================================= */

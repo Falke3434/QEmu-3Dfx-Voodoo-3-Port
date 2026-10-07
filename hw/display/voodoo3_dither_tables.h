@@ -38,7 +38,8 @@ extern const uint8_t voodoo3_dither_g[256][4][4];
 extern const uint8_t voodoo3_dither_rb2x2[256][2][2];
 extern const uint8_t voodoo3_dither_g2x2[256][2][2];
 
-/* Subtraction dither (FBZ_DITHER_SUB / fbzMode bit 19) */
+/* Subtraction dither (FBZ_DITHER_SUB / fbzMode bit 19); referenced by the
+ * rasterizer, but applied at the wrong point (see voodoo3_render.c) */
 extern const uint8_t voodoo3_dithersub_rb[256][4][4];
 extern const uint8_t voodoo3_dithersub_g[256][4][4];
 extern const uint8_t voodoo3_dithersub_rb2x2[256][2][2];

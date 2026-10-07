@@ -4,7 +4,7 @@
  * Ported from 86Box (vid_voodoo_banshee.c et al.)
  * Original 86Box authors: Sarah Walker et al.
  *
- * Copyright (C) 2026 <your name here>
+ * QEMU port: https://github.com/Falke3434/QEmu-3Dfx-Voodoo-3-Port
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -12,8 +12,6 @@
 #define INCLUDE_HW_DISPLAY_VOODOO3_H
 
 #include "hw/pci/pci_device.h"
-#include "hw/core/qdev-properties.h"
-#include "qapi/error.h"
 
 #define TYPE_VOODOO3_PCI  "voodoo3"
 
@@ -25,19 +23,5 @@ DECLARE_INSTANCE_CHECKER(Voodoo3State, VOODOO3_PCI, TYPE_VOODOO3_PCI)
 #define VOODOO3_MODEL_V3_2000    2u
 #define VOODOO3_MODEL_V3_3000    3u
 #define VOODOO3_MODEL_V3_3500TV  4u
-
-/*
- * Note: there is no "big-endian-framebuffer" property; the display path
- * always interprets 16/32-bpp frame buffers in big-endian (PPC) order.
- */
-static inline DeviceState *
-voodoo3_create(PCIBus *bus, uint32_t model, bool is_agp)
-{
-    DeviceState *dev = qdev_new(TYPE_VOODOO3_PCI);
-    qdev_prop_set_uint32(dev, "model", model);
-    qdev_prop_set_bit(dev,   "agp",   is_agp);
-    pci_realize_and_unref(PCI_DEVICE(dev), bus, &error_fatal);
-    return dev;
-}
 
 #endif /* INCLUDE_HW_DISPLAY_VOODOO3_H */

@@ -1,7 +1,26 @@
 /*
- * voodoo3diag v13.0 -- 3Dfx Voodoo3 / Banshee diagnostics for AmigaOS 4.1
+ * voodoo3diag v13.2 -- 3Dfx Voodoo3 / Banshee diagnostics for AmigaOS 4.1
  *
- * Rewritten from v12.4.  Main changes:
+ * Register layout and bit fields follow the Voodoo3 register specification
+ * ("Avenger", rev. 0.97) and 86Box.
+ *
+ * v13.2:
+ *  - dramInit0/1 decoded per spec (bit 27 of dramInit0 = SGRAM type
+ *    16 Mbit, bit 26 = two chip sets; dramInit1 bit 27 = mctl_pagebreak,
+ *    not a "memory initialised" flag)
+ *  - vidProcCfg: tile space, overlay format, filter mode, chroma key
+ *  - VGA module reads CRTC 0x1A/0x1B and compares the CRTC display end
+ *    with vidScreenSize (height off by one?)
+ *  - FUNC: colour pattern registers (pattern0Alias/pattern1Alias must
+ *    alias colorPattern[0]/[1] at 0x100/0x104, writing 0x100/0x104 must
+ *    not touch dstBaseAddr/dstFormat), and an opaque mono-pattern fill
+ *    with ROP 0xF0 (two colours expected)
+ *  - FUNC3D: nopCMD with bit 0 clear must keep the fbi counters, with
+ *    bit 0 set must clear them (spec 8.17)
+ *  - 2D commands 9..15 are never issued: 9..12 are undefined, 13..15 write
+ *    the SGRAM mode/mask/colour registers (spec 7.x, command[3:0])
+ *
+ * v13.0 (rewrite of v12.4):
  *
  *  - Register map corrected against the Banshee/Voodoo3 spec and 86Box
  *    (ext/init registers, CMD/AGP block at BAR0+0x80000, 2D block at
@@ -52,7 +71,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define VERSION_STR "13.1"
+#define VERSION_STR "13.2"
 
 struct PCIIFace *IPCI = NULL;
 
@@ -200,6 +219,7 @@ struct PCIIFace *IPCI = NULL;
 #define CMD2D_DX              (1UL << 14)  /* right-to-left */
 #define CMD2D_DY              (1UL << 15)  /* bottom-to-top */
 #define CMD2D_PATTERN_MONO    (1UL << 13)
+#define CMD2D_TRANS_MONO      (1UL << 16)
 
 /* surface formats (bits 19:16 of src/dstFormat) */
 #define FMT_8BPP              1
@@ -616,8 +636,13 @@ static void mod_decode(void)
     res(R_INFO, "pixel clock (pllCtrl0)", p0, "%.3f MHz", pll_mhz(p0));
     res(R_INFO, "memory clock (pllCtrl1)", p1, "%.3f MHz", pll_mhz(p1));
     res(R_INFO, "strapInfo", strap, "0x%08lX", (unsigned long)strap);
-    res(R_INFO, "dramInit0/1", d0, "0x%08lX / 0x%08lX  sgram=%d", (unsigned long)d0,
-        (unsigned long)d1, (int)((d0 >> 27) & 1));
+    res(R_INFO, "dramInit0", d0,
+        "0x%08lX  sgram-16Mbit(27)=%d two-chipsets(26)=%d tCAS=%lu",
+        (unsigned long)d0, (int)((d0 >> 27) & 1), (int)((d0 >> 26) & 1),
+        (unsigned long)(((d0 >> 14) & 3) + 1));
+    res(R_INFO, "dramInit1", d1,
+        "0x%08lX  refresh=%d sdram(30)=%d pagebreak(27)=%d",
+        (unsigned long)d1, (int)(d1 & 1), (int)((d1 >> 30) & 1), (int)((d1 >> 27) & 1));
     res(R_INFO, "miscInit0 LFB swizzle", m0,
         "0x%08lX  byte-swizzle(30)=%d word-swizzle(31)=%d  y-origin=%lu",
         (unsigned long)m0, (int)((m0 >> 30) & 1), (int)((m0 >> 31) & 1),
@@ -634,6 +659,8 @@ static void mod_decode(void)
 /* =========================================================================
  * MODULE 4 -- video processor / desktop / cursor decode
  * ========================================================================= */
+static ULONG g_scr_h = 0;   /* vidScreenSize height, for module 8 */
+
 static void mod_video(void)
 {
     ULONG vpc, ss, ds, dst, cpat, cloc, dm;
@@ -659,7 +686,13 @@ static void mod_video(void)
         (unsigned long)vpc, (int)(vpc & 1), pixfmt_name(fmt), (int)((vpc >> 8) & 1),
         (int)((vpc >> 27) & 1), (vpc & 2) ? "X11" : "Windows", (int)((vpc >> 10) & 1),
         (int)((vpc >> 12) & 1), (int)((vpc >> 26) & 1));
+    res(R_INFO, "vidProcCfg (2)", vpc,
+        "desktop-tile=%d overlay-tile=%d overlay-fmt=%lu filter=%lu chroma=%d inv=%d h/v-scale=%d/%d",
+        (int)((vpc >> 24) & 1), (int)((vpc >> 25) & 1), (unsigned long)((vpc >> 21) & 7),
+        (unsigned long)((vpc >> 16) & 3), (int)((vpc >> 5) & 1), (int)((vpc >> 6) & 1),
+        (int)((vpc >> 14) & 1), (int)((vpc >> 15) & 1));
     res(R_INFO, "screen size", ss, "%lux%lu", (unsigned long)w, (unsigned long)h);
+    g_scr_h = h;
     res(R_INFO, "desktop start", ds, "0x%06lX", (unsigned long)(ds & 0xffffff));
     res(R_INFO, "desktop/overlay stride", dst, "desktop %lu bytes  overlay %lu bytes",
         (unsigned long)stride, (unsigned long)((dst >> 16) & 0x7fff));
@@ -756,7 +789,8 @@ static void mod_3d_regs(void)
  * ========================================================================= */
 static void mod_vga(void)
 {
-    UBYTE misc, seqidx, crtidx, seq[5], crt[25];
+    UBYTE misc, seqidx, crtidx, seq[5], crt[0x1c];
+    ULONG vde;
     int i;
     char buf[100];
 
@@ -772,7 +806,7 @@ static void mod_vga(void)
         g_dev->OutByte(g_io + VGA_IO(0x3C4), (UBYTE)i);
         seq[i] = g_dev->InByte(g_io + VGA_IO(0x3C5));
     }
-    for (i = 0; i < 25; i++) {
+    for (i = 0; i < 0x1c; i++) {
         g_dev->OutByte(g_io + VGA_IO(0x3D4), (UBYTE)i);
         crt[i] = g_dev->InByte(g_io + VGA_IO(0x3D5));
     }
@@ -786,8 +820,17 @@ static void mod_vga(void)
              crt[0], crt[1], crt[2], crt[3], crt[4], crt[5], crt[6], crt[7], crt[8], crt[9],
              crt[0x12], crt[0x13]);
     res(R_INFO, "CRTC 0-9,12h,13h", crt[0], "%s", buf);
-    res(R_INFO, "CRTC h-total/v-disp", crt[0], "htotal=%u vdisp-end(low)=%u",
-        (unsigned)crt[0], (unsigned)crt[0x12]);
+    res(R_INFO, "CRTC h-total/v-disp", crt[0], "htotal=%u vdisp-end(low)=%u ext 1Ah=%02X 1Bh=%02X",
+        (unsigned)crt[0], (unsigned)crt[0x12], crt[0x1a], crt[0x1b]);
+    /* display end: CR12 + CR07 bit1 (bit 8) + bit6 (bit 9) + CR1B bit2 (bit 10) */
+    vde = crt[0x12] | ((ULONG)(crt[7] & 0x02) << 7) | ((ULONG)(crt[7] & 0x40) << 3) |
+          ((ULONG)(crt[0x1b] & 0x04) << 8);
+    if (g_scr_h) {
+        res(vde + 1 == g_scr_h ? R_OK : R_INFO, "CRTC vs vidScreenSize", vde,
+            "CRTC display lines %lu, vidScreenSize height %lu%s", (unsigned long)(vde + 1),
+            (unsigned long)g_scr_h,
+            vde + 1 == g_scr_h ? "" : "  (differ: driver programs CR12 = height, not height-1)");
+    }
 }
 
 /* =========================================================================
@@ -1203,6 +1246,61 @@ static void mod_func_2d(void)
         }
     }
 
+    /* --- f) colour pattern registers (spec: 0x44/0x48 alias colorPattern
+     *        [0]/[1] at 0x100/0x104; 0x100.. are pattern registers only) - */
+    if (!g_func_abort) {
+        ULONG p0 = r2d_rd(R2D_pattern), p1 = r2d_rd(R2D_pattern + 4);
+        ULONG dba = r2d_rd(R2D_dstBaseAddr), dfm = r2d_rd(R2D_dstFormat);
+        ULONG a, b, dba2, dfm2;
+
+        r2d_wr(R2D_pattern0Alias, 0x13579BDFUL);
+        a = r2d_rd(R2D_pattern);
+        r2d_wr(R2D_pattern + 4, 0x2468ACE0UL);
+        b = r2d_rd(R2D_pattern1Alias);
+        r2d_wr(R2D_pattern, 0x00123400UL);
+        dba2 = r2d_rd(R2D_dstBaseAddr);
+        dfm2 = r2d_rd(R2D_dstFormat);
+        res(a == 0x13579BDFUL ? R_OK : R_FAIL, "pattern0Alias -> colorPattern[0]", a,
+            "0x100 reads 0x%08lX (expected 0x13579BDF)", (unsigned long)a);
+        res(b == 0x2468ACE0UL ? R_OK : R_FAIL, "colorPattern[1] -> pattern1Alias", b,
+            "0x48 reads 0x%08lX (expected 0x2468ACE0)", (unsigned long)b);
+        res(dba2 == dba && dfm2 == dfm ? R_OK : R_FAIL, "0x100 is a pattern register", dba2,
+            "dstBaseAddr 0x%06lX -> 0x%06lX, dstFormat 0x%08lX -> 0x%08lX",
+            (unsigned long)dba, (unsigned long)dba2, (unsigned long)dfm, (unsigned long)dfm2);
+        r2d_wr(R2D_dstBaseAddr, dba);
+        r2d_wr(R2D_dstFormat, dfm);
+        r2d_wr(R2D_pattern, p0);
+        r2d_wr(R2D_pattern + 4, p1);
+    }
+
+    /* --- g) opaque mono pattern, ROP 0xF0 (PATCOPY): pattern bit 1 =
+     *        colorFore, bit 0 = colorBack; rows of 0xAA alternate ---------- */
+    if (!g_func_abort) {
+        ULONG p0 = r2d_rd(R2D_pattern0Alias), p1 = r2d_rd(R2D_pattern1Alias);
+        ULONG fg = g_tbpp == 1 ? 0x33 : g_tbpp == 2 ? 0xF800 : 0x00FF0000UL;
+        ULONG bg = g_tbpp == 1 ? 0x44 : g_tbpp == 2 ? 0x001F : 0x000000FFUL;
+        ULONG c0, c1, c2;
+        blt_setup_dst();
+        r2d_wr(R2D_pattern0Alias, 0xAAAAAAAAUL);
+        r2d_wr(R2D_pattern1Alias, 0xAAAAAAAAUL);
+        r2d_wr(R2D_colorFore, fg);
+        r2d_wr(R2D_colorBack, bg);
+        r2d_wr(R2D_dstSize, (1UL << 16) | 8);
+        r2d_wr(R2D_dstXY, (ULONG)(2 * TBM_H + 6) << 16);
+        if (blt_go(0xF0000000UL | CMD2D_PATTERN_MONO | CMD2D_RECTFILL)) {
+            c0 = px_read(0, 2 * TBM_H + 6);
+            c1 = px_read(1, 2 * TBM_H + 6);
+            c2 = px_read(2, 2 * TBM_H + 6);
+            res(c0 != c1 && c0 == c2 ? R_OK : R_FAIL, "mono pattern fill 0xF0", c0,
+                "x0=0x%08lX x1=0x%08lX x2=0x%08lX (x0==x2, x0!=x1 expected)",
+                (unsigned long)c0, (unsigned long)c1, (unsigned long)c2);
+        } else {
+            res(R_FAIL, "mono pattern fill 0xF0", 0, "engine timeout");
+        }
+        r2d_wr(R2D_pattern0Alias, p0);
+        r2d_wr(R2D_pattern1Alias, p1);
+    }
+
     restore_2d();
     IExec->Permit();
     unlock_test_bitmap();
@@ -1213,6 +1311,7 @@ static void mod_func_2d(void)
 
 /* MODULE 13 (FUNC3D) -- 3D fastfill into the test bitmap */
 static ULONG g_tri_inside = 0, g_tri_outside = 0;
+static ULONG g_nop0_out = 0, g_nop1_out = 0;
 static int   g_tri_ok = 0;
 
 static void mod_func_3d(void)
@@ -1280,6 +1379,15 @@ static void mod_func_3d(void)
     }
     pin  = r3d_rd(R3D_fbiPixelsIn);
     pout = r3d_rd(R3D_fbiPixelsOut);
+    /* spec 8.17: nopCMD clears the fbi counters only with bit 0 set */
+    r3d_wr(R3D_nopCMD, 0);
+    mmio_sync();
+    wait_idle(2000000);
+    g_nop0_out = r3d_rd(R3D_fbiPixelsOut);
+    r3d_wr(R3D_nopCMD, 1);
+    mmio_sync();
+    wait_idle(2000000);
+    g_nop1_out = r3d_rd(R3D_fbiPixelsOut);
     IExec->Permit();
     unlock_test_bitmap();
 
@@ -1297,6 +1405,13 @@ static void mod_func_3d(void)
     res((pout & 0xffffff) ? R_OK : R_WARN, "pixel counters", pout,
         "after triangle: in=%lu out=%lu (expected about 700)", (unsigned long)(pin & 0xffffff),
         (unsigned long)(pout & 0xffffff));
+    if (pout & 0xffffff) {
+        res((g_nop0_out & 0xffffff) == (pout & 0xffffff) ? R_OK : R_FAIL, "nopCMD(0) keeps counters",
+            g_nop0_out, "fbiPixelsOut %lu -> %lu", (unsigned long)(pout & 0xffffff),
+            (unsigned long)(g_nop0_out & 0xffffff));
+    }
+    res((g_nop1_out & 0xffffff) == 0 ? R_OK : R_FAIL, "nopCMD(1) clears counters", g_nop1_out,
+        "fbiPixelsOut after nopCMD(1) = %lu", (unsigned long)(g_nop1_out & 0xffffff));
 }
 
 /* MODULE 14 (FIFO) -- CMDFIFO type-2 packet writing 2D colorBack */

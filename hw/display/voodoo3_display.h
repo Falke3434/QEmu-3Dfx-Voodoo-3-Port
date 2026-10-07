@@ -1,7 +1,7 @@
 /*
- * QEMU 3Dfx Voodoo 3 — Display subsystem header
+ * QEMU 3Dfx Voodoo 3 — display subsystem header
  *
- * Copyright (C) 2026 <your name here>
+ * QEMU port: https://github.com/Falke3434/QEmu-3Dfx-Voodoo-3-Port
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -16,16 +16,7 @@ typedef struct Voodoo3State Voodoo3State;
 /* Number of dirty-line tracking slots (max vertical resolution tracked) */
 #define V3_DIRTY_LINES  2048
 
-/*
- * Dither table initialisation (now a no-op; tables are static const data).
- * Call once at device realise time for forward compatibility.
- */
-void voodoo3_init_dither_tables(void);
-
-/*
- * Hardware-accurate dither lookup tables — include the dedicated header for
- * the full set (4×4, 2×2, dithersub variants).
- */
+/* Dither lookup tables (static const data, from 86Box) */
 #include "hw/display/voodoo3_dither_tables.h"
 
 /* NCC (YIQ) lookup table update — call when nccTable regs change */
@@ -39,8 +30,9 @@ void voodoo3_swap_buffer(Voodoo3State *s, uint32_t cmd_val);
 
 /* Called from vblank callback — perform flip if swap_interval elapsed */
 void voodoo3_do_swap_if_pending(Voodoo3State *s);
+void voodoo3_swap_count_dec(Voodoo3State *s);
 
-/* Dirty-line-aware display blit — only redraws changed scanlines */
+/* Convert the rows flagged in dirty_line[] to the console surface */
 void voodoo3_update_display_dirty(Voodoo3State *s);
 
 /* Build the RGB565 -> XRGB8888 lookup table (idempotent) */

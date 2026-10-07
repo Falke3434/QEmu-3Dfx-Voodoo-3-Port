@@ -1,14 +1,16 @@
 /*
- * QEMU 3Dfx Voodoo 3 — Display, FastFill, SwapBuffer, NCC
+ * QEMU 3Dfx Voodoo 3 — display output, fastfill, swapbuffer, NCC,
+ * hardware cursor and video overlay
  *
  * Ported from 86Box:
- *   vid_voodoo_display.c  — voodoo_update_ncc(), dirty-line display output
+ *   vid_voodoo_display.c  — voodoo_update_ncc(), screen filter
  *   vid_voodoo_blitter.c  — voodoo_fastfill()
  *   vid_voodoo_reg.c      — swapbufferCMD logic
+ *   vid_voodoo_banshee.c  — hardware cursor, overlay
  *
  * Original author: Sarah Walker <https://pcem-emulator.co.uk/>
  * Copyright (C) 2008-2024 Sarah Walker and 86Box contributors
- * Copyright (C) 2026 <your name here>
+ * QEMU port: https://github.com/Falke3434/QEmu-3Dfx-Voodoo-3-Port
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -23,32 +25,6 @@
 #include "qemu/bswap.h"
 #include "qemu/atomic.h"
 #include "qemu/bitmap.h"
-
-/*
- * Dither tables are now provided by voodoo3_dither_tables.c, which contains
- * the verbatim hardware-accurate lookup tables from 86Box vid_voodoo_dither.h.
- *
- * The previous runtime Bayer-matrix approximation has been removed because
- * its thresholds differed from real Voodoo hardware, causing visibly wrong
- * dithered gradients in RGB565 mode (especially in 3D games that rely on
- * ordered dithering for smooth colour transitions).
- *
- * Table layout:
- *   voodoo3_dither_rb[256][4][4]      4×4 forward dither, R and B → 5-bit
- *   voodoo3_dither_g[256][4][4]       4×4 forward dither, G       → 6-bit
- *   voodoo3_dither_rb2x2[256][2][2]   2×2 forward dither, R and B → 5-bit
- *   voodoo3_dither_g2x2[256][2][2]    2×2 forward dither, G       → 6-bit
- *   voodoo3_dithersub_rb[256][4][4]   4×4 subtraction dither, R/B
- *   voodoo3_dithersub_g[256][4][4]    4×4 subtraction dither, G
- *   voodoo3_dithersub_rb2x2[256][2][2] 2×2 subtraction dither, R/B
- *   voodoo3_dithersub_g2x2[256][2][2]  2×2 subtraction dither, G
- *
- * voodoo3_init_dither_tables() is now a no-op kept for API compatibility.
- */
-void voodoo3_init_dither_tables(void)
-{
-    /* Nothing to do — tables are static const data in voodoo3_dither_tables.c */
-}
 
 /* =========================================================================
  * NCC (Naïve Colour Compression) table update
@@ -102,8 +78,8 @@ void voodoo3_update_ncc(Voodoo3State *s, int tmu)
  *
  * Ported from 86Box voodoo_fastfill() in vid_voodoo_blitter.c.
  * ========================================================================= */
-#define FBZ_RGB_WMASK   (1 << 9)   /* 86Box: was 1 << 10 */
-#define FBZ_DEPTH_WMASK (1 << 10)  /* 86Box: was 1 << 12 */
+#define FBZ_RGB_WMASK   (1 << 9)
+#define FBZ_DEPTH_WMASK (1 << 10)
 #define FBZ_Y_ORIGIN    (1 << 17)
 
 void voodoo3_fastfill(Voodoo3State *s)
@@ -120,97 +96,47 @@ void voodoo3_fastfill(Voodoo3State *s)
         high_y = p->clipHighY;
     }
 
-    /* 86Box voodoo_fastfill(): bounded only by the clip rectangle — the
-     * target is usually an off-screen back buffer, so clamping to the
-     * visible screen height (as before) dropped fills. */
+    /* 86Box voodoo_fastfill(): bounded only by the clip rectangle (the
+     * target is usually an off-screen back buffer) */
     if (low_y < 0) low_y = 0;
     if (high_y > 2048) high_y = 2048;
 
     /* --- Colour buffer fill --- */
     if (p->fbzMode & FBZ_RGB_WMASK) {
-        /*
-         * FIX 3: dispatch on pix_format so 32bpp framebuffers are filled
-         * with 32-bit words rather than 16-bit words.
-         *
-         * pix_format == 3 (RGB32/XRGB8888): write color1 directly as a
-         * 32-bit XRGB value.  The rasterizer stores colour in color1 as
-         * 0x00RRGGBB (same wire format as XRGB8888 with X=0); we set the
-         * X byte to 0xFF so the display output path treats every pixel as
-         * fully opaque, matching hardware behaviour.
-         *
-         * All other formats (0=8bpp palette, 1=RGB565, 2=RGB24) use the
-         * existing 16-bit path which is correct for RGB565 (the only
-         * format the Voodoo3 3D engine writes in tiled mode) and
-         * acceptable for 8bpp (fastfill with palette index from LSB of
-         * color1).
-         */
-        /* The 3D colour buffer is always RGB565 (86Box writes 16-bit
-         * unconditionally).  The desktop format used here before made 3D
-         * clears write 32-bit pixels whenever the Workbench ran in 32 bpp. */
-        if (0) {
-            /* 32bpp fill */
-            /* SGRAM holds pixels in CPU (big-endian) byte order */
-            uint32_t col32 = v3_px32(s, 0xff000000u | (p->color1 & 0x00ffffffu));
+        /* The 3D colour buffer is always RGB565 (86Box writes 16 bit
+         * regardless of the desktop format). */
+        uint8_t r = (uint8_t)(((p->color1 >> 16) & 0xff) >> 3);
+        uint8_t g = (uint8_t)(((p->color1 >>  8) & 0xff) >> 2);
+        uint8_t b = (uint8_t)( (p->color1        & 0xff) >> 3);
+        uint16_t col = v3_px16(s, (uint16_t)((r << 11) | (g << 5) | b));
 
-            for (int y = low_y; y < high_y; y++) {
-                uint32_t *row;
-                if (p->col_tiled)
-                    row = (uint32_t *)(s->fb_mem + p->draw_offset
-                          + (size_t)(y >> 5) * p->row_width
-                          + (size_t)(y & 31) * 128);
-                else
-                    row = (uint32_t *)(s->fb_mem + p->draw_offset
-                          + (size_t)y * p->row_width);
-
-                for (int x = p->clipLeft; x < p->clipRight; x++) {
-                    if (p->col_tiled) {
-                        /* 32bpp tiled: 32 pixels per 128-byte strip */
-                        int xt = (x & 31) | ((x >> 5) * 128 * 32 / 4);
-                        row[xt] = col32;
-                    } else {
-                        row[x] = col32;
-                    }
-                }
-
-                voodoo3_vram_mark_dirty(s, (uint32_t)((uint8_t *)row - s->fb_mem),
-                    p->col_tiled ? (uint32_t)(p->clipRight >> 6) * 4096u + 128u
-                                 : (uint32_t)p->clipRight * 4u);
+        for (int y = low_y; y < high_y; y++) {
+            uint16_t *row;
+            size_t roff = p->col_tiled
+                ? (size_t)p->draw_offset + (size_t)(y >> 5) * p->row_width
+                  + (size_t)(y & 31) * 128
+                : (size_t)p->draw_offset + (size_t)y * p->row_width;
+            size_t span = p->col_tiled
+                ? (size_t)(p->clipRight >> 6) * 4096u + 128u
+                : (size_t)p->clipRight * 2u;
+            if (roff + span > s->fb_size) {
+                break;                         /* stay inside SGRAM */
             }
-        } else {
-            /* 16bpp (RGB565) and 8bpp fill — original path */
-            uint8_t r = (uint8_t)(((p->color1 >> 16) & 0xff) >> 3);
-            uint8_t g = (uint8_t)(((p->color1 >>  8) & 0xff) >> 2);
-            uint8_t b = (uint8_t)( (p->color1        & 0xff) >> 3);
-            uint16_t col = v3_px16(s, (uint16_t)((r << 11) | (g << 5) | b));
+            row = (uint16_t *)(s->fb_mem + roff);
 
-            for (int y = low_y; y < high_y; y++) {
-                uint16_t *row;
-                size_t roff = p->col_tiled
-                    ? (size_t)p->draw_offset + (size_t)(y >> 5) * p->row_width
-                      + (size_t)(y & 31) * 128
-                    : (size_t)p->draw_offset + (size_t)y * p->row_width;
-                size_t span = p->col_tiled
-                    ? (size_t)(p->clipRight >> 6) * 4096u + 128u
-                    : (size_t)p->clipRight * 2u;
-                if (roff + span > s->fb_size) {
-                    break;                         /* stay inside SGRAM */
+            for (int x = p->clipLeft; x < p->clipRight; x++) {
+                if (p->col_tiled) {
+                    int xt = (x & 63) | ((x >> 6) * 128 * 32 / 2);
+                    row[xt] = col;
+                } else {
+                    row[x] = col;
                 }
-                row = (uint16_t *)(s->fb_mem + roff);
-
-                for (int x = p->clipLeft; x < p->clipRight; x++) {
-                    if (p->col_tiled) {
-                        int xt = (x & 63) | ((x >> 6) * 128 * 32 / 2);
-                        row[xt] = col;
-                    } else {
-                        row[x] = col;
-                    }
-                }
-
-                /* dirty by SGRAM address (display + texture cache) */
-                voodoo3_vram_mark_dirty(s, (uint32_t)roff,
-                    p->col_tiled ? (uint32_t)(p->clipRight >> 6) * 4096u + 128u
-                                 : (uint32_t)p->clipRight * 2u);
             }
+
+            /* dirty by SGRAM address (display + texture cache) */
+            voodoo3_vram_mark_dirty(s, (uint32_t)roff,
+                p->col_tiled ? (uint32_t)(p->clipRight >> 6) * 4096u + 128u
+                             : (uint32_t)p->clipRight * 2u);
         }
     }
 
@@ -257,13 +183,11 @@ void voodoo3_swap_buffer(Voodoo3State *s, uint32_t val)
     /*
      * Banshee/Voodoo3 (86Box vid_voodoo_reg.c, swapbufferCMD for
      * VOODOO_BANSHEE): the swap shows leftOverlayBuf through the video
-     * OVERLAY.  It never moves the desktop.  The old code flipped
-     * vidDesktopStartAddr to the 3D draw buffer, so a windowed Warp3D
-     * program (CoW3D, MiniGL) briefly turned the whole Workbench into its
-     * 640-pixel back buffer on every frame (stripes / doubled screen).
+     * OVERLAY.  It never moves the desktop (vidDesktopStartAddr).
      */
     s->frame_count++;
     if (!(val & 1)) {
+        voodoo3_swap_count_dec(s);
         s->overlay_addr = s->leftOverlayBuf;
         s->params.front_offset = s->leftOverlayBuf;
         if (s->vidProcCfg & VIDPROCCFG_OVERLAY_ENABLE) {
@@ -275,6 +199,20 @@ void voodoo3_swap_buffer(Voodoo3State *s, uint32_t val)
     s->swap_offset   = s->leftOverlayBuf;
     s->swap_pending  = true;
     s->retrace_count = 0;
+}
+
+/* 86Box: "if (swap_count > 0) swap_count--" */
+void voodoo3_swap_count_dec(Voodoo3State *s)
+{
+    int old = qatomic_read(&s->swap_count);
+
+    while (old > 0) {
+        int seen = qatomic_cmpxchg(&s->swap_count, old, old - 1);
+        if (seen == old) {
+            break;
+        }
+        old = seen;
+    }
 }
 
 /* Called from vblank timer — perform the actual flip if interval elapsed */
@@ -289,6 +227,7 @@ void voodoo3_do_swap_if_pending(Voodoo3State *s)
     s->params.front_offset = s->swap_offset;
     s->overlay_addr        = s->swap_offset;
     s->swap_pending        = false;
+    voodoo3_swap_count_dec(s);
     s->retrace_count       = 0;
     if (!(s->vidProcCfg & VIDPROCCFG_OVERLAY_ENABLE)) {
         return;
@@ -299,15 +238,13 @@ void voodoo3_do_swap_if_pending(Voodoo3State *s)
 }
 
 /* =========================================================================
- * Display output with dirty-line tracking
+ * Display output
  *
- * Ported from 86Box voodoo_callback() in vid_voodoo_display.c.
- *
- * Rather than blitting the entire framebuffer every vblank (expensive),
- * we only update lines that have been written by the rasterizer.
- * Each scanline rendered sets dirty_line[y]=1; we clear it after copying.
- *
- * This is the QEMU equivalent of 86Box's dirty_line[] + svga_doblit().
+ * Rows flagged in dirty_line[] are converted from SGRAM to the console
+ * surface (the QEMU counterpart of 86Box dirty_line[] + svga_doblit()).
+ * voodoo3_display_apply_dirty() derives the flags from dirty SGRAM pages
+ * and cursor changes; voodoo3_update_display() (voodoo3.c) currently
+ * flags every row on every refresh.
  * ========================================================================= */
 /* RGB565 -> XRGB8888 (0xffRRGGBB), 256 KiB, built once */
 static uint32_t v3_rgb565_lut[65536];
@@ -493,7 +430,7 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
             uint64_t end  = s->desktop_tiled
                 ? (uint64_t)s->desktop_start + (uint64_t)(y >> 5) * s->desktop_stride
                   + (uint64_t)(y & 31) * 128u
-                  + ((uint64_t)((w * sbpp) >> 7) + 1) * 4096u
+                  + (uint64_t)((((w * sbpp) + 127) >> 7) - 1) * 4096u + 128u
                 : (uint64_t)s->desktop_start + (uint64_t)y * s->desktop_stride
                   + (uint64_t)w * sbpp;
             if (end > s->fb_size) {
@@ -559,12 +496,8 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
                 const uint16_t *src = (const uint16_t *)src_row;
                 if (dst_bpp == 4) {
                     uint32_t *dst = (uint32_t *)dst_row;
-                    /*
-                     * Big-endian RGB565 (as written by the PPC guest) via a
-                     * 64K lookup table.  lduw_be_p() makes the result
-                     * independent of the host byte order (bswap16() on a
-                     * host-native load was only correct on LE hosts).
-                     */
+                    /* RGB565 via the 64K lookup table; v3_ld16() applies the
+                     * byte order selected by the driver (miscInit0 swizzle) */
                     for (int x = 0; x < w; x++) {
                         dst[x] = v3_rgb565_lut[v3_ld16(s, &src[x])];
                     }
@@ -603,11 +536,8 @@ void voodoo3_update_display_dirty(Voodoo3State *s)
             {
                 const uint32_t *src = (const uint32_t *)src_row;
                 if (dst_bpp == 4) {
-                    /*
-                     * 32-bpp pixels are stored big-endian (ARGB byte order,
-                     * as written by the PPC guest through the RAM-backed
-                     * BAR1).  ldl_be_p() yields 0xAARRGGBB on every host.
-                     */
+                    /* v3_ld32() applies the byte order selected by the driver
+                     * (miscInit0 swizzle) and yields 0xAARRGGBB */
                     uint32_t *dst = (uint32_t *)dst_row;
                     for (int x = 0; x < w; x++) {
                         dst[x] = v3_ld32(s, &src[x]);
@@ -956,11 +886,11 @@ void voodoo3_draw_cursor(Voodoo3State *s,
  *   H: ov.vidOverlayDudx = source X step in 20.12 fixed-point
  *      (1<<20 = no scaling, <1<<20 = upscale, >1<<20 = downscale)
  *   V: ov.vidOverlayDvdy = source Y step in 20.12 fixed-point
- *      ov.src_y accumulates; integer part = source line index
+ *      source line = ((line - start_y) * dvdy) >> 20
  *
  * Filtering:
- *   BILINEAR: vertical bilinear between current and next source line.
- *   POINT / DITHER4X4 / DITHER2X2: nearest-neighbour (no filter tables).
+ *   BILINEAR: 2D bilinear with horizontal scaling, otherwise vertical only.
+ *   POINT / DITHER4X4 / DITHER2X2: nearest-neighbour.
  *
  * Chroma-key: if vidChromaKeyMin/Max match the desktop pixel at the same
  * screen coordinate, the overlay pixel is written; otherwise skipped.
@@ -1177,13 +1107,15 @@ static bool ov_chroma_key(Voodoo3State *s, int scr_x, int scr_y)
  *   ov.src_y tracks the current source line (integer = y >> 20, frac = y & 0xfffff).
  *   For each display line, src_y += vidOverlayDvdy (V scale step).
  *   For each display pixel, src_x += vidOverlayDudx (H scale step).
- *   src_y and src_x are reset to 0 on each new frame (vblank callback).
+ *   src_y is derived from the screen line (no state carried between
+ *   refreshes); src_x restarts at 0 on every line.
  *
  * Filtering (VIDPROCCFG_FILTER_MODE_*):
- *   POINT / DITHER4X4 / DITHER2X2 → nearest-neighbour (86Box scrfilter path
- *   is not ported; the emulator-option path = nearest-neighbour is used).
- *   BILINEAR → vertical blend between buf[0] (current line) and buf[1]
- *   (next source line) using the fractional part of src_y as coefficient.
+ *   POINT / DITHER4X4 / DITHER2X2 → nearest-neighbour (86Box's dither
+ *   filter for the overlay is not ported).
+ *   BILINEAR → with horizontal scaling a 2D blend of buf[0] (current line)
+ *   and buf[1] (next line); without horizontal scaling a vertical blend
+ *   using the fractional part of src_y.
  */
 void voodoo3_overlay_draw(Voodoo3State *s,
                           uint8_t *dst_base, int dst_bpp, int dst_pitch,
@@ -1199,12 +1131,8 @@ void voodoo3_overlay_draw(Voodoo3State *s,
     if (s->vidProcCfg & VIDPROCCFG_OVERLAY_TILE)
         ov_pitch *= 128u * 32u;
 
-    /* Base VRAM address of overlay surface — addr word 0 of overlay region.
-     * 86Box: svga->overlay_latch.addr = (vidDesktopOverlayStride bits[30:16]) × stride.
-     * We use ov_pitch as both the VRAM base stride and the line pitch.
-     * The actual start address comes from the start coordinate relative
-     * to the desktop start, consistent with 86Box behaviour. */
-    /* 86Box: overlay.addr = leftOverlayBuf (set by swapbufferCMD) */
+    /* Overlay surface start: leftOverlayBuf / swapbufferCMD (86Box
+     * overlay.addr) */
     uint32_t ov_base = s->overlay_addr;
 
     uint32_t filter = s->vidProcCfg & VIDPROCCFG_FILTER_MODE_MASK;
@@ -1220,15 +1148,24 @@ void voodoo3_overlay_draw(Voodoo3State *s,
     if (ov_x0 >= scr_w) return;
     if (ov_x0 + ov_w > scr_w) ov_w = scr_w - ov_x0;
 
+    /*
+     * Source line accumulator in 12.20 fixed point.  86Box keeps it in the
+     * device and restarts it at the overlay's first line of every frame;
+     * here it is computed from the screen line, so it cannot run away
+     * between refreshes (it used to grow forever: the overlay image
+     * crawled across the screen).
+     */
+    int64_t y_step = v_scale ? (int64_t)s->ov.vidOverlayDvdy : (int64_t)1 << 20;
+
     for (int scr_y = dirty_lo; scr_y <= dirty_hi; scr_y++) {
         /* Only draw within the overlay vertical extent */
         if (scr_y < s->ov.start_y || scr_y >= s->ov.end_y)
             continue;
 
-        /* Source line index from accumulated src_y */
-        int   src_line  = s->ov.src_y >> 20;
+        int64_t src_y   = (int64_t)(scr_y - s->ov.start_y) * y_step;
+        int   src_line  = (int)(src_y >> 20);
         /* Y fractional part for bilinear filter (0..0xfffff → 0..0xffff) */
-        unsigned int y_coeff = (unsigned int)((s->ov.src_y & 0xfffffu) >> 4);
+        unsigned int y_coeff = (unsigned int)((src_y & 0xfffff) >> 4);
 
         /* Compute source addresses for current and next lines */
         uint32_t src_addr0, src_addr1;
@@ -1351,11 +1288,5 @@ void voodoo3_overlay_draw(Voodoo3State *s,
 next_pixel:
             if (h_scale) src_x += s->ov.vidOverlayDudx;
         }
-
-        /* Advance source Y accumulator */
-        if (v_scale)
-            s->ov.src_y += (int32_t)s->ov.vidOverlayDvdy;
-        else
-            s->ov.src_y += (1 << 20);  /* 1.0 in 20.12 = advance one source line */
     }
 }

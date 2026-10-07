@@ -1,42 +1,26 @@
 /*
- * QEMU 3Dfx Voodoo 3 — Pixel Rasterizer
+ * QEMU 3Dfx Voodoo 3 -- pixel rasterizer and LFB write pipeline
  *
- * Ported from 86Box vid_voodoo_render.c
+ * Ported from 86Box vid_voodoo_render.c and vid_voodoo_fb.c
  * Original author: Sarah Walker <https://pcem-emulator.co.uk/>
  * Copyright (C) 2008-2024 Sarah Walker and 86Box contributors
- * Copyright (C) 2026 <your name here>
+ * QEMU port: https://github.com/Falke3434/QEmu-3Dfx-Voodoo-3-Port
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * -------------------------------------------------------------------------
- * What this file contains
- * -------------------------------------------------------------------------
- * voodoo3_triangle()       — full triangle rasterizer entry point
- *                             (ported from voodoo_triangle + voodoo_half_triangle)
+ * voodoo3_triangle()       triangle entry point, called by every render
+ *                          thread for every queued triangle; each thread
+ *                          draws only its own scanlines
+ * voodoo3_fb_writel/w()    LFB writes through the 3D pipeline (lfbMode)
+ * voodoo3_gap_scan_triangle()  gap tracker, once per triangle at queue time
  *
- * The following sub-systems are included:
- *  - Scanline edge-walk (dxAB / dxAC / dxBC sub-pixel exact)
- *  - Clipping (left/right/top/bottom, both clip rectangles)
- *  - Sub-pixel parameter correction (FBZ_PARAM_ADJUST)
- *  - Depth/W-buffer (Z-compare: LT / GT / LE / GE / EQ / NE / ALWAYS / NEVER)
- *  - Stipple patterns (both rotating and pattern modes)
- *  - fbzColorPath colour combine (all CC_MSELECT / CC_ADD modes)
- *  - Alpha test
- *  - Fog (linear, per-table, z-based)
- *  - Alpha blend (all src/dst factors)
- *  - 4×4 and 2×2 ordered dither (RGB565 output)
- *  - Pixel write-back to framebuffer (tiled and linear)
- *  - Depth/alpha write-back to aux buffer
- *  - Flat-shaded (no texture) path fully implemented
- *  - Perspective-correct texture fetch (voodoo_tmu_fetch)
- *  - Bilinear filtering (tex_read_4 / tex_read)
- *  - Dual-TMU colour blend (voodoo_tmu_fetch_and_blend)
+ * Covered: edge walk with sub-pixel start, clipping, stipple, depth/W
+ * buffer, chroma key, TMU fetch (perspective, bilinear, LOD, mirror, clamp)
+ * and the TMU1 -> TMU0 combine chain, fbzColorPath colour/alpha combine,
+ * fog, alpha test, alpha blend, 4x4/2x2 ordered dither, colour and aux
+ * write-back (linear and tiled).
  *
- * NOT yet ported (stubs only):
- *  - Texture cache (tex[] pointers filled by voodoo3_use_texture)
- *  - x86-64 / ARM64 JIT recompiler path (NO_CODEGEN forced)
- *  - SLI (single-GPU only)
- * -------------------------------------------------------------------------
+ * Not ported: the x86-64/ARM64 JIT of 86Box (interpreter only) and SLI.
  */
 
 #include "qemu/osdep.h"
@@ -47,11 +31,11 @@
 #include "hw/display/voodoo3_texture.h"
 #include "hw/display/voodoo3_display.h"
 
-#include <math.h>   /* log2() for LOD calc */
+#include <math.h>
 
 /* =========================================================================
  * fbzColorPath / fbzMode / alphaMode / textureMode bit definitions
- * Kept local to this file — mirror the 86Box vid_voodoo_regs.h values.
+ * Kept local to this file; values as in 86Box vid_voodoo_regs.h.
  * ========================================================================= */
 
 /* fbzColorPath */
@@ -65,7 +49,6 @@
 #define FBZCP_CC_MSELECT(r)         (((r) >> 10) & 7)
 #define FBZCP_CC_REVERSE_BLEND(r)   (!!((r) & (1 << 13)))
 #define FBZCP_CC_ADD(r)             (((r) >> 14) & 3)
-#define FBZCP_CC_ADD_ALOCAL(r)      (!!((r) & (1 << 15)))
 #define FBZCP_CC_INVERT_OUT(r)      (!!((r) & (1 << 16)))
 #define FBZCP_CCA_ZERO_OTHER(r)     (!!((r) & (1 << 17)))
 #define FBZCP_CCA_SUB_CLOCAL(r)     (!!((r) & (1 << 18)))
@@ -74,7 +57,7 @@
 #define FBZCP_CCA_ADD(r)            (((r) >> 23) & 3)
 #define FBZCP_CCA_INVERT_OUT(r)     (!!((r) & (1 << 25)))
 #define FBZCP_TEXTURE_ENABLED(r)    (!!((r) & (1 << 27)))
-#define FBZCP_PARAM_ADJUST(r)       (!!((r) & (1 << 30)))
+#define FBZCP_PARAM_ADJUST(r)       (!!((r) & (1 << 26)))
 
 /* fbzMode */
 #define FBZ_ENABLE_CLIPPING     (1 << 0)
@@ -83,7 +66,6 @@
 #define FBZ_W_BUFFER            (1 << 3)
 #define FBZ_DEPTH_ENABLE        (1 << 4)
 #define FBZ_DEPTH_OP_SHIFT      5
-#define FBZ_DEPTH_OP_MASK       (7 << FBZ_DEPTH_OP_SHIFT)
 #define FBZ_DEPTH_BIAS          (1 << 16)
 #define FBZ_DEPTH_SOURCE        (1 << 20)
 #define FBZ_RGB_WMASK           (1 << 9)
@@ -93,9 +75,8 @@
 #define FBZ_DITHER_2X2          (1 << 11)
 #define FBZ_ALPHA_ENABLE        (1 << 18)
 #define FBZ_Y_ORIGIN            (1 << 17)
-#define FBZ_CHROMAKEY           (1 << 1)    /* hardware fbzMode bit 1 */
-#define FBZ_DITHER_SUB          (1 << 19)   /* hardware fbzMode bit 19: subtraction dither */
-#define FBZ_PARAM_ADJUST        (1 << 30)   /* reuse bit from fbzColorPath */
+#define FBZ_CHROMAKEY           (1 << 1)
+#define FBZ_DITHER_SUB          (1 << 19)   /* subtraction dither of the destination */
 
 /* alphaMode */
 #define ALPHA_FUNC(r)   (((r) >> 1) & 7)
@@ -109,32 +90,18 @@
 #define FOG_ENABLE      (1 << 0)
 #define FOG_ADD         (1 << 1)
 #define FOG_MULT        (1 << 2)
-#define FOG_Z           (1 << 3)
-#define FOG_ALPHA       (1 << 4)
+#define FOG_ALPHA       (1 << 3)
+#define FOG_Z           (1 << 4)
 #define FOG_CONSTANT    (1 << 5)
-/* FOG_W: both Z and ALPHA bits set — use w>>32 directly (86Box: AFUNC_AOM_COLOR path) */
-#define FOG_W           (FOG_Z | FOG_ALPHA)
 
 /* textureMode */
 #define TEXMODE_PERSP_CORR  (1 << 0)
-#define TEXMODE_BILINEAR    (1 << 1)
 /*
- * TEXMODE_TRILINEAR — enables trilinear mipmap blending.
- * 86Box: TEXTUREMODE_TRILINEAR = (1 << 30) in vid_voodoo_regs.h.
- * The original port had this wrong as (1 << 2); corrected here.
- * When set and lod is odd, the blend-direction flag (cc_rev_blend /
- * cca_rev_blend) is inverted for the multiplier step — see 86Box
- * voodoo_render.c lines 445 and 544.
+ * Trilinear: on odd LODs the TMU combine inverts its blend direction
+ * (86Box TEXTUREMODE_TRILINEAR, applied in v3_tmu_combine()).
  */
 #define TEXMODE_TRILINEAR   (1u << 30)
-#define TEXMODE_LOCAL_MASK  0x00643000
-#define TEXMODE_LOCAL       0x00241000
-#define TEXMODE_PASSTHROUGH 0x00
-#define TEXMODE_TCLAMPS     (1 << 6)
-#define TEXMODE_TCLAMPT     (1 << 7)
-/* Mirroring lives in tLOD, not textureMode (86Box LOD_TMIRROR_S/T).
- * textureMode bits 17/18 are texture-combine bits and are set by most
- * drivers, so every texture used to be mirrored. */
+/* Mirroring is selected in tLOD (86Box LOD_TMIRROR_S/T), not textureMode */
 #define TLOD_TMIRROR_S      (1u << 28)
 #define TLOD_TMIRROR_T      (1u << 29)
 
@@ -144,14 +111,9 @@
 #define CC_MSELECT_AOTHER  2
 #define CC_MSELECT_ALOCAL  3
 #define CC_MSELECT_TEX     4    /* texture alpha */
-#define CC_MSELECT_TEXRGB  5    /* texture RGB (Voodoo2 and later) */
-/*
- * Detail-texture and LOD-fraction blend factors exist only in the TMU
- * combine unit (textureMode tc_mselect 4 / 5, see v3_tmu_combine).  An
- * earlier revision of this file moved them into the fbzColorPath selectors,
- * which made "multiply by texture alpha" / "multiply by texture RGB"
- * unusable in the colour combine unit.
- */
+#define CC_MSELECT_TEXRGB  5    /* texture RGB */
+/* Detail and LOD-fraction factors exist only in the TMU combine unit
+ * (textureMode tc_mselect 4/5, see v3_tmu_combine). */
 
 /* CCA selectors (fbzColorPath bits [21:19]) — 86Box CCA_MSELECT_* */
 #define CCA_MSELECT_ZERO     0
@@ -160,8 +122,7 @@
 #define CCA_MSELECT_ALOCAL2  3
 #define CCA_MSELECT_TEX      4  /* texture alpha */
 
-/* CC_ADD */
-#define CC_ADD_ZERO   0
+/* CC_ADD (bits 15:14, two independent bits) */
 #define CC_ADD_CLOCAL 1
 #define CC_ADD_ALOCAL 2
 
@@ -186,9 +147,9 @@
 #define DEPTH_OP_ALWAYS 7
 
 /* =========================================================================
- * Helper macros — identical semantics to 86Box
+ * Helper macros (86Box semantics)
  * ========================================================================= */
-/* glib defines CLAMP(x,low,high) with 3 args - override with our 1-arg version */
+/* glib defines a 3-argument CLAMP(); the render code uses 86Box's 1-arg one */
 #ifdef CLAMP
 #undef CLAMP
 #endif
@@ -297,7 +258,7 @@ typedef struct {
     int     tex_s, tex_t;
     int     clamp_s[2], clamp_t[2];
 
-    /* Texture data pointers (set from texture cache — currently NULL) */
+    /* Decoded texture per TMU and LOD (texture cache, tex_wire()) */
     uint32_t *tex[2][V3_LOD_MAX + 1];
     int      *tex_w_mask[2], *tex_h_mask[2], *tex_shift[2], *tex_lod[2];
 
@@ -417,15 +378,8 @@ static void v3_tmu_fetch(v3_state_t *st, const voodoo3_params_t *p,
     st->lod >>= 8;
     st->lod_int[tmu]  = st->lod;
 
-    /*
-     * Mask / row shift / mip index are per-LOD arrays (86Box:
-     * state->tex_w_mask[tmu][state->lod] ...).  They used to be read from
-     * element 0, i.e. always the LOD-0 geometry (256x256, shift 8): a
-     * 64x64 texture sampled at LOD 2 was addressed with a 256 texel row
-     * stride and LOD-0 coordinate scale, so only the first rows showed
-     * anything and the rest read zeros (MiniGL texturesurf: one rainbow
-     * strip, one dim strip, the sheet in between black).
-     */
+    /* Mask, row shift and mip index are per LOD (86Box
+     * state->tex_w_mask[tmu][state->lod] ...) */
     {
         int li = st->lod;
         if (li < 0) li = 0;
@@ -469,11 +423,6 @@ static void v3_tmu_fetch(v3_state_t *st, const voodoo3_params_t *p,
  *   30 trilinear
  *
  * mselect: 0 zero, 1 Clocal, 2 Aother, 3 Alocal, 4 detail, 5 LOD fraction.
- *
- * The old code only looked at five of these bits to decide "TMU0 only /
- * TMU1 only", never combined the two TMUs, and mistook the multitexture
- * modulate setup (mselect = Clocal, everything else clear) for pass-through,
- * so GLQuake's lightmap (TMU0) was never applied.
  * ========================================================================= */
 #define TM_TC_ZERO_OTHER(m)   (!!((m) & (1u << 12)))
 #define TM_TC_SUB_CLOCAL(m)   (!!((m) & (1u << 13)))
@@ -580,7 +529,7 @@ static inline bool depth_test(int op, uint16_t new_d, uint16_t old_d)
 }
 
 /* =========================================================================
- * Alpha blend helper — all 12 src/dst factor modes
+ * Alpha blend helper (RGB channels)
  * ========================================================================= */
 static inline void alpha_blend(int *r, int *g, int *b, int src_a,
                                 uint8_t dst_r, uint8_t dst_g, uint8_t dst_b,
@@ -602,13 +551,7 @@ static inline void alpha_blend(int *r, int *g, int *b, int src_a,
      *   0x7 AOM_ADST_ALPHA   1 - destination alpha
      *   0xf ASATURATE        source factor: min(src alpha, 1 - dst alpha)
      *       ACOLORBEFOREFOG  dest   factor: colour before fog
-     *
-     * The previous table used an invented ordering (1 = ONE, 2 = SRC_ALPHA,
-     * 3 = 1 - SRC_ALPHA ...).  The usual GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA
-     * (src 1, dst 5) therefore became "src * 1 + dst * (1 - dst_alpha)" with
-     * dst_alpha = 0xff, i.e. a plain overwrite: the fully transparent texels
-     * of font / sprite textures were painted opaque (GLQuake console: pink
-     * boxes behind every glyph, palette index 255 = RGB 159,91,83).
+     *   0x8..0xe reserved (reported by the gap tracker)
      *
      * Result: out = (src * (sf + 1) + dst * (df + 1)) >> 8   (86Box)
      */
@@ -766,7 +709,7 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
     uint32_t fcp  = p->fbzColorPath;
     uint32_t alm  = p->alphaMode;
     uint32_t fogm = p->fogMode;
-    bool     bilinear = s->bilinear && true;
+    bool     bilinear = s->bilinear;
 
     bool clip_en      = !!(fbz & FBZ_ENABLE_CLIPPING);
     bool depth_en     = !!(fbz & FBZ_DEPTH_ENABLE);
@@ -800,7 +743,6 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
     int cc_mselect      = (int)FBZCP_CC_MSELECT(fcp);
     int cc_rev_blend    = (int)FBZCP_CC_REVERSE_BLEND(fcp);
     int cc_add          = (int)FBZCP_CC_ADD(fcp);
-    int cc_add_alocal   = (int)FBZCP_CC_ADD_ALOCAL(fcp);
     int cc_invert       = (int)FBZCP_CC_INVERT_OUT(fcp);
     int cca_zero_other  = (int)FBZCP_CCA_ZERO_OTHER(fcp);
     int cca_sub_clocal  = (int)FBZCP_CCA_SUB_CLOCAL(fcp);
@@ -808,70 +750,6 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
     int cca_rev_blend   = (int)FBZCP_CCA_REVERSE_BLEND(fcp);
     int cca_add         = (int)FBZCP_CCA_ADD(fcp);
     int cca_invert      = (int)FBZCP_CCA_INVERT_OUT(fcp);
-
-    /* -----------------------------------------------------------------------
-     * Debug: verify dither table, render path, and texture pointers.
-     * These fire once per triangle (not per pixel) so overhead is minimal.
-     * ----------------------------------------------------------------------- */
-#ifdef DEBUG_VOODOO3_RENDER
-    /* Dither table sanity: when dither is enabled the tables must be inited */
-    if (dither_en) {
-        /* voodoo3_dither_rb[0][0][0] should never be zero after table init */
-        if (voodoo3_dither_rb[127][3][3] == 0 && voodoo3_dither_rb[1][0][0] == 0) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                "voodoo3: WARNING dither enabled but dither table looks uninitialised "
-                "(fbzMode=0x%08x dither_2x2=%d dithersub=%d)\n",
-                fbz, dither_2x2, dithersub_en);
-        } else {
-            qemu_log_mask(LOG_UNIMP,
-                "voodoo3: render dither active: fbzMode=0x%08x "
-                "dither_2x2=%d dithersub=%d\n",
-                fbz, dither_2x2, dithersub_en);
-        }
-    }
-
-    /* Render path: log whether texturing is active */
-    qemu_log_mask(LOG_UNIMP,
-        "voodoo3: render tri#%u tex_en=%d dither_en=%d depth_en=%d "
-        "blend_en=%d fog_en=%d alpha_en=%d\n",
-        s->tri_count, tex_en, dither_en, depth_en,
-        blend_en, fog_en, alpha_en);
-
-    /* Texture pointer validation: if tex_en is set, TMU0 pointers must exist */
-    if (tex_en) {
-        bool tmu0_ok = false, tmu1_ok = false;
-        for (int _l = 0; _l <= V3_LOD_MAX; _l++) {
-            if (st->tex[0][_l]) { tmu0_ok = true; break; }
-        }
-        if (!tmu0_ok) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                "voodoo3: tex_en=1 but TMU0 tex pointers all NULL "
-                "(tri#%u textureMode0=0x%08x) — expect black/garbage\n",
-                s->tri_count, p->tmu[0].textureMode);
-        }
-        /* Check TMU1 only when dual-TMU blend is active (passthrough mode off) */
-        if ((p->tmu[0].textureMode & 0x00643000u) != 0x00241000u) {
-            for (int _l = 0; _l <= V3_LOD_MAX; _l++) {
-                if (st->tex[1][_l]) { tmu1_ok = true; break; }
-            }
-            if (!tmu1_ok) {
-                qemu_log_mask(LOG_GUEST_ERROR,
-                    "voodoo3: dual-TMU active but TMU1 tex pointers all NULL "
-                    "(tri#%u textureMode1=0x%08x)\n",
-                    s->tri_count, p->tmu[1].textureMode);
-            }
-        }
-    } else if (!tex_en) {
-        /* Sanity: if FBZCP_TEXTURE_ENABLED is clear, CC path must not reference
-         * texture (cc_localselect values 0/1 are safe; value 2 = texture) */
-        if (_rgb_sel == 2) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                "voodoo3: tex_en=0 but fbzColorPath CC_RGBSELECT=2 (texture) "
-                "(fbzColorPath=0x%08x) — output will be undefined\n",
-                fcp);
-        }
-    }
-#endif /* DEBUG_VOODOO3_RENDER */
 
     /* Apply top clip */
     if (clip_en && ystart < p->clipLowY) {
@@ -917,8 +795,8 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
         int screen_y = y_origin ? (y_origin_v - (real_y >> 4)) : (real_y >> 4);
 
         /*
-         * Band-parallel scanline filter — ported from 86Box
-         * voodoo_half_triangle() (vid_voodoo_render.c line 837):
+         * Scanline interleave between render threads (86Box
+         * voodoo_half_triangle()):
          *
          *   if ((real_y & voodoo->odd_even_mask) != odd_even)
          *       goto next_line;
@@ -1242,13 +1120,10 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                 src_b = (src_b * msel_b) >> 8;
                 src_a = (src_a * msel_a) >> 8;
 
-                /* Add */
-                switch (cc_add) {
-                case CC_ADD_CLOCAL: src_r += clocal_r; src_g += clocal_g; src_b += clocal_b; break;
-                case CC_ADD_ALOCAL: src_r += alocal;   src_g += alocal;   src_b += alocal;    break;
-                default: break;
-                }
-                if (cc_add_alocal) { src_r += alocal; src_g += alocal; src_b += alocal; }
+                /* Add: bit 14 cc_add_clocal, bit 15 cc_add_alocal, independent
+                 * (register spec fbzColorPath) */
+                if (cc_add & CC_ADD_CLOCAL) { src_r += clocal_r; src_g += clocal_g; src_b += clocal_b; }
+                if (cc_add & CC_ADD_ALOCAL) { src_r += alocal;   src_g += alocal;   src_b += alocal; }
                 if (cca_add) src_a += alocal;
 
                 src_r = CLAMP(src_r); src_g = CLAMP(src_g);
@@ -1302,9 +1177,11 @@ static void v3_half_triangle(Voodoo3State *s, const voodoo3_params_t *p,
                      * 2×2 mode: index with (screen_y & 1), (x & 1)
                      *           — uses dedicated 2x2 tables, NOT the 4x4 ones
                      *
-                     * FBZ_DITHER_SUB (fbzMode bit 19): apply subtraction
-                     * dither to the destination (read-back) colour before
-                     * blending, matching 86Box voodoo_half_triangle() logic.
+                     * FBZ_DITHER_SUB (fbzMode bit 19): this block runs after
+                     * alpha_blend() has consumed dest_r/g/b and therefore has
+                     * no effect.  86Box applies the subtraction dither before
+                     * ALPHA_BLEND, only with blending on (open item in
+                     * voodoo3-port-analyse.md).
                      */
                     if (dithersub_en) {
                         if (dither_2x2) {
@@ -1373,8 +1250,7 @@ skip_pixel:
             x += st->xdir;
         } while (x != x2 + st->xdir);
 
-        /* 86Box: fbiPixelsIn += pixels of the span (the old code evaluated
-         * this after the loop, when x had already reached x2, i.e. 2/row) */
+        /* 86Box: fbiPixelsIn += pixels of the span */
         qatomic_add(&s->fbiPixelsIn, pix_span);
 
 next_line:
@@ -1476,18 +1352,10 @@ void voodoo3_triangle(Voodoo3State *s, const voodoo3_params_t *p, int odd_even)
         }
 
         /*
-         * FIX 1: wire tLOD lodbias into LOD calculation.
-         * p->tmu[t].lodbias is decoded in voodoo3.c (6-bit signed,
-         * tLOD[17:12]) before the triangle is queued — use it here.
-         *
-         * FIX 5: decode lod_min / lod_max from the tLOD register instead of
-         * hardcoding 0 / V3_LOD_MAX.
-         * tLOD bit layout (Voodoo2/3 hardware spec, matches 86Box):
-         *   bits [5:2]  = lod_min  (4-bit integer, 0..8)
-         *   bits [11:8] = lod_max  (4-bit integer, 0..8)
-         * Both are stored as raw integer LOD levels; multiply by 256 to
-         * convert to the 8.8 fixed-point used by the clamp comparisons in
-         * voodoo_tmu_fetch() (st->lod < st->lod_min[tmu]).
+         * lodbias: tLOD[17:12], 6-bit signed, decoded at queue time.
+         * lod_min = tLOD[5:2], lod_max = tLOD[11:8] (whole LOD levels),
+         * scaled by 256 to the 8.8 fixed point used for clamping in
+         * voodoo_tmu_fetch().
          */
         int lodbias = p->tmu[t].lodbias;
         st.tmu[t].lod = LOD + (lodbias << 6);
@@ -1506,11 +1374,8 @@ void voodoo3_triangle(Voodoo3State *s, const voodoo3_params_t *p, int odd_even)
             st.tex[_t][_l] = p->tex_ptr[_t][_l];
 
     /*
-     * Wire per-LOD geometry arrays into state.
-     * We copy the int arrays from tex_params into local storage so
-     * the int* pointers in v3_state_t remain valid for the lifetime
-     * of this function.  Declared static is WRONG for multi-thread
-     * use, so we use properly-scoped arrays.
+     * Per-LOD geometry: copied to function-local arrays (the render threads
+     * run concurrently, so no static storage) that v3_state_t points into.
      */
     int wm[2][V3_LOD_MAX+2], hm[2][V3_LOD_MAX+2];
     int sh[2][V3_LOD_MAX+2], tl[2][V3_LOD_MAX+2];
@@ -1540,16 +1405,15 @@ void voodoo3_triangle(Voodoo3State *s, const voodoo3_params_t *p, int odd_even)
 }
 
 /* =========================================================================
- * voodoo3_fb_writel — LFB pixel-write through the 3D pipeline
+ * voodoo3_fb_writel — LFB pixel write through the 3D pipeline
  *
- * Handles FIFO_WRITEL_FB entries queued by voodoo3_mmio_write() and by
- * CMDFIFO packet-5 type-2 (direct LFB writes from the Glide driver).
+ * Called for CPU writes to the 3D LFB aperture of BAR0 and for CMDFIFO
+ * packet-5 writes to the 3D LFB.
  *
  * Ported from 86Box src/video/vid_voodoo_fb.c : voodoo_fb_writel().
  * Original author: Sarah Walker.
  *
- * addr = framebuffer byte address (lower 23 bits of the FIFO command word;
- *        the FIFO_WRITEL_FB type bits have already been stripped by the caller)
+ * addr = byte offset within the 3D LFB aperture
  * val  = 32-bit pixel value as written by the guest
  *
  * The lfbMode register controls the pixel format.  When lfbMode bit 8
@@ -1601,6 +1465,7 @@ static void voodoo3_fb_write_common(Voodoo3State *s, uint32_t addr,
             val &= 0xffffu;
             break;
         default:
+            voodoo3_note_gap(s, V3_GAP_LFB_FORMAT16, s->lfbMode & 0xfu);
             return;
         }
     }
@@ -1639,11 +1504,7 @@ static void voodoo3_fb_write_common(Voodoo3State *s, uint32_t addr,
         write_mask = LFB_WRITE_COLOUR; count = 2;
         break;
 
-    /*
-     * lfbMode format 4 = XRGB8888, 5 = ARGB8888 (86Box vid_voodoo_regs.h
-     * LFB_FORMAT_XRGB8888 = 4, LFB_FORMAT_ARGB8888 = 5).  The alpha handling
-     * of the two formats was swapped before.
-     */
+    /* lfbMode format 4 = XRGB8888, 5 = ARGB8888 (86Box LFB_FORMAT_*) */
     case 4: /* XRGB8888 — one 32-bit pixel, alpha from zaColor */
         col_b[0] =  (int)(val        & 0xffu);
         col_g[0] =  (int)((val >>  8) & 0xffu);
@@ -1696,8 +1557,8 @@ static void voodoo3_fb_write_common(Voodoo3State *s, uint32_t addr,
         break;
 
     default:
-        /* Unknown format — silently ignore (matches 86Box fatal() path
-         * which we replace with a no-op for robustness). */
+        /* Reserved format (86Box: fatal()): write dropped, gap reported */
+        voodoo3_note_gap(s, V3_GAP_LFB_FORMAT, s->lfbMode & 0xfu);
         return;
     }
 
@@ -1707,10 +1568,6 @@ static void voodoo3_fb_write_common(Voodoo3State *s, uint32_t addr,
      * Ported from 86Box voodoo_fb_writel() Banshee branch (vid_voodoo_fb.c):
      *   x = addr & 0xffe          bits[11:1]  — byte X within row
      *   y = (addr >> 12) & 0x3ff  bits[21:12] — row index
-     *
-     * The old Voodoo1/2 encoding (x = addr & 0x7fe, y = addr >> 11) is
-     * WRONG for Banshee: it only allows 11-bit X (max 1023 pixels wide) and
-     * the bit ranges overlap, corrupting Y for any resolution > 1024 wide.
      *
      * For single-pixel 32-bit formats (ARGB8888 / XRGB8888 / depth+colour)
      * the caller has already shifted addr >>= 1 to convert the 32-bit pixel
@@ -1729,9 +1586,6 @@ static void voodoo3_fb_write_common(Voodoo3State *s, uint32_t addr,
      *   case LFB_WRITE_FRONT (0x00): fb_write_offset = front_offset
      *   case LFB_WRITE_BACK  (0x10): fb_write_offset = draw_offset  (back buf)
      *   default:                     fb_write_offset = front_offset
-     *
-     * Previously QEMU always used draw_offset, which was wrong when the Glide
-     * driver selects the front buffer for direct LFB writes (e.g. 2D overlays).
      * ----------------------------------------------------------------------- */
     uint32_t fb_write_offset;
     switch (s->lfbMode & 0x30u) {
@@ -1949,4 +1803,75 @@ void voodoo3_fb_writew(Voodoo3State *s, uint32_t addr, uint16_t val)
         val = bswap16(val);
     }
     voodoo3_fb_write_common(s, addr, val, true);
+}
+
+/* =========================================================================
+ * Gap tracker: per-triangle scan of the 3D state
+ *
+ * Called ONCE per triangle from voodoo3_queue_triangle(), never from the
+ * render threads and never per pixel.  It mirrors, field for field, the
+ * decisions the rasterizer makes above and reports every selector value
+ * the rasterizer has no case for (it falls into a `default:` there and the
+ * pixel is computed with a guessed value).  Keep it in step with the
+ * switches in voodoo3_triangle() and alpha_blend() when a case is added.
+ * See voodoo3_gaps.h.
+ * ========================================================================= */
+void voodoo3_gap_scan_triangle(Voodoo3State *s, const voodoo3_params_t *p)
+{
+    const uint32_t fcp = p->fbzColorPath;
+    const uint32_t alm = p->alphaMode;
+    unsigned v;
+
+    /* fbzColorPath: colour/alpha combine unit */
+    v = FBZCP_CC_RGBSELECT(fcp);
+    if (v > 2) {                        /* 0 iterated, 1 texture, 2 color1 */
+        voodoo3_note_gap(s, V3_GAP_CC_RGBSEL, v);
+    }
+    v = FBZCP_CC_ASELECT(fcp);
+    if (v > A_SEL_COLOR1) {
+        voodoo3_note_gap(s, V3_GAP_CC_ASEL, v);
+    }
+    v = FBZCP_CCA_LOCALSELECT(fcp);
+    if (v > CCA_LOCALSEL_ITER_Z) {
+        voodoo3_note_gap(s, V3_GAP_CCA_LOCALSEL, v);
+    }
+    v = FBZCP_CC_MSELECT(fcp);
+    if (v > CC_MSELECT_TEXRGB) {
+        voodoo3_note_gap(s, V3_GAP_CC_MSELECT, v);
+    }
+    v = FBZCP_CCA_MSELECT(fcp);
+    if (v > CCA_MSELECT_TEX) {
+        voodoo3_note_gap(s, V3_GAP_CCA_MSELECT, v);
+    }
+
+    /* textureMode: TMU combine units (TMU1 only when TMU0 reads it) */
+    if (FBZCP_TEXTURE_ENABLED(fcp)) {
+        int ntmu = voodoo3_tmu1_needed(p->tmu[0].textureMode) ? 2 : 1;
+
+        for (int t = 0; t < ntmu; t++) {
+            const uint32_t tm = p->tmu[t].textureMode;
+
+            v = TM_TC_MSELECT(tm);
+            if (v > 5) {                /* 0..5: zero, clocal, aother,
+                                         * alocal, detail, lod frac */
+                voodoo3_note_gap(s, V3_GAP_TMU_TC_MSELECT, 0x10u * t + v);
+            }
+            v = TM_TCA_MSELECT(tm);
+            if (v > 5) {
+                voodoo3_note_gap(s, V3_GAP_TMU_TCA_MSELECT, 0x10u * t + v);
+            }
+        }
+    }
+
+    /* alphaMode: blend factors (0..7 and 0xf are implemented) */
+    if (alm & ALPHA_BLEND_EN) {
+        v = ALPHA_SRC_FUNC(alm);
+        if (v > 7 && v != 0xf) {
+            voodoo3_note_gap(s, V3_GAP_BLEND_SRC, v);
+        }
+        v = ALPHA_DST_FUNC(alm);
+        if (v > 7 && v != 0xf) {
+            voodoo3_note_gap(s, V3_GAP_BLEND_DST, v);
+        }
+    }
 }

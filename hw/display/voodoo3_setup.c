@@ -4,7 +4,7 @@
  * Ported from 86Box vid_voodoo_setup.c
  * Original author: Sarah Walker <https://pcem-emulator.co.uk/>
  * Copyright (C) 2008-2024 Sarah Walker and 86Box contributors
- * Copyright (C) 2026 <your name here>
+ * QEMU port: https://github.com/Falke3434/QEmu-3Dfx-Voodoo-3-Port
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
@@ -30,7 +30,6 @@
 #define SETUPMODE_S0_T0         (1 << 5)
 #define SETUPMODE_W1            (1 << 6)
 #define SETUPMODE_S1_T1         (1 << 7)
-#define SETUPMODE_STRIP_MODE    (1 << 16)
 #define SETUPMODE_CULLING_ENABLE    (1 << 17)
 #define SETUPMODE_CULLING_SIGN      (1 << 18)
 #define SETUPMODE_DISABLE_PINGPONG  (1 << 19)
@@ -42,9 +41,6 @@
  *
  * Ported 1:1 from 86Box voodoo_triangle_setup().
  */
-/* Forward declaration - defined in voodoo3.c */
-/* voodoo3_queue_triangle declared in voodoo3_int.h */
-
 void voodoo3_triangle_setup(Voodoo3State *s)
 {
     /* Local aliases */
@@ -114,7 +110,7 @@ void voodoo3_triangle_setup(Voodoo3State *s)
      * render-state regs that are NOT set by the setup engine) */
     voodoo3_params_t p = s->params;
 
-    /* Fixed-point vertex coordinates (4.12) */
+    /* Fixed-point vertex coordinates (12.4, sign-extended 16 bit) */
     p.vertexAx = (int32_t)(int16_t)((int32_t)(v[va].sVx * 16.0f) & 0xffff);
     p.vertexAy = (int32_t)(int16_t)((int32_t)(v[va].sVy * 16.0f) & 0xffff);
     p.vertexBx = (int32_t)(int16_t)((int32_t)(v[vb].sVx * 16.0f) & 0xffff);
